@@ -628,6 +628,8 @@ public:
     static AiBotAI* AttachToRealCharacter(Player* owner);
 
     // --- Combat (from BattleBotAI) ---
+    bool CommanderRaidCast(Unit* target, uint32 spellId);
+    bool CommanderRaidMove(float x, float y, float z);
     bool AttackStart(Unit* pVictim);
     Unit* SelectAttackTarget(Unit* pExcept = nullptr) const;
     bool DrinkAndEat();

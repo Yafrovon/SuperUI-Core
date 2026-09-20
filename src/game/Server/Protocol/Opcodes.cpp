@@ -657,7 +657,8 @@ Handlers BuildOpcodeList()
     DEFINE_HANDLER(CMSG_GUILD_SET_OFFICER_NOTE,       STATUS_LOGGEDIN,  PACKET_PROCESS_GUILD,         &WorldSession::HandleGuildSetOfficerNoteOpcode);
     INVALID_PACKET(SMSG_LOGIN_VERIFY_WORLD,           UnhandleReason::SendByServer);
     INVALID_PACKET(CMSG_CLEAR_EXPLORATION,            UnhandleReason::Unhandled);
-    DEFINE_HANDLER(CMSG_SEND_MAIL,                    STATUS_LOGGEDIN,  PACKET_PROCESS_MAP,           &WorldSession::HandleSendMail);
+    // Capture the mail sender before a later possession release or freeze in this same queue.
+    DEFINE_HANDLER(CMSG_SEND_MAIL,                    STATUS_LOGGEDIN,  PACKET_PROCESS_WORLD,         &WorldSession::HandleSendMail);
     INVALID_PACKET(SMSG_SEND_MAIL_RESULT,             UnhandleReason::SendByServer);
     DEFINE_HANDLER(CMSG_GET_MAIL_LIST,                STATUS_LOGGEDIN,  PACKET_PROCESS_MAP,           &WorldSession::HandleGetMailList);
     INVALID_PACKET(SMSG_MAIL_LIST_RESULT,             UnhandleReason::SendByServer);
@@ -972,6 +973,8 @@ Handlers BuildOpcodeList()
     INVALID_PACKET(SMSG_SUI_PARTY_TAXI_RESULT,        UnhandleReason::SendByServer);
     DEFINE_HANDLER(CMSG_SUI_TACTICAL_FREEZE,          STATUS_LOGGEDIN,  PACKET_PROCESS_WORLD,         &WorldSession::HandleSuiTacticalFreezeOpcode);
     INVALID_PACKET(SMSG_SUI_TACTICAL_FREEZE,          UnhandleReason::SendByServer);
+    DEFINE_HANDLER(CMSG_SUI_COMMANDER_RAID, STATUS_LOGGEDIN, PACKET_PROCESS_WORLD, &WorldSession::HandleSuiCommanderRaidOpcode);
+    INVALID_PACKET(SMSG_SUI_COMMANDER_RAID, UnhandleReason::SendByServer);
     DEFINE_HANDLER(CMSG_SUI_TACTICAL_QUEUE,           STATUS_LOGGEDIN,  PACKET_PROCESS_WORLD,         &WorldSession::HandleSuiTacticalQueueOpcode);
     INVALID_PACKET(SMSG_SUI_TACTICAL_QUEUE,           UnhandleReason::SendByServer);
     DEFINE_HANDLER(CMSG_SUI_PORTAL_PREPARE,            STATUS_LOGGEDIN,  PACKET_PROCESS_MAP,           &WorldSession::HandleSuiPortalPrepareOpcode);

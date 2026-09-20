@@ -1,3 +1,4 @@
+#include "SuiCommanderRaid.h"
 /*
  * AiBotAIBridge.cpp — the C# <-> C++ TCP bridge for the autonomous AI bot.
  *
@@ -748,6 +749,19 @@ void AiBotAI::BridgeProcessLine(const char* line)
     if (cbt > 0)
         CB_HITV(me->GetGUIDLow(), "cpp-chain: command adopted", static_cast<double>(cbt));
     CB_HITN(me->GetGUIDLow(), "cpp-bridge: dispatch", msgType);
+
+    // Encounter execution owns combat and movement until an explicit commander order yields it.
+    // Continue receiving liveness/diagnostics so stale autonomous commands are drained.
+    if (SuiCommanderRaid::Owns(me) && strcmp(msgType,"PING")!=0 && strcmp(msgType,"CIRCUIT_TRACE")!=0)
+    {
+        if(m_suiCommanderLine) SuiCommanderRaid::Yield(me);
+        else
+        {
+            BridgeSendEvent("ENCOUNTER_DROP",msgType);
+            m_bridgeDispatchCbt=previousDispatchCbt;
+            return;
+        }
+    }
 
     // [SUI] While a real player drives this bot every mutating command would
     // execute under the human's feet (MOVE_TO would yank the mover). Drop with

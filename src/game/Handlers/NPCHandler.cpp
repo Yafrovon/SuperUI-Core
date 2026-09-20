@@ -602,6 +602,8 @@ void WorldSession::HandleListStabledPetsOpcode(WorldPackets::Npc::ListStabledPet
     // [SUI] the driven bot's stable
     Player* pActor = GetSuiActor();
 
+    if (!pActor || pActor->GetClass() != CLASS_HUNTER)
+        return;
     Creature* unit = pActor->GetNPCIfCanInteractWith(packet.npcGuid, UNIT_NPC_FLAG_STABLEMASTER);
     if (!unit)
     {
@@ -619,6 +621,8 @@ void WorldSession::SendStablePet(ObjectGuid guid)
     // [SUI] the driven bot's pets; the list answers on this socket (or mirrors from a gossip pick)
     Player* pActor = GetSuiActor();
 
+    if (!CheckStableMaster(guid))
+        return;
     WorldPacket data(MSG_LIST_STABLED_PETS, 200);           // guess size
     data << guid;
 
@@ -681,6 +685,9 @@ void WorldSession::SendStableResult(uint8 res)
 
 bool WorldSession::CheckStableMaster(ObjectGuid guid)
 {
+    Player* pActor = GetSuiActor();
+    if (!pActor || pActor->GetClass() != CLASS_HUNTER)
+        return false;
     if (SuiTacticalFreeze::IsInteractionTargetFrozen(this, guid))
         return false;
 
@@ -697,7 +704,7 @@ bool WorldSession::CheckStableMaster(ObjectGuid guid)
     // stable master case
     else
     {
-        if (!GetPlayer()->GetNPCIfCanInteractWith(guid, UNIT_NPC_FLAG_STABLEMASTER))
+        if (!pActor->GetNPCIfCanInteractWith(guid, UNIT_NPC_FLAG_STABLEMASTER))
         {
             sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "Stablemaster %s not found or you can't interact with him.", guid.GetString().c_str());
             return false;
@@ -756,7 +763,7 @@ void WorldSession::HandleStablePet(WorldPackets::Npc::StablePet const& packet)
 
     if (free_slot <= pActor->m_stableSlots)
     {
-        pet->Unsummon(PetSaveMode(free_slot), _player);
+        pet->Unsummon(PetSaveMode(free_slot), pActor);
         SendStableResult(STABLE_SUCCESS_STABLE);
     }
     else
@@ -809,7 +816,7 @@ void WorldSession::HandleUnstablePet(WorldPackets::Npc::UnstablePet const& packe
     }
 
     Pet* newpet = new Pet(HUNTER_PET);
-    if (!newpet->LoadPetFromDB(_player, creatureId, packet.petNumber))
+    if (!newpet->LoadPetFromDB(pActor, creatureId, packet.petNumber))
     {
         delete newpet;
         newpet = nullptr;
@@ -920,11 +927,11 @@ void WorldSession::HandleStableSwapPet(WorldPackets::Npc::StableSwapPet const& p
         return;
     }
 
-    pet->Unsummon(PetSaveMode(slot), _player);
+    pet->Unsummon(PetSaveMode(slot), pActor);
 
     // summon unstabled pet
     Pet* newpet = new Pet;
-    if (!newpet->LoadPetFromDB(_player, creature_id, packet.petNumber))
+    if (!newpet->LoadPetFromDB(pActor, creature_id, packet.petNumber))
     {
         delete newpet;
         SendStableResult(STABLE_ERR_STABLE);

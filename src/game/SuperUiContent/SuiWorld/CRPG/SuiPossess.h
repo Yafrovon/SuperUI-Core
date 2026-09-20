@@ -83,6 +83,8 @@ namespace SuiPossess
         ORDER_DISMISS          = 12,  // muster out: the brain resumes questing in place
         ORDER_MANUAL           = 13,  // the commander drives this unit's actions himself
         ORDER_AUTO             = 14,  // hand the unit's actions back to its AI
+        ORDER_PREPARE          = 15,  // raid-ready from own spellbook and bags: buffs, elixirs, potion, food, pet (x = expected school mask)
+        ORDER_SUPPLY           = 16,  // quartermaster: top bags up to the per-role policy loadout (x = encounter role 1-5, 0 = derive)
     };
 
     // SMSG_SUI_CONTROL_ROSTER member flags
@@ -145,6 +147,8 @@ namespace SuiPossess
     // ── Queries ───────────────────────────────────────────────────────────────
     /// The real player driving `bot` via SUI possession, or nullptr.
     Player* GetPossessor(Unit const* bot);
+    // True only for the active possessor of this unit's owner/charmer.
+    bool IsControlledOwnerOf(Unit const* unit, Player const* observer);
     // True when this bot is possessed AND its possessor is commanding from the free view
     // (evidenced by a live freecam eye). Such a bot takes RTS orders and executes them under
     // its own AI: the client that "owns" it is parked on a camera and will never move it.

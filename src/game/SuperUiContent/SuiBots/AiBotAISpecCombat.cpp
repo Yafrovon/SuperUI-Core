@@ -14,6 +14,7 @@
  */
 
 #include "AiBotAIMain.h"
+#include "SuiCommanderRaid.h"
 #include "AiBotCircuit.h"   // [CIRCUIT] probe macros (CIRCUIT_BOARD.md)
 #include "CreatureAI.h"
 #include "Group.h"
@@ -160,6 +161,7 @@ uint8 AiBotAI::GetCombatSpecTab() const
 
 CombatBotRoles AiBotAI::GetCombatActiveRole() const
 {
+    if (SuiCommanderRaid::Owns(me)) return GetRole(); // temporary encounter role
     return GetCombatSpecTab() <= 2 ? botEntry->activeRole : GetRole();
 }
 
@@ -247,6 +249,8 @@ bool AiBotAI::CanUseSpecAoE(Unit* center, float radius, uint32 minimumTargets) c
 
 Unit* AiBotAI::SelectSafeSpecAdd(Unit const* primary) const
 {
+    // The active encounter owns add assignments and crowd-control decisions.
+    if (SuiCommanderRaid::Owns(me)) return nullptr;
     Unit* add = SelectAttackerDifferentFrom(primary);
     if (!add || !IsValidHostileTarget(add) || add->HasBreakableByDamageCrowdControlAura())
         return nullptr;   // cb:fold hot per-update detail
@@ -628,7 +632,19 @@ bool AiBotAI::UpdateSpecOutOfCombat(uint8 playerClass, uint8 spec)
                 if (!holder || holder->GetCasterGuid() != me->GetObjectGuid())
                     continue;   // cb:fold only this Paladin's assignment controls diversification
 
-                uint32 const chain = sSpellMgr.GetFirstSpellInChain(aura.first);
+                uint32 chain = sSpellMgr.GetFirstSpellInChain(aura.first);
+                // A Greater blessing is this caster's existing assignment too.
+                // Its native blessing category, family flags and effect identify the same family
+                // even when the spell database uses a separate rank chain.
+                if (Spells::GetSpellSpecific(aura.first) == SPELL_BLESSING)
+                    for (SpellEntry const* candidate : {might, wisdom, light, kings, sanctuary, salvation})
+                        if (candidate && holder->GetSpellProto()->SpellFamilyFlags == candidate->SpellFamilyFlags &&
+                            holder->GetSpellProto()->EffectApplyAuraName[0] == candidate->EffectApplyAuraName[0] &&
+                            holder->GetSpellProto()->EffectMiscValue[0] == candidate->EffectMiscValue[0])
+                        {   // cb:fold native blessing-family normalization, selected family is probed
+                            chain = sSpellMgr.GetFirstSpellInChain(candidate->Id);
+                            break;
+                        }
                 if (chain == SP_BLESSING_OF_PROTECTION ||
                     chain == SP_BLESSING_OF_FREEDOM ||
                     chain == SP_BLESSING_OF_SACRIFICE)
@@ -1143,7 +1159,7 @@ bool AiBotAI::UpdateSpecCombatHunter(uint8 spec)
         me->HasSpell(SP_AUTO_SHOT))
     {   // cb:fold rotation rung, outcome probed at cast
         SpellCastResult result = me->CastSpell(victim, SP_AUTO_SHOT, false);
-        if (result == SPELL_FAILED_NEED_AMMO || result == SPELL_FAILED_NO_AMMO)
+        if ((result == SPELL_FAILED_NEED_AMMO || result == SPELL_FAILED_NO_AMMO) && !SuiCommanderRaid::Owns(me))
         {   // cb:fold rotation rung, outcome probed at cast
             CB_HIT(me->GetGUIDLow(), "cpp-spec: out of ammo, restocking");
             AddHunterAmmo();

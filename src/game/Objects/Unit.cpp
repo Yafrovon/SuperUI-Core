@@ -1,3 +1,4 @@
+#include "SuiCommanderRaid.h"
 /*
  * Copyright (C) 2005-2011 MaNGOS <http://getmangos.com/>
  * Copyright (C) 2009-2011 MaNGOSZero <https://github.com/mangos/zero>
@@ -239,6 +240,9 @@ void Unit::Update(uint32 update_diff, uint32 p_time)
 
     if (IsSuiTacticallyFrozen())
         return;
+
+    if (IsCreature() && SuiCommanderRaid::Watches(GetEntry()))
+        SuiCommanderRaid::ObserveUnit(this, update_diff);
 
     // Buffer spell system update time to save on performance when players are updated twice per
     // world update. We do not need to update spells when the interval is only a few ms (~10ms)

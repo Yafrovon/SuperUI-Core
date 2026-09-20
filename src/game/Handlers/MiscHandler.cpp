@@ -447,8 +447,10 @@ void WorldSession::HandleSetSelectionOpcode(WorldPackets::Misc::SetSelection con
 
 void WorldSession::HandleStandStateChangeOpcode(WorldPackets::Misc::StandStateChange const& packet)
 {
+    Player* actor=GetSuiActor();
+    if(!actor)return;
     // Tactical freeze preserves the sampled body pose as well as its clocks.
-    if (_player->IsSuiTacticallyFrozen())
+    if (actor->IsSuiTacticallyFrozen())
         return;
 
     switch (packet.animState)
@@ -462,12 +464,12 @@ void WorldSession::HandleStandStateChangeOpcode(WorldPackets::Misc::StandStateCh
             return;
     }
 
-    if (_player->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PREVENT_ANIM))
+    if (actor->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_PREVENT_ANIM))
         return;
 
-    _player->InterruptSpellsWithChannelFlags(AURA_INTERRUPT_ANIM_CANCELS);
-    _player->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_ANIM_CANCELS);
-    _player->SetStandState(packet.animState);
+    actor->InterruptSpellsWithChannelFlags(AURA_INTERRUPT_ANIM_CANCELS);
+    actor->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_ANIM_CANCELS);
+    actor->SetStandState(packet.animState);
 }
 
 void WorldSession::HandleFriendListOpcode(NullClientPacket const& /*packet*/)

@@ -122,3 +122,7 @@ Progression.h
 *.prefinding*
 *.prelivelock
 *.bak
+
+# Raid QA artifacts (scripts, logs, checkpoints - hundreds of MB) and editor backup snapshots: never source.
+/qa-artifacts/
+/.claude-backups/

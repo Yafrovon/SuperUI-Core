@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "_about": "Raid quartermaster policy read by ORDER_SUPPLY (SuiRaidSupply.cpp) on every Supply order. Lives beside mangosd.conf (override with SuiRaidSupply.Policy=<path>). Counts are TOP-UP targets per member: the server grants only what is missing and never removes anything. Edit freely; no restart needed. Item ids come from item_template.",
+  "repair": true,
+  "everyone": [
+    { "item": 13457, "count": 10, "_": "Greater Fire Protection Potion" },
+    { "item": 13446, "count": 10, "_": "Major Healing Potion" },
+    { "item": 18045, "count": 5,  "_": "Tender Wolf Steak" }
+  ],
+  "mana": [
+    { "item": 13444, "count": 10, "_": "Major Mana Potion - members whose power is mana" }
+  ],
+  "roles": {
+    "tank": [
+      { "item": 13510, "count": 1, "_": "Flask of the Titans" },
+      { "item": 3825,  "count": 1, "_": "Elixir of Fortitude" },
+      { "item": 13452, "count": 1, "_": "Elixir of the Mongoose" }
+    ],
+    "healer": [
+      { "item": 9179,  "count": 1, "_": "Elixir of Greater Intellect" }
+    ],
+    "physical": [
+      { "item": 13452, "count": 1, "_": "Elixir of the Mongoose - melee and shooters" }
+    ],
+    "caster": [
+      { "item": 13454, "count": 1, "_": "Greater Arcane Elixir" }
+    ]
+  },
+  "ammo": { "count": 1000, "arrows": 18042, "bullets": 15997, "_": "tops up the member's current ammunition; Thorium Headed Arrow / Thorium Shells only for a shooter with none" },
+  "petFood": [
+    { "item": 8952,  "count": 20, "_": "Roasted Quail - meat" },
+    { "item": 13935, "count": 20, "_": "Baked Salmon - fish" },
+    { "item": 3927,  "count": 20, "_": "Fine Aged Cheddar - cheese" },
+    { "item": 4601,  "count": 20, "_": "Soft Banana Bread - bread" },
+    { "item": 8948,  "count": 20, "_": "Dried King Bolete - fungus" },
+    { "item": 4602,  "count": 20, "_": "Moon Harvest Pumpkin - fruit" }
+  ]
+}

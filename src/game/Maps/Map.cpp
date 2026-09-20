@@ -453,7 +453,10 @@ bool Map::Add(Player* player)
     if (!player->GetSession()->PlayerLoading())
         player->GetSession()->ClearIncomingPacketsByType(PACKET_PROCESS_MOVEMENT);
 
-    player->m_broadcaster->SetInstanceId(GetInstanceId());
+    // Disconnect tears down the broadcaster before LogoutPlayer finishes a pending
+    // worldport. The player still has to enter the map for normal logout cleanup.
+    if (player->m_broadcaster)
+        player->m_broadcaster->SetInstanceId(GetInstanceId());
     return true;
 }
 

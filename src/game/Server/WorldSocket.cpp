@@ -113,7 +113,11 @@ void WorldSocket::DoRecvIncomingData()
         EndianConvertReverse(header->size);
         EndianConvert(header->cmd);
 
-        if ((header->size < 4) || (header->size > 0x2800) || IsDefinitelyBogusOpcode(header->cmd))
+        // Commander v4: opcode + header + at most 40 assignments + 32 KiB JSON.
+        // Keep the vanilla bound for every other opcode; the handler still checks exact lengths.
+        uint32 const maxIncomingSize = header->cmd == CMSG_SUI_COMMANDER_RAID
+            ? 4u + 24u + 40u * 71u + 32768u : 0x2800u;
+        if ((header->size < 4) || (header->size > maxIncomingSize) || IsDefinitelyBogusOpcode(header->cmd))
         {
             sLog.Out(LOG_NETWORK, LOG_LVL_BASIC, "[%s] WorldSocket::DoRecvIncomingData: client sent malformed packet size = %u, cmd = %u", self->m_socket.GetRemoteIpString().c_str(), header->size, header->cmd);
             self->CloseSocket(); // We don't want to receive any more packets from this client
@@ -532,7 +536,10 @@ void WorldSocket::SendPacket(WorldPacket packet)
 
     // We don't want to allocate or encrypt anything inside the world thread, so we move everything to the IO thread.
     m_sendQueueLock.lock();
-    if (m_sendQueue.size() > 1024) // There should never be so many packets queued up. The socket is probably not responding.
+    // A raid owner teleporting into a new grid with forty group members queues thousands of update packets while the
+    // client loads terrain (QA raid sessions 2026-09-14: "Send queue is full" three times in one night at 1024); a
+    // socket that is really dead still trips this at the higher bound.
+    if (m_sendQueue.size() > 16384)
     {
         m_sendQueueLock.unlock();
         sLog.Out(LOG_NETWORK, LOG_LVL_ERROR, "[%s] Send queue is full. Disconnecting.", GetRemoteIpString().c_str());

@@ -471,6 +471,9 @@ ChatCommand * ChatHandler::getCommandTable()
     {
         { "additem",         SEC_GAMEMASTER,    false, &ChatHandler::HandleGroupAddItemCommand,        "", nullptr },
         { "revive",          SEC_GAMEMASTER,    false, &ChatHandler::HandleGroupReviveCommand,         "", nullptr },
+        { "qaelixirs",       SEC_ADMINISTRATOR, true, &ChatHandler::HandleGroupQaElixirsCommand, "", nullptr },
+        { "qarepair",        SEC_ADMINISTRATOR, true, &ChatHandler::HandleGroupQaRepairCommand, "", nullptr },
+        { "qacheckpoint",    SEC_ADMINISTRATOR, true, &ChatHandler::HandleGroupQaCheckpointCommand, "", nullptr },
         { "replenish",       SEC_GAMEMASTER,    false, &ChatHandler::HandleGroupReplenishCommand,      "", nullptr },
         { "summon",          SEC_GAMEMASTER,    false, &ChatHandler::HandleGroupSummonCommand,         "", nullptr },
         { nullptr,           0,                 false, nullptr,                                        "", nullptr }

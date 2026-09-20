@@ -82,6 +82,8 @@ set (game_SRCS
     Chat/MasterPlayerChat.cpp
     Commands/AccountCommands.cpp
     Commands/CharacterCommands.cpp
+    Commands/RaidQaCommands.cpp
+    Commands/RaidQaCheckpoint.cpp
     Commands/CreatureCommands.cpp
     Commands/DebugCommands.cpp
     Commands/LookupCommands.cpp
@@ -219,6 +221,10 @@ set (game_SRCS
     SuperUiContent/SuiWorld/CRPG/SuiPossess.cpp
     SuperUiContent/SuiWorld/CRPG/SuiCompanion.cpp
     SuperUiContent/SuiWorld/CRPG/SuiTaxi.cpp
+    SuperUiContent/SuiWorld/CRPG/SuiCommanderRaid.cpp
+    SuperUiContent/SuiWorld/CRPG/SuiRaidPrepare.cpp
+    SuperUiContent/SuiWorld/CRPG/SuiRaidSupply.cpp
+    SuperUiContent/SuiWorld/CRPG/SuiEncounterDefinition.cpp
     SuperUiContent/SuiWorld/CRPG/SuiTacticalFreeze.cpp
     SuperUiContent/SuiWorld/RTS/SuiFactionControl.cpp
     SuperUiContent/SuiWorld/RTS/SuiHonor.cpp

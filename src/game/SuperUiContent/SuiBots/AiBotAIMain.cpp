@@ -13,6 +13,8 @@
  */
 
 #include "AiBotAIMain.h"
+#include "SuiCommanderRaid.h"
+#include "SuiRaidPrepare.h"
 #include "AiBotCircuit.h" // [CIRCUIT] probe macros (CIRCUIT_BOARD.md)
 #include "AiBotTalents.h"
 #include "SuiHero.h"
@@ -1339,14 +1341,8 @@ Player* AiBotAI::FindEscortBoss() const
 // [MULTI-HUMAN] "the boss" here = this bot's ASSIGNED human (FindEscortBoss) — with several
 // real players in the party the escort splits across them deterministically.
 //  - dead boss: stand vigil (his ghost is not a follow target; follow resumes on his rez);
-//  - cross-map boss (2026-07-08, instance-follow): dwell AIBOT_PARTY_INSTANCE_DWELL_MS so a
-//    portal in-out can't thrash, never while he's taxi-flying or riding a transport (boat/
-//    zeppelin — he'll land somewhere; chasing mid-ride teleports bots into the ocean), then
-//    TeleportTo his exact position — into his instance OR back out, symmetrically. The far
-//    port defers behind a loading screen like any real relocation; the doctrine + pparty stay
-//    live throughout. NO ReGroundZ on this dest: it queries the CURRENT map's terrain, which
-//    is the wrong map here — the boss is standing on his coords, they're trustworthy;
-//  - left far behind on the SAME map (boss took a port): NearTeleportTo the boss, grounded;
+//  - cross-map/instance boss or a detected distant port: hold and end the follow leg;
+//  - ordinary same-map walking separation retains the existing catch-up path;
 //  - otherwise: (re)issue MoveFollow only when the follow generator is not already driving,
 //    with a per-guid angle so the escort fans out behind him instead of stacking.
 // [SUI-TAXI] A hold must also END the walk: the follow generator issued while the boss
@@ -1366,7 +1362,7 @@ void AiBotAI::DoPartyFollow()
 {
     // [MULTI-HUMAN] Formation keys on the ASSIGNED human (FindEscortBoss), not the single
     // detection boss — with two real players the fleet splits ~evenly instead of stacking
-    // on one. Catch-up teleport + instance-follow below inherit the same target, so each
+    // on one. Catch-up and world-hold below inherit the same target, so each
     // half of the escort tracks ITS human even when the humans split up.
     // [SUI] Divinity-style chain: an UNLINKED member (broken off from the portrait
     // chain) never formation-follows — it stands where it was left. Combat assist
@@ -1401,49 +1397,25 @@ void AiBotAI::DoPartyFollow()
         return;
     }
 
-    if (pBoss->GetMapId() != me->GetMapId())
+    if (pBoss->GetMap() != me->GetMap())
     {
-        CB_HIT(me->GetGUIDLow(), "cpp-main: boss on other map, instance-follow path");
-        // [PLAYERPARTY] Instance-follow (2026-07-08): the boss crossed a map boundary
-        // (dungeon portal — or a boat/taxi, which we deliberately wait out).
-        if (pBoss->HasUnitState(UNIT_STATE_TAXI_FLIGHT) || pBoss->GetTransport())
-        {
-            CB_HIT(me->GetGUIDLow(), "cpp-main: boss in transit, waiting");
-            m_bossOffMapMs = 0;   // in transit — he'll land; don't chase a moving platform
-            return;
-        }
-
-        m_bossOffMapMs += AIBOT_UPDATE_INTERVAL;
-        if (m_bossOffMapMs < AIBOT_PARTY_INSTANCE_DWELL_MS)
-        {
-            CB_HITV(me->GetGUIDLow(), "cpp-main: off-map dwell accruing", m_bossOffMapMs);
-            return;
-        }
-
+        // A map/instance boundary must not become a delayed automatic summon.
         m_bossOffMapMs = 0;
-        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
-            "[AIBOT-PARTY] %s: boss on map %u (we are on %u) — instance-follow TeleportTo (%.1f, %.1f, %.1f)",
-            me->GetName(), pBoss->GetMapId(), me->GetMapId(),
-            pBoss->GetPositionX(), pBoss->GetPositionY(), pBoss->GetPositionZ());
-        me->TeleportTo(pBoss->GetMapId(),
-            pBoss->GetPositionX(), pBoss->GetPositionY(), pBoss->GetPositionZ(),
-            me->GetOrientation());
+        if (!m_suiLandedHold)
+        {
+            m_suiLandedHold = true;
+            SuiPossess::NotifyChainChanged(me);
+        }
+        SuiStopFollowForHold();
         return;
     }
 
-    m_bossOffMapMs = 0;   // same map — a fresh crossing starts a fresh dwell
+    m_bossOffMapMs = 0;
 
     float const dist = me->GetDistance(pBoss);
 
-    // [SUI-TAXI] Which gap is this? The same boss standing far from where he stood last
-    // tick took a port (hearth, summon, portal): catch up by teleport as always. A NEW boss
-    // (the human hopped to another body — a flyer that landed across the zone, say) far
-    // away is not a port: the rest of the party STAYS (owner 2026-09-03), and only walks
-    // once he comes back within catch-up range. First observation of a boss never holds.
-    // The position is recorded EVERY tick, flight included (a gryphon covers ~32 yd per
-    // tick, well under the port threshold) — recording only on non-flight ticks made the
-    // landing read as a 1872-yard port and the main catch-up teleported to Westfall,
-    // which in turn broke the possession (owner, 14:58).
+    // Record the anchor every tick, flights included. A far body switch or
+    // discontinuous movement of the same body leaves the party holding.
     ObjectGuid const bossGuid = pBoss->GetObjectGuid();
     bool const bossChanged = !m_suiLastBossGuid.IsEmpty() && m_suiLastBossGuid != bossGuid;
     bool const bossPorted = !bossChanged && !m_suiLastBossGuid.IsEmpty() &&
@@ -1452,19 +1424,12 @@ void AiBotAI::DoPartyFollow()
     m_suiLastBossX = pBoss->GetPositionX();
     m_suiLastBossY = pBoss->GetPositionY();
     m_suiLastBossZ = pBoss->GetPositionZ();
-    if (bossChanged && !bossPorted && dist > AIBOT_PARTY_CATCHUP_TELEPORT && !m_suiLandedHold)
+    if ((bossChanged || bossPorted) && dist > AIBOT_PARTY_CATCHUP_TELEPORT && !m_suiLandedHold)
     {
-        CB_HIT(me->GetGUIDLow(), "cpp-main: human hopped to a far body, holding");
+        CB_HIT(me->GetGUIDLow(), "cpp-main: anchor hopped or ported away, holding");
         m_suiLandedHold = true;
         SuiPossess::NotifyChainChanged(me);
     }
-    // POSSESS_LAW 4.3: a PORT of the driven body (the mage-tower portal, a summon) is
-    // followed by the chain — every linked member, the unattended main included,
-    // catch-up teleports after it (owner 2026-09-03: "the non-main follow me through the
-    // portal ... at least it worked"). The main's own catch-up teleport no longer breaks
-    // the possession (SuiPossess::OnPlayerTeleport, possessor near case). Flights and
-    // hops are NOT ports: those hold (above / below).
-
     // Owner 2026-09-03: in direct control the rest of the party STAYS when the driven
     // body takes a flight. Hold while he flies; when he lands far away, keep holding
     // (the left-behind latch) rather than catch-up teleporting after the gryphon.
@@ -1486,7 +1451,7 @@ void AiBotAI::DoPartyFollow()
         }
     }
 
-    // [SUI-TAXI] Left-behind hold (landed a flight alone, or the human hopped far away):
+    // [SUI-TAXI] Left-behind hold (flight, distant body switch, or anchor port):
     // hold here. The boss coming within catch-up range releases it and formation resumes.
     if (m_suiLandedHold)
     {
@@ -1829,6 +1794,10 @@ void AiBotAI::UpdateAI(uint32 const diff)
     // [SUI] Fix A: drain at most one coalesced RTS move per tick (latest dest wins). Runs ahead of
     // the 1 Hz behaviour gate so an ordered move stays responsive, and before the possess
     // early-returns so a free-view-commanded body still gets its move.
+    if (SuiCommanderRaid::Tick(this, diff)) return;
+    // A commanded pre-pull preparation owns the tick the same way: the body stays put
+    // and eats, drinks and buffs until it is raid-ready or interrupted.
+    if (SuiRaidPrepare::Tick(this, diff)) return;
     ConsumePendingSuiRtsMove();
 
     // [ROTATION/SPEC] Combat sub-tick: external slates and validated built-in

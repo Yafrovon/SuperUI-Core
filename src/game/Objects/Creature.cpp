@@ -20,6 +20,7 @@
  */
 
 #include "Creature.h"
+#include "SuiCommanderRaid.h"
 #include "Database/DatabaseEnv.h"
 #include "WorldPacket.h"
 #include "World.h"
@@ -2202,6 +2203,8 @@ void Creature::SetDeathState(DeathState s)
     }
 
     Unit::SetDeathState(s);
+    // Observe actual death before scripted immediate despawn can remove the body.
+    if(s==JUST_DIED&&SuiCommanderRaid::Watches(GetEntry()))SuiCommanderRaid::ObserveUnit(this,0);
 
     if (s == JUST_DIED)
     {

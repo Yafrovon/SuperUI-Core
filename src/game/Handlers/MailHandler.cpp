@@ -72,7 +72,7 @@ bool WorldSession::CheckMailBox(ObjectGuid guid)
 {
     // [SUI] acts as the DRIVEN bot while possessing one, else the session player.
     Player* pActor = GetSuiActor();
-    if (!pActor->GetGameObjectIfCanInteractWith(guid, GAMEOBJECT_TYPE_MAILBOX))
+    if (!pActor || !pActor->GetGameObjectIfCanInteractWith(guid, GAMEOBJECT_TYPE_MAILBOX))
     {
         sLog.Out(LOG_BASIC, LOG_LVL_DEBUG, "Mailbox %s not found or you can't interact with it.", guid.GetString().c_str());
         return false;
@@ -87,6 +87,8 @@ public:
     AsyncMailSendRequest(): accountId(0), money(0), COD(0), receiverPtr(nullptr), rcTeam(TEAM_NONE), mailsCount(0xFF) {}
     uint32 accountId;
     ObjectGuid senderGuid;
+    ObjectGuid sessionPlayerGuid;
+    ObjectGuid mailboxGuid;
     ObjectGuid receiver;
     ObjectGuid itemGuid;
     uint32      money;
@@ -101,7 +103,7 @@ public:
     void Callback(std::unique_ptr<QueryResult> result)
     {
         WorldSession* sess = sWorld.FindSession(accountId);
-        if (!sess || !sess->GetPlayer() || sess->GetPlayer()->GetObjectGuid() != senderGuid || !sess->GetPlayer()->IsInWorld())
+        if (!sess || !sess->GetPlayer() || sess->GetPlayer()->GetObjectGuid() != sessionPlayerGuid || !sess->GetPlayer()->IsInWorld())
         {
             delete this;
             return;
@@ -137,7 +139,11 @@ public:
 void WorldSession::HandleSendMail(WorldPackets::Mail::SendMail const& packet)
 {
     if (SuiTacticalFreeze::IsSessionGameplayFrozen(this))
+    {
+        // The send may precede the client's freeze snapshot. Resolve its pending UI.
+        SendMailResult(0, MAIL_SEND, MAIL_ERR_INTERNAL_ERROR);
         return;
+    }
 
     // [SUI] acts as the DRIVEN bot while possessing one, else the session player.
     Player* pActor = GetSuiActor();
@@ -155,7 +161,9 @@ void WorldSession::HandleSendMail(WorldPackets::Mail::SendMail const& packet)
 
     std::unique_ptr<WorldSession::AsyncMailSendRequest> req = std::make_unique<WorldSession::AsyncMailSendRequest>();
     req->accountId = GetAccountId();
-    req->senderGuid = GetMasterPlayer()->GetObjectGuid();
+    req->sessionPlayerGuid = GetPlayer()->GetObjectGuid();
+    req->senderGuid = pActor->GetObjectGuid();
+    req->mailboxGuid = packet.mailboxGuid;
 
     req->receiverName = packet.receiverName;
     req->subject = packet.subject;
@@ -192,7 +200,7 @@ void WorldSession::HandleSendMail(WorldPackets::Mail::SendMail const& packet)
     if (req->receiverName.empty())
         return;
 
-    MasterPlayer* pl = GetMasterPlayer();
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
 
     if (normalizePlayerName(req->receiverName))
         req->receiver = sObjectMgr.GetPlayerGuidByName(req->receiverName);
@@ -253,9 +261,24 @@ void WorldSession::HandleSendMailCallback(WorldSession::AsyncMailSendRequest* re
 {
     // [SUI] acts as the DRIVEN bot while possessing one, else the session player.
     Player* pActor = GetSuiActor();
-    MasterPlayer* pl = GetMasterPlayer();
+    // The database reply can arrive after a body switch, movement, or a freeze.
+    // Never debit a newly controlled body for the previous body's request.
+    if (!pActor || !pActor->IsInWorld() || pActor->GetObjectGuid() != req->senderGuid ||
+        SuiTacticalFreeze::IsSessionGameplayFrozen(this) || !CheckMailBox(req->mailboxGuid))
+    {
+        SendMailResult(0, MAIL_SEND, MAIL_ERR_INTERNAL_ERROR);
+        return;
+    }
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
     Player* loadedPlayer = pActor;
     ASSERT(pl);
+    // Online state may also have changed while the mail-count query was pending.
+    req->receiverPtr = sObjectMgr.GetPlayer(req->receiver);
+    if (req->receiverPtr)
+    {
+        req->rcTeam = req->receiverPtr->GetTeam();
+        req->mailsCount = req->receiverPtr->GetSession()->GetMasterPlayer()->GetMailSize();
+    }
 
     uint32 reqmoney = req->money + 30;
 
@@ -328,8 +351,8 @@ void WorldSession::HandleSendMailCallback(WorldSession::AsyncMailSendRequest* re
         }
     }
 
-    // check trial account restrictions for offline receiver
-    if (!req->receiverPtr && GetSecurity() <= SEC_PLAYER && sAccountMgr.HasTrialRestrictions(receiverAccount))
+    // Recheck recipient account restrictions after the asynchronous query.
+    if (GetSecurity() <= SEC_PLAYER && sAccountMgr.HasTrialRestrictions(receiverAccount))
     {
         SendMailResult(0, MAIL_SEND, MAIL_ERR_DISABLED_FOR_TRIAL_ACC);
         return;
@@ -348,7 +371,7 @@ void WorldSession::HandleSendMailCallback(WorldSession::AsyncMailSendRequest* re
     if (!data.CanMail(receiverAccount))
     {
         std::stringstream details;
-        std::string from = ChatHandler(this).playerLink(GetMasterPlayer()->GetName());
+        std::string from = ChatHandler(this).playerLink(pActor->GetName());
         std::string to = ChatHandler(this).playerLink(req->receiverName);
         details << from << " -> " << to << "\n";
         details << req->subject << "\n";
@@ -462,7 +485,7 @@ void WorldSession::HandleMailMarkAsRead(WorldPackets::Mail::MailMarkAsRead const
     if (!CheckMailBox(packet.mailboxGuid))
         return;
 
-    MasterPlayer* pl = GetMasterPlayer();
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
     ASSERT(pl);
 
     if (Mail *m = pl->GetMail(packet.mailId))
@@ -501,7 +524,7 @@ void WorldSession::HandleMailDelete(WorldPackets::Mail::MailDelete const& packet
     if (!CheckMailBox(packet.mailboxGuid))
         return;
 
-    MasterPlayer* pl = GetMasterPlayer();
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
     ASSERT(pl);
     pl->MarkMailsUpdated();
 
@@ -537,7 +560,7 @@ void WorldSession::HandleMailReturnToSender(WorldPackets::Mail::MailReturnToSend
     if (!CheckMailBox(packet.mailboxGuid))
         return;
 
-    MasterPlayer* pl = GetMasterPlayer();
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
     ASSERT(pl);
     Mail *m = pl->GetMail(packet.mailId);
     if (!m || m->state == MAIL_STATE_DELETED || m->deliver_time > time(nullptr))
@@ -595,7 +618,7 @@ void WorldSession::HandleMailTakeItem(WorldPackets::Mail::MailTakeItem const& pa
     if (!CheckMailBox(packet.mailboxGuid))
         return;
 
-    MasterPlayer* pl = GetMasterPlayer();
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
     Player* loadedPlayer = pActor;
     ASSERT(pl);
 
@@ -728,7 +751,7 @@ void WorldSession::HandleMailTakeMoney(WorldPackets::Mail::MailTakeMoney const& 
     if (!CheckMailBox(packet.mailboxGuid))
         return;
 
-    MasterPlayer* pl = GetMasterPlayer();
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
     Player* loadedPlayer = pActor;
     ASSERT(pl);
 
@@ -777,7 +800,7 @@ void WorldSession::HandleGetMailList(WorldPackets::Mail::GetMailList const& pack
     if (!CheckMailBox(packet.mailboxGuid))
         return;
 
-    MasterPlayer* pl = GetMasterPlayer();
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
     ASSERT(pl);
 
     constexpr uint32 averageSizePerMail =
@@ -917,7 +940,7 @@ void WorldSession::HandleMailCreateTextItem(WorldPackets::Mail::MailCreateTextIt
     if (!CheckMailBox(packet.mailboxGuid))
         return;
 
-    MasterPlayer* pl = GetMasterPlayer();
+    MasterPlayer* pl = pActor->GetSession()->GetMasterPlayer();
     ASSERT(pl);
     Player* loadedPlayer = pActor;
 
@@ -968,7 +991,7 @@ void WorldSession::HandleQueryNextMailTime(NullClientPacket const& /*packet*/)
 {
     // [SUI] acts as the DRIVEN bot while possessing one, else the session player.
     Player* pActor = GetSuiActor();
-    MasterPlayer* player = GetMasterPlayer();
+    MasterPlayer* player = pActor->GetSession()->GetMasterPlayer();
     ASSERT(player);
     WorldPacket data(MSG_QUERY_NEXT_MAIL_TIME, 8);
     if (player->HasUnreadMail())

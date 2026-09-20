@@ -27,6 +27,7 @@
 #include "World.h"
 #include "Creature.h"
 #include "Player.h"
+#include "SuiPossess.h"
 #include "GameObjectAI.h"
 #include "ObjectMgr.h"
 #include "ObjectGuid.h"
@@ -695,11 +696,17 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
     // 2 specialized loops for speed optimization in non-unit case
     if (IsType(TYPEMASK_UNIT))                              // unit (creature/player) case
     {
+        uint16 const* fieldFlags = nullptr;
+        uint16 const visibleFlags = GetUpdateFieldFlagsForTarget(target, fieldFlags);
         for (uint16 index = 0; index < m_valuesCount; ++index)
         {
             if (updateMask->GetBit(index))
             {
-                if (index == UNIT_NPC_FLAGS)
+                // Forced possession refreshes include old owner-only fields so
+                // release clears cached values without disclosing their current data.
+                if ((fieldFlags[index] & UF_FLAG_OWNER_ONLY) && !(fieldFlags[index] & visibleFlags))
+                    *data << uint32(0);
+                else if (index == UNIT_NPC_FLAGS)
                 {
                     uint32 appendValue = m_uint32Values[index];
 
@@ -713,7 +720,9 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
 
                         if (appendValue & UNIT_NPC_FLAG_STABLEMASTER)
                         {
-                            if (target->GetClass() != CLASS_HUNTER)
+                            // Service eligibility belongs to the body receiving gameplay input.
+                            Player const* actor = target->GetSession()->GetSuiActor();
+                            if (!actor || actor->GetClass() != CLASS_HUNTER)
                                 appendValue &= ~UNIT_NPC_FLAG_STABLEMASTER;
                         }
 
@@ -836,7 +845,7 @@ void Object::BuildValuesUpdate(uint8 updatetype, ByteBuffer* data, UpdateMask* u
                 // Hide real health value. Send a percent instead. See ShowHealthValues option in mangosd.conf
                 else if (!ShowHealthValues && (index == UNIT_FIELD_HEALTH || index == UNIT_FIELD_MAXHEALTH))
                 {
-                    if (target->CanSeeHealthOf((Unit*)this))
+                    if (target->CanSeeHealthOf((Unit*)this) || SuiPossess::IsControlledOwnerOf(ToUnit(), target))
                         *data << m_uint32Values[index];
                     else // Hide
                     {
@@ -1057,7 +1066,8 @@ uint16 Object::GetUpdateFieldFlagsForTarget(Player const* target, uint16 const*&
             else
             {
                 if (static_cast<Unit const*>(this)->GetOwnerGuid() == target->GetObjectGuid() ||
-                    static_cast<Unit const*>(this)->GetCharmerGuid() == target->GetObjectGuid())
+                    static_cast<Unit const*>(this)->GetCharmerGuid() == target->GetObjectGuid() ||
+                    SuiPossess::IsControlledOwnerOf(ToUnit(), target))
                     visibleFlag |= UF_FLAG_OWNER_ONLY;
 
                 if (HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_SPECIALINFO))

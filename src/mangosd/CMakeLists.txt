@@ -146,6 +146,8 @@ install(TARGETS ${EXECUTABLE_NAME} DESTINATION ${BIN_DIR})
 install(FILES run-mangosd DESTINATION ${BIN_DIR})
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/mangosd.conf.dist.in ${CMAKE_CURRENT_BINARY_DIR}/mangosd.conf.dist)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/mangosd.conf.dist DESTINATION ${CONF_DIR})
+# Raid quartermaster policy template (ORDER_SUPPLY reads <conf dir>/sui-raid-supply.json).
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/sui-raid-supply.json.dist DESTINATION ${CONF_DIR})
 
 if(WIN32 AND MSVC)
   install(FILES $<TARGET_PDB_FILE:${EXECUTABLE_NAME}> DESTINATION ${BIN_DIR} OPTIONAL)

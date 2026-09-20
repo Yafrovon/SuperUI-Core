@@ -563,6 +563,9 @@ class ChatHandler
         bool HandleGroupAddItemCommand(char* args);
         bool HandleGroupReviveCommand(char* args);
         bool HandleGroupReplenishCommand(char* args);
+        bool HandleGroupQaElixirsCommand(char* args);
+        bool HandleGroupQaRepairCommand(char* args);
+        bool HandleGroupQaCheckpointCommand(char* args);
         bool HandleGroupSummonCommand(char* args);
 
         bool HandleHonorShow(char* args);

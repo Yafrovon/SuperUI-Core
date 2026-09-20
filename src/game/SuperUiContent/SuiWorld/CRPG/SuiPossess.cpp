@@ -8,6 +8,9 @@
  */
 
 #include "SuiPossess.h"
+#include "SuiCommanderRaid.h"
+#include "SuiRaidPrepare.h"
+#include "SuiRaidSupply.h"
 #include "ScriptMgr.h"
 #include <algorithm>
 #include <unordered_map>
@@ -33,6 +36,8 @@
 #include "World.h"
 #include "Maps/Map.h"
 #include "Weather.h"
+#include "UpdateData.h"
+#include "UpdateMask.h"
 #include "ReputationMgr.h"
 
 namespace SuiPossess
@@ -93,6 +98,61 @@ Player* GetPossessor(Unit const* bot)
 bool IsSuiPossessed(Unit const* unit)
 {
     return GetPossessor(unit) != nullptr;
+}
+
+bool IsControlledOwnerOf(Unit const* unit, Player const* observer)
+{
+    if (!unit || !observer || !observer->GetSession())
+        return false;
+    Player* controlled = GetControlledBot(observer->GetSession());
+    return controlled && GetPossessor(controlled) == observer &&
+        (unit->GetOwnerGuid() == controlled->GetObjectGuid() ||
+         unit->GetCharmerGuid() == controlled->GetObjectGuid());
+}
+
+// Re-evaluate objects already streamed before a body change. Only this observer
+// receives the refresh; ordinary object updates handle newly streamed objects.
+static void RefreshActorVisibility(WorldSession* session, ObjectGuid previousActor)
+{
+    Player* observer = session->GetPlayer();
+    Player* actor = session->GetSuiActor();
+    if (!observer || !observer->IsInWorld() || !actor)
+        return;
+    ObjectGuidSet visible;
+    {
+        std::shared_lock<std::shared_timed_mutex> guard(observer->m_visibleGUIDs_lock);
+        visible = observer->m_visibleGUIDs;
+    }
+    UpdateData data;
+    for (ObjectGuid const& guid : visible)
+    {
+        if (!guid.IsUnit())
+            continue;
+        Unit* unit = observer->GetMap()->GetUnit(guid);
+        if (!unit)
+            continue;
+        UpdateMask mask;
+        mask.SetCount(unit->GetValuesCount());
+        if (unit->GetTypeId() == TYPEID_UNIT)
+            mask.SetBit(UNIT_NPC_FLAGS);
+        ObjectGuid const owner = unit->GetOwnerGuid();
+        ObjectGuid const charmer = unit->GetCharmerGuid();
+        bool const affectedPet = unit->GetTypeId() == TYPEID_UNIT &&
+            (owner == previousActor || charmer == previousActor ||
+             owner == actor->GetObjectGuid() || charmer == actor->GetObjectGuid());
+        if (affectedPet)
+        {
+            // includingEmpty sends zero training points too. The serializer masks
+            // owner-only values back to zero when this observer loses access.
+            unit->BuildValuesUpdateBlockForPlayerWithFlags(data, observer, UF_FLAG_OWNER_ONLY, true);
+            mask.SetBit(UNIT_FIELD_HEALTH);
+            mask.SetBit(UNIT_FIELD_MAXHEALTH);
+        }
+        if (mask.HasData())
+            unit->BuildValuesUpdateBlockForPlayer(data, mask, observer);
+    }
+    if (data.HasData())
+        data.Send(session);
 }
 
 static AiBotAI* BotAiOf(Player* bot)
@@ -327,6 +387,7 @@ static AckResult TryBegin(WorldSession* session, ObjectGuid targetGuid, Player**
 
     sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[SUI] %s now possesses bot %s",
         possessor->GetName(), bot->GetName());
+    RefreshActorVisibility(session, possessor->GetObjectGuid());
     if (grantedBot)
         *grantedBot = bot;
     return ACK_OK;
@@ -465,6 +526,7 @@ static bool DoRelease(WorldSession* session, AckResult reason, bool serverInitia
         botGuid.GetString().c_str(), uint32(reason));
 
     SendAck(session, possessor ? possessor->GetObjectGuid() : ObjectGuid(), reason, possessor);
+    RefreshActorVisibility(session, botGuid);
     // The client resets its pet bar on the release ack; hand the own character's
     // pet bar back after it (no pet → nothing sent, bar stays empty).
     if (possessor && possessor->IsInWorld())
@@ -842,6 +904,7 @@ void HandleOrder(WorldSession* session, uint8 orderType,
     // Formation slots depend on the whole ordered set, so those subjects are
     // collected here and laid out after the expansion loop below.
     std::vector<std::pair<Player*, AiBotAI*>> formationSubjects;
+    std::set<Group*> changedChainGroups;
 
     // [SUI] Owner 2026-08-28: bots must not STACK in transit or on arrival. A
     // multi-subject move/waypoint order fans out around the clicked point —
@@ -919,9 +982,14 @@ void HandleOrder(WorldSession* session, uint8 orderType,
         // formation-snapped on the next tick.
         // [SUI] Every explicit order is discipline: the idle wander stands down
         // until the journey is abandoned (doctrine change or possession).
-        if (orderType != ORDER_AUTO)
+        // Preparation and supply are not movement orders: they neither stand the
+        // wander down nor yield an applied raid plan row.
+        bool const logistics = orderType == ORDER_PREPARE || orderType == ORDER_SUPPLY;
+        if (orderType != ORDER_AUTO && !logistics)
             ai->m_suiRtsHold = true;
 
+        if (!logistics)
+            SuiCommanderRaid::Yield(pMember);
         char json[192];
         switch (orderType)
         {
@@ -976,7 +1044,7 @@ void HandleOrder(WorldSession* session, uint8 orderType,
                     "{\"type\":\"SET_ESCORT\",\"payload\":{\"player_name\":\"%s\"}}",
                     realTarget ? followTarget->GetName() : "");
                 ai->SuiInjectCommandLine(json);
-                NotifyChainChanged(pMember);
+                if (Group* changed = pMember->GetGroup()) changedChainGroups.insert(changed);
                 break;
             }
             case ORDER_LINK:
@@ -993,7 +1061,7 @@ void HandleOrder(WorldSession* session, uint8 orderType,
                     // An explicit re-link is the human saying "come": it also lifts a
                     // world hold (the catch-up rule then walks or ports it over).
                     ai->m_suiLandedHold = false;
-                NotifyChainChanged(pMember);
+                if (Group* changed = pMember->GetGroup()) changedChainGroups.insert(changed);
                 break;
             case ORDER_PATROL:
             {
@@ -1043,6 +1111,12 @@ void HandleOrder(WorldSession* session, uint8 orderType,
             case ORDER_AUTO:
                 ai->m_suiManual = false;
                 break;
+            case ORDER_PREPARE:
+                SuiRaidPrepare::Begin(player, pMember, ai, uint32(std::max(0.f, x)));
+                break;
+            case ORDER_SUPPLY:
+                SuiRaidSupply::Supply(player, pMember, uint32(std::max(0.f, x)));
+                break;
             default:
                 break;
         }
@@ -1056,6 +1130,14 @@ void HandleOrder(WorldSession* session, uint8 orderType,
             orderBot(itr->getSource());
     else
         orderBot(player);   // empty subject list solo = the own character
+    if (orderType == ORDER_SUPPLY)
+        SuiRaidSupply::Flush(player); // one receipt per supply order
+
+    // One roster/facts publication per affected group, not per ordered member.
+    // Bulk raid link/follow orders otherwise enqueue N full-raid snapshots and
+    // can disconnect the commander with a full socket send queue.
+    for (Group* changed : changedChainGroups)
+        BroadcastRoster(changed);
 
     if (!formationSubjects.empty())
         DispatchFormation(player, formationSubjects,
@@ -1252,10 +1334,14 @@ static void AppendSnapshotItem(WorldPacket& data, uint8 bag, uint8 slot, Item* i
     data << uint64(item->GetObjectGuid().GetRawValue());
     data << uint32(item->GetEntry());
     data << uint32(item->GetCount());
+    // Quivers and ammo pouches (ITEM_CLASS_QUIVER) are Bag objects too: the object
+    // type is decided by INVTYPE_BAG (NewItemOrBag), which is exactly what IsBag()
+    // tests. The old Class == ITEM_CLASS_CONTAINER test typed a possessed hunter's
+    // quiver as a plain item, so the client could neither open it nor list its
+    // arrows (MSUIClient issue #40).
     uint8 bagSlots = 0;
-    if (ItemPrototype const* proto = item->GetProto())
-        if (proto->Class == ITEM_CLASS_CONTAINER)
-            bagSlots = (uint8)((Bag*)item)->GetBagSize();
+    if (item->IsBag())
+        bagSlots = (uint8)((Bag*)item)->GetBagSize();
     data << bagSlots;
 }
 
@@ -1300,8 +1386,7 @@ static void SendSnapshot(WorldSession* to, Player* bot)
         }
     for (uint8 bagSlot = BANK_SLOT_BAG_START; bagSlot < BANK_SLOT_BAG_END; ++bagSlot)
         if (Item* bagItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bagSlot))
-            if (ItemPrototype const* proto = bagItem->GetProto())
-                if (proto->Class == ITEM_CLASS_CONTAINER)
+            if (bagItem->IsBag()) // containers AND quivers/ammo pouches (issue #40)
                 {
                     Bag* pBag = (Bag*)bagItem;
                     for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
@@ -1313,8 +1398,7 @@ static void SendSnapshot(WorldSession* to, Player* bot)
                 }
     for (uint8 bagSlot = INVENTORY_SLOT_BAG_START; bagSlot < INVENTORY_SLOT_BAG_END; ++bagSlot)
         if (Item* bagItem = bot->GetItemByPos(INVENTORY_SLOT_BAG_0, bagSlot))
-            if (ItemPrototype const* proto = bagItem->GetProto())
-                if (proto->Class == ITEM_CLASS_CONTAINER)
+            if (bagItem->IsBag()) // containers AND quivers/ammo pouches (issue #40)
                 {
                     Bag* pBag = (Bag*)bagItem;
                     for (uint32 j = 0; j < pBag->GetBagSize(); ++j)
@@ -2533,6 +2617,7 @@ void MirrorOwnerPacket(WorldSession* botSession, WorldPacket const* packet)
         case SMSG_COOLDOWN_EVENT:
         case SMSG_CLEAR_COOLDOWN:
         case SMSG_CAST_RESULT:
+        case SMSG_STANDSTATE_UPDATE:
         // [SUI] P4b: the NPC-interaction reply frames of a driven bot. The quest
         // and gossip handler family now runs as GetSuiActor() (the possessed bot),
         // so these are built from the BOT's quest state and must reach the

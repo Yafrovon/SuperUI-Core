@@ -900,5 +900,7 @@ enum OpcodesList
     SMSG_SUI_TACTICAL_FREEZE               = 871,      // 0x0367
     CMSG_SUI_TACTICAL_QUEUE                = 872,      // 0x0368
     SMSG_SUI_TACTICAL_QUEUE                = 873,      // 0x0369
-    NUM_MSG_TYPES                          = 874
+    CMSG_SUI_COMMANDER_RAID                = 874,
+    SMSG_SUI_COMMANDER_RAID                = 875,
+    NUM_MSG_TYPES                          = 876
 };

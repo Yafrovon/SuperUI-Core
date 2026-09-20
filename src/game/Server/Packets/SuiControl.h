@@ -407,6 +407,39 @@ namespace WorldPackets
             }
         };
 
+        class CommanderRaid final : public ClientPacket
+        {
+        public:
+            struct Record
+            {
+                ObjectGuid guid;
+                uint8 role=0, team=0, manual=0;
+                ObjectGuid primary;
+                float gx=0,gy=0,gz=0,ax=0,ay=0,az=0;
+                uint32 heal=0,damage=0,focus=0,interrupt=0,dispel=0,taunt=0,defensive=0;
+            };
+            uint8 version=0,operation=0,flags=0;
+            uint32 requestId=0,revision=0,bossEntry=0,mapId=0;
+            std::string definition;
+            bool exactSize=false;
+            std::vector<Record> records;
+            explicit CommanderRaid() : ClientPacket(CMSG_SUI_COMMANDER_RAID) {}
+            void ReadFromWorldPacket(WorldPacket& data) override
+            {
+                if (data.size()<24) { data.rfinish();return; }
+                uint8 count=0; uint32 length=0;
+                data >> version >> requestId >> revision >> operation >> bossEntry >> flags >> count >> mapId >> length;
+                if (count>40 || length>32768 || data.size()!=24+size_t(count)*71+length || (operation!=1 && (count!=0 || length!=0)))
+                { data.rfinish();return; }
+                records.resize(count);
+                for (auto& r:records) data >> r.guid >> r.role >> r.team >> r.manual >> r.gx >> r.gy >> r.gz
+                    >> r.ax >> r.ay >> r.az >> r.heal >> r.damage >> r.primary >> r.focus >> r.interrupt >> r.dispel >> r.taunt >> r.defensive;
+                definition.resize(length);
+                for(uint32 i=0;i<length;i++) {uint8 value=0;data>>value;definition[i]=char(value);}
+                exactSize=true;
+            }
+        };
+
         class TacticalQueue final : public ClientPacket
         {
         public:

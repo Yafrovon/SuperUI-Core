@@ -539,6 +539,7 @@ class WorldSession
         void HandleSuiCompanionOpcode(WorldPackets::SuiControl::Companion const& packet);
         void HandleSuiPartyTaxiOpcode(WorldPackets::SuiControl::PartyTaxi const& packet);
         void HandleSuiTacticalFreezeOpcode(WorldPackets::SuiControl::TacticalFreeze const& packet);
+        void HandleSuiCommanderRaidOpcode(WorldPackets::SuiControl::CommanderRaid const& packet);
         void HandleSuiTacticalQueueOpcode(WorldPackets::SuiControl::TacticalQueue const& packet);
         void HandleSuiPortalPrepareOpcode(WorldPackets::SuiPortal::Prepare const& packet);
         void HandleSuiPortalReadyOpcode(WorldPackets::SuiPortal::Ready const& packet);

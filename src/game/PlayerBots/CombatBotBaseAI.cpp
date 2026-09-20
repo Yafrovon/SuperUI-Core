@@ -2334,6 +2334,24 @@ bool CombatBotBaseAI::IsValidBuffTargetInternal(Unit const* pTarget,
 
     for (const auto& i : pTarget->GetSpellAuraHolderMap())
     {
+        // Greater blessings have separate rank chains/visuals. Preserve an
+        // equally strong, longer class buff, including one supplied by another
+        // Paladin; otherwise idle maintenance silently shortens raid preparation.
+        SpellAuraHolder const* blessing = i.second;
+        SpellEntry const* active = blessing ? blessing->GetSpellProto() : nullptr;
+        if (active && Spells::GetSpellSpecific(pSpellEntry->Id) == SPELL_BLESSING &&
+            Spells::GetSpellSpecific(active->Id) == SPELL_BLESSING &&
+            active->SpellFamilyFlags == pSpellEntry->SpellFamilyFlags &&
+            active->EffectApplyAuraName[0] == pSpellEntry->EffectApplyAuraName[0] &&
+            active->EffectMiscValue[0] == pSpellEntry->EffectMiscValue[0] &&
+            blessing->GetAuraMaxDuration() > pSpellEntry->GetDuration() &&
+            Spells::CompareAuraRanks(pSpellEntry->Id, active->Id) <= 0 &&
+            (!allowAuraRefresh || blessing->IsPermanent() ||
+             blessing->GetCasterGuid() != me->GetObjectGuid() ||
+             blessing->GetAuraDuration() < 0 ||
+             blessing->GetAuraDuration() > BUFF_REFRESH_WINDOW_MS))
+            return false;
+
         if (i.first == pSpellEntry->Id)
         {
             SpellAuraHolder const* holder = i.second;

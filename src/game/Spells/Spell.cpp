@@ -1,3 +1,4 @@
+#include "SuiCommanderRaid.h"
 /*
  * Copyright (C) 2005-2011 MaNGOS <http://getmangos.com/>
  * Copyright (C) 2009-2011 MaNGOSZero <https://github.com/mangos/zero>
@@ -3458,6 +3459,9 @@ SpellCastResult Spell::prepare(Aura* triggeredByAura, uint32 chance)
         if (m_spellScript)
             m_spellScript->OnSuccessfulStart(this);
 
+        // Successful triggered casts may have a real windup without a client cast bar.
+        SuiCommanderRaid::ObserveCast(m_casterUnit,m_spellInfo->Id,m_targets.getUnitTarget(),true,m_casttime);
+
         if (!m_IsTriggeredSpell)
         {
             // will show cast bar
@@ -4529,6 +4533,7 @@ void Spell::SendSpellStart()
 
 void Spell::SendSpellGo()
 {
+    SuiCommanderRaid::ObserveCast(m_casterUnit,m_spellInfo->Id,m_targets.getUnitTarget(),false);
     // not send invisible spell casting
     if (!IsNeedSendToClient())
     {
