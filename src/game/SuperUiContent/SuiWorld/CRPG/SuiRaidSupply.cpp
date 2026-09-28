@@ -27,6 +27,7 @@ namespace
         std::string error;
         std::vector<Want> everyone, mana, tank, healer, physical, caster, petFood;
         uint32 ammoCount = 0, arrows = 0, bullets = 0;
+        uint32 bag = 0;   // container for every empty bag slot (0 = none)
     };
     struct Receipt
     {
@@ -106,6 +107,13 @@ namespace
                     error = "ammo: unknown item or count above 4000";
             }
         }
+        if (j.count("bag"))
+        {
+            p.bag = j.value("bag", 0u);
+            ItemPrototype const* proto = p.bag ? sObjectMgr.GetItemPrototype(p.bag) : nullptr;
+            if (p.bag && (!proto || proto->Class != ITEM_CLASS_CONTAINER || proto->SubClass != ITEM_SUBCLASS_CONTAINER))
+                error = "bag: not a plain container item";
+        }
         if (!error.empty()) { p.error = error; return p; }
         p.loaded = true;
         return p;
@@ -163,6 +171,20 @@ namespace
         return bot->GetPowerType() == POWER_MANA ? BucketCaster : BucketPhysical;
     }
 
+    // A member with an empty bag slot gets the policy's container there (a raider without bags has
+    // no room for ammunition, potions or loot).
+    void Bags(Player* bot, Policy const& policy, Receipt& receipt)
+    {
+        if (!policy.bag) return;
+        for (uint8 slot = INVENTORY_SLOT_BAG_START; slot < INVENTORY_SLOT_BAG_END; ++slot)
+        {
+            if (bot->GetItemByPos(INVENTORY_SLOT_BAG_0, slot)) continue;
+            uint16 dest = 0;
+            if (bot->CanEquipNewItem(slot, dest, policy.bag, false) != EQUIP_ERR_OK) continue;
+            if (bot->EquipNewItem(dest, policy.bag, true)) ++receipt.items;
+        }
+    }
+
     void Ammunition(Player* bot, Policy const& policy, Receipt& receipt)
     {
         if (!policy.ammoCount) return;
@@ -209,6 +231,7 @@ namespace SuiRaidSupply
         Policy policy = Load();
         if (!policy.loaded) { receipt.error = policy.error; return; }
         ++receipt.members;
+        Bags(bot, policy, receipt);
         Grant(bot, policy.everyone, receipt);
         if (bot->GetPowerType() == POWER_MANA) Grant(bot, policy.mana, receipt);
         switch (Resolve(bot, role))

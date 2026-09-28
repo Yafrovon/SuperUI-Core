@@ -1,4 +1,5 @@
 #include "SuiCommanderRaid.h"
+#include "SuiRaidTelemetry.h"
 /*
  * Copyright (C) 2005-2011 MaNGOS <http://getmangos.com/>
  * Copyright (C) 2009-2011 MaNGOSZero <https://github.com/mangos/zero>
@@ -3461,6 +3462,7 @@ SpellCastResult Spell::prepare(Aura* triggeredByAura, uint32 chance)
 
         // Successful triggered casts may have a real windup without a client cast bar.
         SuiCommanderRaid::ObserveCast(m_casterUnit,m_spellInfo->Id,m_targets.getUnitTarget(),true,m_casttime);
+        SuiRaidTelemetry::OnCreatureCast(m_casterUnit, m_spellInfo);
 
         if (!m_IsTriggeredSpell)
         {

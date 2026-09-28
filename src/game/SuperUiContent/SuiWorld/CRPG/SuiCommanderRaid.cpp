@@ -1,6 +1,7 @@
 #include "SuiCommanderRaid.h"
 #include "SuiEncounterDefinition.h"
 #include "Creature.h"
+#include "TemporarySummon.h"
 #include <atomic>
 #include "SuiPossess.h"
 #include "SuiCompanion.h"
@@ -118,6 +119,11 @@ namespace
         ObjectGuid breaker; std::chrono::steady_clock::time_point breakerAt{}; // the member elected to break the released add's control (v45)
         std::map<ObjectGuid,bool> controllable; std::chrono::steady_clock::time_point controllableAt{}; // add -> a raid damage member can hold it (v45)
         std::map<ObjectGuid,ObjectGuid> addTankOf; // uncontrollable add -> the add tank assigned to hold it (v53)
+        // Adds SUMMONED by a watched unit during the fight. They are never required kills (an
+        // undeclared entry sorts last in KillRank) and never extend the completion predicate;
+        // they exist so the add tanks and add damage members can SEE them. Bounded like
+        // addObjectives, because a summoner that keeps summoning must not grow this without end.
+        std::map<ObjectGuid,uint32> summonedAdds; // summon guid -> entry
     };
     std::recursive_mutex mutex;
     std::map<uint64, Plan> plans;
@@ -2966,6 +2972,21 @@ void WorldSession::HandleSuiCommanderRaidOpcode(WorldPackets::SuiControl::Comman
     Reply(this,packet.requestId,0,&plans[Raw(owner->GetObjectGuid())]);
 }
 
+bool SuiCommanderRaid::ForbidsSplash(Unit* actor,Unit* enemy)
+{
+    if(!actor||!enemy||watchedEntries[0].load()==0)return false;
+    std::lock_guard<std::recursive_mutex> guard(mutex);
+    for(auto const& pair:plans)if(pair.second.state==2&&pair.second.definition.addPolicy=="hold")
+        for(auto const& row:pair.second.rows)if(row.guid==actor->GetObjectGuid()&&!row.manual&&!row.yielded)
+        {
+            if(row.role!=4)return false;
+            auto const& objectives=pair.second.definition.objectives;
+            if(std::find(objectives.begin(),objectives.end(),enemy->GetEntry())!=objectives.end())return false;
+            for(auto const& requirement:pair.second.definition.requiredAdds)if(requirement.entry==enemy->GetEntry())return true;
+            return false;
+        }
+    return false;
+}
 bool SuiCommanderRaid::Owns(Unit* actor)
 {
     if(!actor)return false;
@@ -2973,6 +2994,16 @@ bool SuiCommanderRaid::Owns(Unit* actor)
     for(auto const& pair:plans)if(pair.second.state==2)
         for(auto const& row:pair.second.rows)if(row.guid==actor->GetObjectGuid()&&!row.manual&&!row.yielded)return true;
     return false;
+}
+// Cheap on purpose: this sits on every creature's Update. The first slot is zero whenever no
+// plan is armed, so an idle server pays one atomic load.
+bool SuiCommanderRaid::WatchesSummonerOf(Creature* creature)
+{
+    if(!creature||!creature->IsTemporarySummon()||watchedEntries[0].load()==0)return false;
+    ObjectGuid const summoner=static_cast<TemporarySummon*>(creature)->GetSummonerGuid();
+    if(summoner.IsEmpty()||!summoner.IsCreature())return false;
+    Creature* parent=creature->GetMap()?creature->GetMap()->GetCreature(summoner):nullptr;
+    return parent&&Watches(parent->GetEntry());
 }
 bool SuiCommanderRaid::Watches(uint32 entry)
 {
@@ -2988,6 +3019,27 @@ void SuiCommanderRaid::ObserveUnit(Unit* boss,uint32 diff)
         Plan& plan=pair.second;
         if(plan.state!=2||plan.definition.map!=boss->GetMapId()||plan.instance!=boss->GetInstanceId())continue;
         bool primary=std::find(plan.definition.objectives.begin(),plan.definition.objectives.end(),boss->GetEntry())!=plan.definition.objectives.end();
+        // A summon of a unit this plan watches: remember it while it lives and fights, forget it
+        // when it dies or despawns. Declared entries fall through to the branches below.
+        if(!primary&&boss->IsCreature()&&static_cast<Creature*>(boss)->IsTemporarySummon())
+        {
+            ObjectGuid const summoner=static_cast<TemporarySummon*>(static_cast<Creature*>(boss))->GetSummonerGuid();
+            Creature* parent=summoner.IsCreature()&&boss->GetMap()?boss->GetMap()->GetCreature(summoner):nullptr;
+            bool const ours=parent&&(std::find(plan.definition.objectives.begin(),plan.definition.objectives.end(),parent->GetEntry())!=plan.definition.objectives.end()
+                ||std::find(plan.definition.adds.begin(),plan.definition.adds.end(),parent->GetEntry())!=plan.definition.adds.end());
+            auto found=plan.summonedAdds.find(boss->GetObjectGuid());
+            if(ours&&boss->IsAlive()&&boss->IsInCombat())
+            {
+                if(found==plan.summonedAdds.end()&&plan.summonedAdds.size()<256)
+                {
+                    plan.summonedAdds[boss->GetObjectGuid()]=boss->GetEntry();
+                    sLog.Out(LOG_BASIC,LOG_LVL_BASIC,"[SUI][raid-summon] owner=%llu entry=%u guid=%llu summoner=%u",
+                        static_cast<unsigned long long>(Raw(plan.owner)),boss->GetEntry(),
+                        static_cast<unsigned long long>(Raw(boss->GetObjectGuid())),parent->GetEntry());
+                }
+            }
+            else if(found!=plan.summonedAdds.end())plan.summonedAdds.erase(found);
+        }
         bool required=std::any_of(plan.definition.requiredAdds.begin(),plan.definition.requiredAdds.end(),[&](AddRequirement const& r){return r.entry==boss->GetEntry();});
         if(required)
         {
@@ -3247,6 +3299,14 @@ bool SuiCommanderRaid::Tick(AiBotAI* ai,uint32 diff)
         float best=100000;
         std::list<Creature*> candidates;
         for(uint32 entry:plan->definition.adds)actor->GetCreatureListWithEntryInGrid(candidates,entry,100);
+        // Summons of a watched unit, observed into the plan rather than swept for here. Without
+        // them an add that no definition could declare - it has no spawn row to compile from -
+        // was invisible to every add tank and add damage member.
+        for(auto const& summon:plan->summonedAdds)
+            if(Creature* add=actor->GetMap()?actor->GetMap()->GetCreature(summon.first):nullptr)
+                if(add->IsAlive()&&actor->IsWithinDist(add,100.f,false)&&
+                   std::find(candidates.begin(),candidates.end(),add)==candidates.end())
+                    candidates.push_back(add);
         // A controlled add that stands before every uncontrolled fighting add in the kill order is the next kill
         // target: the damage that breaks its control is the kill order at work, not a wasted control (v42).
         Creature* release=nullptr;float looseRank=1e9f;auto const nowTick=std::chrono::steady_clock::now();

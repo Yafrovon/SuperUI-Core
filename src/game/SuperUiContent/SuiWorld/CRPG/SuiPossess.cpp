@@ -39,6 +39,7 @@
 #include "UpdateData.h"
 #include "UpdateMask.h"
 #include "ReputationMgr.h"
+#include "ThreatManager.h"
 
 namespace SuiPossess
 {
@@ -2671,6 +2672,9 @@ void MirrorOwnerPacket(WorldSession* botSession, WorldPacket const* packet)
         // pushes: Player::SendNewItem skips the possessor in its group broadcast so
         // this mirrored copy is the commander's only one.
         case SMSG_LOOT_RESPONSE:
+        // Group::MasterLoot builds the candidate list on the looter's session too, so without
+        // this the possessing master looter got the loot window and an empty assign menu.
+        case SMSG_LOOT_MASTER_LIST:
         case SMSG_LOOT_RELEASE_RESPONSE:
         case SMSG_LOOT_REMOVED:
         case SMSG_LOOT_CLEAR_MONEY:
@@ -2949,6 +2953,55 @@ void WorldSession::HandleSuiPartyQuestOpcode(
         subjects.push_back({ subject.guid, subject.rewardChoice });
     SuiPossess::HandlePartyQuest(this, packet.action, packet.questId,
         packet.npcGuid, subjects);
+}
+
+// Threat meter v1 (owner 2026-09-22: "as a tank or dps I can visualize where I am").
+// Reply layout: u8 version (1), u64 creature, u8 status (0 = list follows, 1 = not a
+// threat-list unit within reach of the driven body), u64 current victim, u16 list size,
+// u8 rows, rows x { u64 guid, f32 threat }, u8 hasSelf, [u16 rank (1-based), f32 threat].
+// The self row belongs to the body you drive (GetSuiActor), so a possessed bot sees its
+// own standing. Replied on this session: nothing here rides a bot's socket-less session.
+void WorldSession::HandleSuiThreatOpcode(WorldPackets::SuiControl::Threat const& packet)
+{
+    if (!packet.exactSize)
+        return;
+    Player* actor = GetSuiActor();
+    if (!actor || !actor->IsInWorld())
+        return;
+
+    WorldPacket data(SMSG_SUI_THREAT, 32 + packet.rows * 12);
+    data << uint8(1) << packet.target;
+    Unit* unit = actor->GetMap()->GetUnit(packet.target);
+    if (!unit || !unit->IsAlive() || !unit->CanHaveThreatList() ||
+        !actor->IsWithinDistInMap(unit, 200.0f))
+    {
+        data << uint8(1);
+        SendPacket(&data);
+        return;
+    }
+
+    std::vector<std::pair<ObjectGuid, float>> list;
+    for (HostileReference* ref : unit->GetThreatManager().getThreatList())
+        if (ref)
+            list.emplace_back(ref->getUnitGuid(), ref->getThreat());
+    std::stable_sort(list.begin(), list.end(),
+        [](auto const& a, auto const& b) { return a.second > b.second; });
+
+    Unit* victim = unit->GetVictim();
+    uint8 const rows = uint8(std::min<size_t>(packet.rows, list.size()));
+    data << uint8(0) << (victim ? victim->GetObjectGuid() : ObjectGuid());
+    data << uint16(std::min<size_t>(list.size(), 0xFFFF)) << rows;
+    for (uint8 i = 0; i < rows; ++i)
+        data << list[i].first << list[i].second;
+
+    auto self = std::find_if(list.begin(), list.end(),
+        [actor](auto const& row) { return row.first == actor->GetObjectGuid(); });
+    size_t const rank = size_t(self - list.begin());
+    if (self != list.end() && rank >= rows)
+        data << uint8(1) << uint16(std::min<size_t>(rank + 1, 0xFFFF)) << self->second;
+    else
+        data << uint8(0);
+    SendPacket(&data);
 }
 
 // ── GM commands (stock-client testable: .sui possess <name> / .sui release) ──

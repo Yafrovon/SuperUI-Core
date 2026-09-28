@@ -422,6 +422,14 @@ struct CombatDirective
 
 #include "RaidPlanLaw.h"   // [RAID-PLAN] SuiRaidPlan member + parse (PLAN_19 M-C)
 
+// [SELF-REZ] Backstop revival when no C# RESURRECT arrives (brain disabled): a dead bot
+// recovers in place after its graveyard run time, clamped to this window, once its
+// group is out of combat. A live brain rezzes at 15-22 s, well inside the minimum.
+static constexpr uint32 AIBOT_SELF_REZ_MIN_MS = 60 * 1000;
+static constexpr uint32 AIBOT_SELF_REZ_MAX_MS = 120 * 1000;
+// No hostile creature this close to the corpse, or the backstop revives elsewhere / waits.
+static constexpr float AIBOT_SELF_REZ_SAFE_YARDS = 40.0f;
+
 class AiBotAI : public CombatBotBaseAI
 {
 public:
@@ -759,6 +767,52 @@ public:
     bool TrySpecStackingAura(Unit* target, uint32 firstRankSpellId);
     bool HasAuraFromSpellChain(Unit const* target, uint32 firstRankSpellId) const;
     bool CanUseSpecAoE(Unit* center, float radius, uint32 minimumTargets = 2) const;
+    bool IsSpecAoEThreatSafe(Unit* enemy) const;
+    bool IsSpecAoETankHolder(Unit const* holder) const;
+    // [TACTICS] A tank holding a mob keeps its front pointed away from the group.
+    bool MaintainTankFacing(Unit* victim);
+    // [TACTICS] Ranged and healers step away from a hostile that is too close.
+    bool MaintainRangedSpacing();
+    bool AvoidGroundHazard();
+    // [TACTICS] Out of the front of a creature kind seen breathing a cone (every role but the tank).
+    bool AvoidFrontalCone();
+    uint32 m_coneNextMs = 0;
+    uint32 m_posLogNextMs = 0;   // [TELEMETRY] where tanks and healers stand in a fight
+    bool TrySpecFearWardTank();
+    // [TACTICS] Dispel by value: the member whose dispellable harm costs the raid most soon
+    // (damage still to land, a lost body, a doubled mana bill on a healer), spread across the
+    // dispellers by a short claim. Harm that does not matter to that member is worth nothing
+    // (a mana-cost curse on a rogue).
+    static float DispelValue(Player const* member, uint32 dispelMask);
+    Player* SelectValuedDispelTarget(SpellEntry const* spell, float minValue) const;
+    bool TrySpecValuedDispel(SpellEntry const* spell, float minValue);
+    bool TrySpecPurgeEnemy(SpellEntry const* spell);
+    bool TrySpecTranquilize();
+    bool TrySpecBanishSpareElite();
+    bool TrySpecPolymorphSpareElite();
+    bool TryCombatPotion();
+    // Creatures seen getting back up after falling (a pack that must die together).
+    static void NoteRiser(uint32 entry);
+    static bool IsKnownRiser(uint32 entry);
+    // Creatures seen healing themselves back to full after being brought low (not worth damage).
+    static void ObserveRebound(Unit const* mob);
+    static bool IsKnownRebounder(uint32 entry);
+    uint32 m_potionNextMs = 0;
+    uint32 m_hazardNextMs = 0;
+    uint32 m_hazardHoldUntil = 0;
+    uint32 m_repositionUntilMs = 0;
+    uint32 m_hazardMeleeHoldUntil = 0;     // my target stands in a pulse: wait outside         // a tactical move the rotation must not cancel           // escaped a hazard: do not follow back into it
+    float m_hazardAnchorX = 0.0f, m_hazardAnchorY = 0.0f;
+    // [TACTICS] A healer is on duty while anyone in its group nearby is fighting, whether or
+    // not a mob has touched the healer yet - the tank at the start of a pull is exactly that.
+    bool HealerOnDuty() const;
+    // [TACTICS] The member holding the most dangerous enemies right now (a boss beats an elite
+    // beats the rest; a tank role wins ties) - where the healers stand and look.
+    Player* ActiveTank() const;
+    uint32 m_rangedSpacingNextMs = 0;
+    bool m_meleeSteppedOut = false;
+    bool m_pulseSteppedOut = false;   // a ranged damage dealer healing up outside a burst circle
+    uint32 m_tankFacingNextMs = 0;
     Unit* SelectSafeSpecAdd(Unit const* primary) const;
     bool TrySpecInterrupt(Unit* target, std::initializer_list<uint32> spellIds);
     bool TrySpecTaunt(Unit* target);

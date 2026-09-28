@@ -13,6 +13,8 @@
  */
 
 #include "AiBotAIMain.h"
+#include "SuiAutopilot.h"
+#include "SuiRaidTelemetry.h"
 #include "SuiCommanderRaid.h"
 #include "SuiRaidPrepare.h"
 #include "AiBotCircuit.h" // [CIRCUIT] probe macros (CIRCUIT_BOARD.md)
@@ -152,6 +154,26 @@ WorldSession* AiBotAI::SuiCommanderSession() const
     if (me && me->GetSession() && !me->GetSession()->GetBot())
         return me->GetSession();
     return nullptr;
+}
+
+// True when this damage dealer should hold its damage: its victim is an elite someone else in its
+// group holds, and its own threat is up to 90 % of the holder's.
+static bool ThreatHoldFor(Player* me, CombatBotRoles role)
+{
+    if (role != ROLE_MELEE_DPS && role != ROLE_RANGE_DPS)
+        return false;
+    Unit* victim = me->GetVictim();
+    if (!victim || !victim->IsCreature() || !victim->IsAlive() || !victim->CanHaveThreatList() || !me->GetGroup())
+        return false;
+    Creature* foe = static_cast<Creature*>(victim);
+    if (!foe->IsElite() && !foe->IsWorldBoss())
+        return false;   // small adds die fast; nobody waits on them
+    Unit* holder = foe->GetVictim();
+    if (!holder || holder == me || !holder->IsPlayer() || !me->GetGroup()->IsMember(holder->GetObjectGuid()))
+        return false;
+    float const held = foe->GetThreatManager().getThreat(holder);
+    float const mine = foe->GetThreatManager().getThreat(me);
+    return mine >= held * 0.9f;
 }
 
 bool AiBotAI::SuiValidateOrderDest(float& x, float& y, float& z)
@@ -1231,6 +1253,10 @@ Player* AiBotAI::FindPartyBoss() const
             firstReal = pMember;
         }
     }
+    // [AUTOPILOT] No human in the group: the autopilot leader stands in for one, so the
+    // whole escort (formation, assist, group tactics) runs unchanged under a bot leader.
+    if (!firstReal)
+        return SuiAutopilot::LeaderFor(me);
     // leader is a bot but a human is present — escort the human's driven body
     if (Player* body = SuiDrivenBodyOf(firstReal))
         return body != me ? body : firstReal;
@@ -1306,7 +1332,7 @@ Player* AiBotAI::FindEscortBoss() const
     if (reals.empty())
     {
         CB_HIT(me->GetGUIDLow(), "cpp-main: no real players, no escort boss");
-        return nullptr;
+        return SuiAutopilot::LeaderFor(me);   // [AUTOPILOT] the bot leader, or null
     }
 
     // [FOLLOW-CMD] Explicit assignment wins: "{bot} follow {player}" stored a lowercased
@@ -1390,11 +1416,48 @@ void AiBotAI::DoPartyFollow()
         return;
     }
 
+    // [AUTOPILOT] The raid holds its camp while the leader walks out to pull.
+    if (SuiAutopilot::HoldForPull(me))
+    {
+        SuiStopFollowForHold();
+        return;
+    }
+    // [AUTOPILOT] ...and stacks on the leader while the raid waits.
+    {
+        float sx = 0.0f, sy = 0.0f, sz = 0.0f;
+        int const stack = SuiAutopilot::StackOnLeader(me, sx, sy, sz);
+        if (stack == 1)
+            return;
+        if (stack == 2)
+        {
+            if (!me->IsMoving() || me->GetMotionMaster()->GetCurrentMovementGeneratorType() == FOLLOW_MOTION_TYPE)
+            {
+                me->UpdateAllowedPositionZ(sx, sy, sz);
+                me->GetMotionMaster()->MovePoint(0, sx, sy, sz, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            }
+            return;
+        }
+    }
+
     Player* pBoss = FindEscortBoss();
     if (!pBoss || !pBoss->IsInWorld() || !pBoss->IsAlive())
     {
         CB_HIT(me->GetGUIDLow(), "cpp-main: no live boss, no follow");
         return;
+    }
+
+    // [TACTICS] Stepped out of lava or fire: stay out while the anchor stands where it stood -
+    // the formation slot is what put this member in it (2026-09-24: 30 bots burned to death in
+    // lava beside a leader waiting out a patrol).
+    if (m_hazardHoldUntil)
+    {
+        if (WorldTimer::getMSTime() < m_hazardHoldUntil &&
+            pBoss->GetDistance2d(m_hazardAnchorX, m_hazardAnchorY) < 8.0f && me->GetDistance(pBoss) < 35.0f)
+        {
+            CB_HIT(me->GetGUIDLow(), "cpp-main: holding clear of a ground hazard");
+            return;
+        }
+        m_hazardHoldUntil = 0;
     }
 
     if (pBoss->GetMap() != me->GetMap())
@@ -1820,7 +1883,7 @@ void AiBotAI::UpdateAI(uint32 const diff)
                     me->SetInFront(pVictim);
         if (!m_possessed && !m_suiManual && !m_recoveryResetHoldMs
             && HasFastCombatPolicy() && me && me->IsInWorld() && !me->IsBeingTeleported()
-            && me->IsAlive() && me->IsInCombat()
+            && me->IsAlive() && (me->IsInCombat() || HealerOnDuty())
             && !me->HasUnitState(UNIT_STATE_CAN_NOT_REACT_OR_LOST_CONTROL)
             && !me->IsNonMeleeSpellCasted(false, false, true))
         {
@@ -1834,12 +1897,29 @@ void AiBotAI::UpdateAI(uint32 const diff)
             // escape hop.  Casting here can stop the isolated tag-and-drag or a
             // stalemate/overpull retreat before its 1 Hz handler advances it.
             // External LOAD_ROTATION remains the absolute override above.
+            // [TACTICS] A tactical move in progress (closing for sight, out of fire, clear of a
+            // melee hostile) is not cancelled by the next cast: DoCastSpell stops movement for any
+            // cast-time spell, which pinned healers behind the rock they were walking out of.
+            else if (m_repositionUntilMs && WorldTimer::getMSTime() < m_repositionUntilMs && me->IsMoving())
+                SuiRaidTelemetry::OnRotationTick(me, 6);
+            // [TACTICS] Threat discipline: a damage dealer does not take an elite off whoever holds
+            // it - at 90 % of the holder's threat it waits (the game moves aggro at 110 % in melee
+            // range, 130 % beyond). 2026-09-25: Onyxia turned to a warlock and a mage in the first
+            // ten seconds, before her tank had built anything, and breathed on the raid.
+            else if (ThreatHoldFor(me, GetCombatActiveRole()))
+                SuiRaidTelemetry::OnRotationTick(me, 4);
             else if (!m_pullActive && !m_stalemateHoldMs && !m_overpullFleeHoldMs)
             {
                 CB_HIT(me->GetGUIDLow(), "cpp-main: built-in spec cast attempt");
+                SuiRaidTelemetry::OnRotationTick(me, 0);
                 UpdateSpecCombatAI();
             }
+            else
+                SuiRaidTelemetry::OnRotationTick(me, m_pullActive ? 3 : 4);
         }
+        else if (me && me->IsInWorld() && me->IsAlive())
+            SuiRaidTelemetry::OnRotationTick(me, !(me->IsInCombat() || HealerOnDuty()) ? 1 :
+                me->IsNonMeleeSpellCasted(false, false, true) ? 2 : 5);
     }
 
     // [RAID-PLAN] Act cadence for the adopted raid plan (PLAN_19 M-D): formation
@@ -2205,22 +2285,37 @@ void AiBotAI::UpdateAI(uint32 const diff)
 
             // [COMPANION] Size the self-run: the time a spirit would spend running
             // back from the nearest graveyard, floored by the reclaim delay.
-            if (SuiCompanion::IsCompanion(me))
+            // [SELF-REZ] Every other bot gets the same clock as a BACKSTOP (owner 2026-09-22:
+            // a wiped raid stayed ghosts for four hours). Revival was delegated wholly to the
+            // C# brain's MaintenancePlanner, and with the brain disabled - the raid setup - no
+            // RESURRECT ever comes. A live brain rezzes in 15-22 s, long before this fires, so
+            // its graveyard/loop handling still wins; the clamp keeps an instance death (whose
+            // graveyard is on another map) from producing a meaningless run time.
             {
+                bool const companion = SuiCompanion::IsCompanion(me);
                 float runSeconds = 0.0f;
                 if (WorldSafeLocsEntry const* grave = sObjectMgr.GetClosestGraveYard(
                         deathX, deathY, deathZ, deathMap, me->GetTeam()))
                 {
-                    float const dx = grave->x - deathX, dy = grave->y - deathY;
-                    runSeconds = sqrtf(dx * dx + dy * dy) / SuiCompanion::GHOST_RUN_SPEED;
+                    if (grave->map_id == deathMap)
+                    {
+                        float const dx = grave->x - deathX, dy = grave->y - deathY;
+                        runSeconds = sqrtf(dx * dx + dy * dy) / SuiCompanion::GHOST_RUN_SPEED;
+                    }
                 }
                 uint32 const reclaimMs = me->GetCorpseReclaimDelay(false) * IN_MILLISECONDS;
+                uint32 runMs = uint32(runSeconds * 1000.0f);
+                if (!companion)
+                    runMs = std::min(std::max(runMs, AIBOT_SELF_REZ_MIN_MS), AIBOT_SELF_REZ_MAX_MS);
                 m_suiCompanionDeadMs = 0;
-                m_suiCompanionSelfRezAtMs = std::max(reclaimMs, uint32(runSeconds * 1000.0f));
-                sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
-                    "[SUI-COMPANION] %s died; self-run pops in %u s unless the party rezzes first",
-                    me->GetName(), m_suiCompanionSelfRezAtMs / 1000);
-                SuiCompanion::NotifyOwner(me, "%s has died.", me->GetName());
+                m_suiCompanionSelfRezAtMs = std::max(reclaimMs, runMs);
+                if (companion)
+                {
+                    sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                        "[SUI-COMPANION] %s died; self-run pops in %u s unless the party rezzes first",
+                        me->GetName(), m_suiCompanionSelfRezAtMs / 1000);
+                    SuiCompanion::NotifyOwner(me, "%s has died.", me->GetName());
+                }
             }
 
             char deathData[160];
@@ -2228,6 +2323,8 @@ void AiBotAI::UpdateAI(uint32 const diff)
                 "x=%.1f|y=%.1f|z=%.1f|map=%u|attackers=%u",
                 deathX, deathY, deathZ, deathMap, m_lastAttackerCount);
             BridgeSendEvent("DEATH", deathData);
+            if (SuiAutopilot::IsLeader(me))
+                SuiAutopilot::NoteLeaderDeath(me);
 
             return;
         }
@@ -2285,8 +2382,9 @@ void AiBotAI::UpdateAI(uint32 const diff)
         // [COMPANION] Nobody's brain will ever RESURRECT a companion. Wait out the
         // self-run (a party rez arriving meanwhile simply revives us), then pop
         // in place once the party has left combat — never mid-fight.
-        if (SuiCompanion::IsCompanion(me))
+        // [SELF-REZ] The same wait is the backstop for every bot the brain does not revive.
         {
+            bool const companion = SuiCompanion::IsCompanion(me);
             m_suiCompanionDeadMs += AIBOT_UPDATE_INTERVAL;
             if (m_suiCompanionDeadMs < m_suiCompanionSelfRezAtMs)
                 return;
@@ -2301,12 +2399,67 @@ void AiBotAI::UpdateAI(uint32 const diff)
                         }
             if (partyInCombat)
                 return;
-            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, "[SUI-COMPANION] %s recovers its corpse in place",
-                me->GetName());
+            if (SuiHero::BlocksResurrection(me))
+                return;
+            // [SELF-REZ] A body revives at half health. Beside the pack that killed it, it
+            // dies again within the minute (2026-09-22: 11 of 39 re-died at a Molten Core
+            // Firelord pack whose Lava Spawns still stood on the corpses, then again to a
+            // Lava Surger and an Ancient Core Hound PATROLLING through the corpses - "nothing
+            // near right now" is no promise inside a raid). So inside an instance the backstop
+            // does what a real corpse run does: the ghost goes to the entrance and revives
+            // there (the proven ghost-port + m_pendingGraveyardRez path above). A healer's
+            // Resurrect during the wait still wins. In the open world it revives in place
+            // unless a hostile is close, and then keeps waiting for the pack to leash.
+            if (me->GetMap()->IsDungeon())
+            {
+                AreaTriggerTeleport const* entrance = sObjectMgr.GetMapEntranceTrigger(me->GetMapId());
+                if (entrance && entrance->destination.mapId == me->GetMapId())
+                {
+                    WorldLocation const& at = entrance->destination;
+                    sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                        "[AIBOT] %s: no RESURRECT after %u s - ghost to the instance entrance (%.1f, %.1f, %.1f) to revive",
+                        me->GetName(), m_suiCompanionDeadMs / 1000, at.x, at.y, at.z);
+                    me->NearTeleportTo(at.x, at.y, at.z, at.o);
+                    m_pendingGraveyardRez = true;
+                    m_graveRezX = at.x; m_graveRezY = at.y; m_graveRezZ = at.z;
+                    m_graveRezMap = me->GetMapId(); m_graveRezWaitMs = 8000;
+                    return;
+                }
+            }
+            {
+                std::list<Unit*> nearby;
+                me->GetEnemyListInRadiusAround(me, AIBOT_SELF_REZ_SAFE_YARDS, nearby);
+                Unit const* threat = nullptr;
+                for (Unit* unit : nearby)
+                    if (unit && unit->IsCreature() && unit->IsAlive() && unit->IsHostileTo(me) &&
+                        static_cast<Creature*>(unit)->GetCreatureType() != CREATURE_TYPE_CRITTER)
+                    {
+                        threat = unit;
+                        break;
+                    }
+                if (threat)
+                {
+                    if (m_suiCompanionDeadMs % 30000 < AIBOT_UPDATE_INTERVAL)
+                        sLog.Out(LOG_BASIC, LOG_LVL_BASIC,
+                            "[AIBOT] %s: holding revival - %s (entry %u) is %.0f yd from the corpse",
+                            me->GetName(), threat->GetName(), threat->GetEntry(), me->GetDistance(threat));
+                    return;
+                }
+            }
+            sLog.Out(LOG_BASIC, LOG_LVL_BASIC, companion
+                    ? "[SUI-COMPANION] %s recovers its corpse in place"
+                    : "[AIBOT] %s: no RESURRECT after %u s and the group is out of combat - recovering in place",
+                me->GetName(), m_suiCompanionDeadMs / 1000);
             me->ResurrectPlayer(0.5f);
             me->CombatStop(true);
             me->SpawnCorpseBones();
-            SuiCompanion::NotifyOwner(me, "%s has recovered its body.", me->GetName());
+            if (companion)
+                SuiCompanion::NotifyOwner(me, "%s has recovered its body.", me->GetName());
+            else
+            {
+                BridgeSendEvent("RESPAWN", "");
+                BridgeSendState();
+            }
             return;
         }
 
@@ -2323,6 +2476,43 @@ void AiBotAI::UpdateAI(uint32 const diff)
             return;
         }
     }
+
+    // [TACTICS] Nobody stands in fire on the ground.
+    if (AvoidGroundHazard())
+        return;
+
+    // [TACTICS] Nobody but the tank stands in front of a breath.
+    if (AvoidFrontalCone())
+        return;
+
+    // [TELEMETRY] Positions of tanks and healers in an instance fight, every 8 s (the geometry a
+    // death line cannot show: who stood where, in lava, without sight of the tank).
+    if (me->IsInCombat() && me->GetGroup() && me->GetMap()->IsDungeon() &&
+        (GetCombatActiveRole() == ROLE_TANK || GetCombatActiveRole() == ROLE_HEALER) &&
+        WorldTimer::getMSTime() >= m_posLogNextMs)
+    {
+        m_posLogNextMs = WorldTimer::getMSTime() + 8000;
+        Player* tank = ActiveTank();
+        Unit* v = me->GetVictim();
+        bool const lava = (me->GetTerrain()->getLiquidStatus(me->GetPositionX(), me->GetPositionY(), me->GetPositionZ() + 0.01f,
+            MAP_LIQUID_TYPE_MAGMA | MAP_LIQUID_TYPE_SLIME, nullptr) & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER | LIQUID_MAP_WATER_WALK)) != 0;
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[POS] %s %s (%.1f, %.1f, %.1f)%s hp %u%% | tank %s %.0f yd%s | victim %s %.0f yd (%.1f, %.1f)%s",
+            me->GetName(), GetCombatActiveRole() == ROLE_TANK ? "tank" : "healer",
+            me->GetPositionX(), me->GetPositionY(), me->GetPositionZ(), lava ? " IN LAVA" : "", uint32(me->GetHealthPercent()),
+            tank ? tank->GetName() : "-", tank ? me->GetDistance(tank) : -1.0f,
+            tank && !me->IsWithinLOSInMap(tank) ? " NO SIGHT" : "",
+            v ? v->GetName() : "-", v ? me->GetDistance(v) : -1.0f, v ? v->GetPositionX() : 0.0f, v ? v->GetPositionY() : 0.0f,
+            v && !me->IsWithinLOSInMap(v) ? " NO SIGHT" : "");
+    }
+
+    // [TACTICS] Ranged and healers keep clear of the melee brawl.
+    if (MaintainRangedSpacing())
+        return;
+
+    // [AUTOPILOT] The leader's drive (pick, walk out, pull, run back) runs ahead of the combat
+    // handling below: a pull is in combat from the moment the pack notices the leader.
+    if (SuiAutopilot::IsLeader(me) && SuiAutopilot::TickLeader(this))
+        return;
 
     // [OVERPULL] Peak melee attackers this combat — stamped on the DEATH event above.
     if (me->IsInCombat())
@@ -3426,6 +3616,9 @@ void AiBotAI::UpdateAI(uint32 const diff)
                 return;
             }
         }
+
+        if (MaintainTankFacing(pVictim))
+            return;
 
         if (!me->HasInArc(pVictim, 2 * M_PI_F / 3) && !me->IsMoving())
         {

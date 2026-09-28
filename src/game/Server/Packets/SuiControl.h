@@ -407,6 +407,22 @@ namespace WorldPackets
             }
         };
 
+        /// Threat meter v1: u8 version (1), u8 rows wanted (1..10), u64 creature.
+        class Threat final : public ClientPacket
+        {
+        public:
+            uint8 version = 0, rows = 0;
+            ObjectGuid target;
+            bool exactSize = false;
+            explicit Threat() : ClientPacket(CMSG_SUI_THREAT) {}
+            void ReadFromWorldPacket(WorldPacket& data) override
+            {
+                if (data.size() != 10) { data.rfinish(); return; }
+                data >> version >> rows >> target;
+                exactSize = version == 1 && rows >= 1 && rows <= 10;
+            }
+        };
+
         class CommanderRaid final : public ClientPacket
         {
         public:

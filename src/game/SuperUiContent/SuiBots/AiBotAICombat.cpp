@@ -1,3 +1,5 @@
+#include <mutex>
+#include <set>
 /*
  * AiBotAICombat.cpp — combat behaviour for the autonomous AI bot.
  *
@@ -44,6 +46,10 @@
 #include "Bag.h"
 #include "PathFinder.h"
 #include "MoveMap.h"
+#include "DynamicObject.h"
+#include "SuiRaidTelemetry.h"
+#include "SuiAutopilot.h"
+#include "Movement/WaypointManager.h"
 
 // BG flag auras (referenced in the combat methods below — never active in open world).
 // File-local: these formerly lived in the AiBotSpells enum, but that enum moved to the shared
@@ -203,8 +209,24 @@ bool AiBotAI::IsCombatIgnored(uint32 guidLow) const
 // [TEAMPLAY] Public seam for TeamPlay::ResolveCombatTarget — "is the anchor's victim something
 // I may legally focus?" Wraps the (AI-internal) IsValidHostileTarget + an alive check, so the
 // free-function resolver never reaches into protected combat internals.
+static bool IsBanishedUnit(Unit const* u)
+{
+    for (auto const& entry : u->GetSpellAuraHolderMap())
+        if (entry.second && entry.second->HasMechanic(MECHANIC_BANISH))
+            return true;
+    return false;
+}
+
 bool AiBotAI::IsValidAssistTarget(Unit* pTarget) const
 {
+    // [TACTICS] A banished enemy takes nothing; attacking it only breaks nothing and wastes time.
+    if (pTarget && IsBanishedUnit(pTarget))
+        return false;
+    // [TACTICS] An enemy lying on the ground as dead (a feigned death) takes nothing from a hit:
+    // attacks go to what is still standing.
+    if (pTarget && (pTarget->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) ||
+        pTarget->GetStandState() == UNIT_STAND_STATE_DEAD))
+        return false;
     return pTarget && pTarget->IsAlive() && IsValidHostileTarget(pTarget);
 }
 
@@ -247,6 +269,17 @@ bool AiBotAI::HandleCombatStalemate()
     if (m_pullActive)
     {   // cb:fold hot per-update detail
         m_stalemateMs = 0;
+        m_lastHealth = me->GetHealth();
+        return false;
+    }
+    // [TACTICS] A grouped bot inside an instance is never "stranded": a pause in the damage is a
+    // tactic (waiting outside a boss's inferno, a rooted boss) - and the old nudge dropped the
+    // boss, whose empty threat list then reset the fight (2026-09-25: Baron Geddon evaded at 40 %).
+    if (me->GetGroup() && me->GetMap()->IsDungeon())
+    {   // cb:fold hot per-update detail
+        m_stalemateMs = 0;
+        m_stalemateNudges = 0;
+        m_stalemateVictim.Clear();
         m_lastHealth = me->GetHealth();
         return false;
     }
@@ -751,6 +784,34 @@ bool AiBotAI::HandlePullRetreat()
     return true;
 }
 
+// Where a melee body stands on its victim: tanks in front, damage dealers behind or at the flank,
+// both further out on a creature of long reach. Every melee chase goes through here.
+static void ChaseInPlace(Player* me, Unit* pVictim, CombatBotRoles role)
+{
+    // Melee damage dealers go behind - unless the creature is a kind seen breathing a cone,
+    // which sweeps its tail too: its flank then, behind the shoulder (2026-09-25, Onyxia:
+    // Tail Sweep 106k).
+    float angle = role == ROLE_MELEE_DPS ? 3.0f : 0.0f;
+    float offset = 1.0f;
+    if (role == ROLE_MELEE_DPS && pVictim->IsCreature())
+    {
+        if (SuiRaidTelemetry::EntryConeRadius(pVictim->GetEntry()) > 0.0f)
+            angle = (me->GetGUIDLow() % 2) ? 1.83f : -1.83f;
+        // A big creature reaches far: the melee stand well out from its centre, where a cleave
+        // chaining from its tank (10 yd a jump) does not find them (2026-09-25: Onyxia, 23 yd
+        // reach, 1.8 yd body - every rogue stood at 3 yd beside the tank and died in 10 s).
+        float const reach = pVictim->GetCombatReach();
+        if (reach >= 8.0f)
+            offset = std::min(reach * 0.5f, 10.0f);
+    }
+    // Its tanks too stand out in front of it, together: inside a 2 yd body around a 23 yd reach
+    // the tanks stood all round Onyxia and every swap of threat between them turned her whole
+    // breath and tail across the raid (2026-09-25).
+    if (role == ROLE_TANK && pVictim->IsCreature() && pVictim->GetCombatReach() >= 8.0f)
+        offset = std::min(pVictim->GetCombatReach() * 0.35f, 7.0f);
+    me->GetMotionMaster()->MoveChase(pVictim, offset, angle);
+}
+
 bool AiBotAI::AttackStart(Unit* pVictim)
 {
     // [SUI] Manual primary: only an explicit RTS ATTACK order (m_suiOrderedAttackPass) may start
@@ -776,7 +837,12 @@ bool AiBotAI::AttackStart(Unit* pVictim)
         else if (me->HasDistanceCasterMovement())   // cb:fold hot per-update detail
             me->SetCasterChaseDistance(0.0f);   // cb:fold hot per-update detail
 
-        me->GetMotionMaster()->MoveChase(pVictim, 1.0f, m_role == ROLE_MELEE_DPS ? 3.0f : 0.0f);
+        // A new target does not call off a step out of harm under way: the chase starts when the
+        // step ends (2026-09-25: under Onyxia's Deep Breath the kill order switched whelps every
+        // second, each switch turned the escape back into a chase - six stood and died in it).
+        if (m_repositionUntilMs && WorldTimer::getMSTime() < m_repositionUntilMs && me->IsMoving())
+            return true;
+        ChaseInPlace(me, pVictim, m_role);
         return true;
     }
 
@@ -1262,7 +1328,7 @@ void AiBotAI::UpdateInCombatAI_Paladin()
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE &&
            !me->CanReachWithMeleeAutoAttack(pVictim))
         {   // cb:fold rotation rung, outcome probed at cast
-            me->GetMotionMaster()->MoveChase(pVictim);
+            ChaseInPlace(me, pVictim, m_role);
         }
     }
 
@@ -2538,7 +2604,7 @@ void AiBotAI::UpdateInCombatAI_Warrior()
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
             && !me->CanReachWithMeleeAutoAttack(pVictim))
         {   // cb:fold rotation rung, outcome probed at cast
-            me->GetMotionMaster()->MoveChase(pVictim);
+            ChaseInPlace(me, pVictim, m_role);
         }
 
         if (m_spells.warrior.pHeroicStrike &&
@@ -3067,7 +3133,7 @@ void AiBotAI::UpdateInCombatAI_Druid()
                 if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
                     && !me->CanReachWithMeleeAutoAttack(pVictim))
                 {   // cb:fold rotation rung, outcome probed at cast
-                    me->GetMotionMaster()->MoveChase(pVictim);
+                    ChaseInPlace(me, pVictim, m_role);
                 }
 
                 if (me->HasAuraType(SPELL_AURA_MOD_STEALTH))
@@ -3160,7 +3226,7 @@ void AiBotAI::UpdateInCombatAI_Druid()
                 if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
                     && !me->CanReachWithMeleeAutoAttack(pVictim))
                 {   // cb:fold rotation rung, outcome probed at cast
-                    me->GetMotionMaster()->MoveChase(pVictim);
+                    ChaseInPlace(me, pVictim, m_role);
                 }
 
                 if (m_spells.druid.pFeralCharge &&
@@ -3285,4 +3351,1218 @@ void AiBotAI::UpdateInCombatAI_Druid()
             }
         }
     }
+}
+
+// [TACTICS] Tank facing (owner 2026-09-23: "tanks are not turning core hounds around").
+// A mob faces its victim. When the tank stands between the group and the mob, the mob's
+// front - its cleave, breath or cone - points at the group. The tank therefore steps to the
+// far side of the mob, so the mob turns its back to everyone else. Only while the tank
+// holds the mob, only when it is badly misaligned, and at most every 1.5 s.
+// A tank's step must keep sight of its mob and be walkable in a short path (2026-09-25: a facing
+// step pressed Sulfuron's priest's tank into rock - 1 yd apart without sight for 25 s, and the
+// priest evaded "target unreachable", resetting the whole encounter).
+static bool TankStepOk(Player* me, Unit* mob, float x, float y, float z)
+{
+    if (!mob->IsWithinLOS(x, y, z + 1.5f))
+        return false;
+    PathInfo path(me);
+    path.calculate(x, y, z, false);
+    if (path.getPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE))
+        return false;
+    PointsArray const& pts = path.getPath();
+    float len = 0.0f;
+    for (size_t k = 1; k < pts.size(); ++k)
+        len += (pts[k] - pts[k - 1]).length();
+    return len <= me->GetDistance(x, y, z) * 2.0f + 4.0f;
+}
+
+bool AiBotAI::MaintainTankFacing(Unit* victim)
+{
+    if (!victim || !victim->IsCreature() || GetCombatActiveRole() != ROLE_TANK ||
+        victim->GetVictim() != me || !victim->IsAlive())
+        return false;
+    // After a facing step the tank stands on its point; if the mob drifts out of reach,
+    // resume the chase rather than standing there swinging at air.
+    if (!me->IsMoving() && !me->CanReachWithMeleeAutoAttack(victim) &&
+        me->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
+    {
+        ChaseInPlace(me, victim, ROLE_TANK);
+        return true;
+    }
+    uint32 const now = WorldTimer::getMSTime();
+    if (now < m_tankFacingNextMs || me->IsMoving() || me->IsNonMeleeSpellCasted(false))
+        return false;
+    Group* group = me->GetGroup();
+    if (!group)
+        return false;
+    // A kind that pulses around itself and has never breathed forward gains nothing from being
+    // turned, and every turn walks the fight away from healers kept outside its circle
+    // (2026-09-25: Baron Geddon's tank died with the healers 42-83 yd away).
+    if (SuiRaidTelemetry::EntryPulseRadius(victim->GetEntry()) > 0.0f &&
+        SuiRaidTelemetry::EntryConeRadius(victim->GetEntry()) <= 0.0f)
+        return false;
+
+    // Two held mobs side by side double every point-blank area hit on the melee between them
+    // (two Molten Giants' Smash). A tank whose mob stands within 12 yd of a mob another tank
+    // holds walks its own a few steps further away; the mob follows its victim.
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* other = itr->getSource();
+        Unit* otherMob = other && other != me && other->IsAlive() ? other->GetVictim() : nullptr;
+        if (!otherMob || otherMob == victim || otherMob->GetVictim() != other ||
+            !IsSpecAoETankHolder(other) || !otherMob->IsWithinDistInMap(victim, 12.0f))
+            continue;
+        float ox = victim->GetPositionX() - otherMob->GetPositionX(), oy = victim->GetPositionY() - otherMob->GetPositionY();
+        float const olen = std::sqrt(ox * ox + oy * oy);
+        if (olen < 0.5f)
+        {
+            ox = std::cos(me->GetOrientation());
+            oy = std::sin(me->GetOrientation());
+        }
+        else
+        {
+            ox /= olen;
+            oy /= olen;
+        }
+        // Only the tank with the higher guid moves, so the two do not dance around each other.
+        if (other->GetGUIDLow() > me->GetGUIDLow())
+            break;
+        float x = me->GetPositionX() + ox * 8.0f, y = me->GetPositionY() + oy * 8.0f, z = me->GetPositionZ();
+        ReGroundZ(x, y, z, "tank-separation");
+        if (std::fabs(z - me->GetPositionZ()) > 4.0f || !TankStepOk(me, victim, x, y, z))
+            break;
+        m_tankFacingNextMs = now + 2500;
+        CB_HIT(me->GetGUIDLow(), "cpp-combat: tank separating its mob from another tank's");
+        me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return true;
+    }
+
+    float cx = 0.0f, cy = 0.0f;
+    uint32 count = 0;
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || m == me || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != me->GetMap() ||
+            IsSpecAoETankHolder(m) || !m->IsWithinDistInMap(victim, 40.0f))
+            continue;
+        cx += m->GetPositionX();
+        cy += m->GetPositionY();
+        ++count;
+    }
+    if (count == 0)
+        return false;
+    cx /= count;
+    cy /= count;
+
+    // Wanted: the tank on the mob's far side from the group.
+    float ax = victim->GetPositionX() - cx, ay = victim->GetPositionY() - cy;
+    float const alen = std::sqrt(ax * ax + ay * ay);
+    float tx = me->GetPositionX() - victim->GetPositionX(), ty = me->GetPositionY() - victim->GetPositionY();
+    float const tlen = std::sqrt(tx * tx + ty * ty);
+    if (alen < 2.0f || tlen < 0.1f)
+        return false;
+    ax /= alen; ay /= alen;
+    // A kind that breathes a cone sweeps its tail as well: the group belongs at its side, so its
+    // tank stands square to the group, on whichever side it already is (2026-09-25: turned "away
+    // from the group", Onyxia put the whole raid behind her - Tail Sweep 108k in 77 s).
+    if (SuiRaidTelemetry::EntryConeRadius(victim->GetEntry()) > 0.0f)
+    {
+        float px = -ay, py = ax;
+        if (tx * px + ty * py < 0.0f)
+        {
+            px = -px;
+            py = -py;
+        }
+        ax = px;
+        ay = py;
+    }
+    float const dot = (tx * ax + ty * ay) / tlen;
+    if (dot > 0.64f)   // within ~50 degrees of ideal
+        return false;
+
+    m_tankFacingNextMs = now + 1500;
+    // (a creature of long reach is tanked from further out, as ChaseInPlace places its tanks)
+    float const reach = victim->GetObjectBoundingRadius() + me->GetObjectBoundingRadius() +
+        (victim->GetCombatReach() >= 8.0f ? std::min(victim->GetCombatReach() * 0.35f, 7.0f) : 1.5f);
+    float x = victim->GetPositionX() + ax * reach, y = victim->GetPositionY() + ay * reach;
+    float z = victim->GetPositionZ();
+    ReGroundZ(x, y, z, "tank-facing");
+    if (std::fabs(z - victim->GetPositionZ()) > 4.0f || !TankStepOk(me, victim, x, y, z))
+        return false;   // a ledge, a lava lip or rock on the far side: stay put
+    CB_HIT(me->GetGUIDLow(), "cpp-combat: tank stepping to turn the mob away from the group");
+    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+    return true;
+}
+
+// [TACTICS] Ranged spacing (2026-09-23: Molten Giant Smash killed the healers and casters
+// standing where the giant was brought). A ranged damage dealer or a healer in a group fight
+// that finds a hostile within 12 yd steps directly away from it to about 22 yd, but never
+// further than 35 yd from its anchor (the tank it heals and the raid it supports). At most
+// every 2 s, never while casting, and only on ground the navmesh can walk.
+namespace
+{
+    struct GroundHazard { float x, y, r; };
+    struct HostileAreasInRange
+    {
+        WorldObject const* origin; float range;
+        bool operator()(DynamicObject* area) const
+        {
+            return area->GetType() == DYNAMIC_OBJECT_AREA_SPELL && area->IsInWorld() && origin->IsWithinDist(area, range, false);
+        }
+        bool operator()(WorldObject*) const { return false; }
+    };
+    struct TrapsInRange
+    {
+        WorldObject const* origin; float range;
+        bool operator()(GameObject* go) const
+        {
+            GameObjectInfo const* info = go->GetGOInfo();
+            return info && info->type == GAMEOBJECT_TYPE_TRAP && go->isSpawned() && origin->IsWithinDist(go, range, false);
+        }
+    };
+    // True when the spell deals damage (direct or periodic) in an area; radius from its data.
+    bool HarmfulArea(SpellEntry const* spell, float& radius)
+    {
+        bool harmful = false;
+        radius = 0.0f;
+        for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        {
+            bool const aura = spell->Effect[i] == SPELL_EFFECT_APPLY_AURA || spell->Effect[i] == SPELL_EFFECT_PERSISTENT_AREA_AURA;
+            bool const damage = spell->Effect[i] == SPELL_EFFECT_SCHOOL_DAMAGE ||
+                (aura && (spell->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE ||
+                    spell->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE_PERCENT));
+            if (!damage)
+                continue;
+            harmful = true;
+            if (SpellRadiusEntry const* entry = sSpellRadiusStore.LookupEntry(spell->EffectRadiusIndex[i]))
+                radius = std::max(radius, Spells::GetSpellRadius(entry));
+        }
+        return harmful;
+    }
+    // The radius of the area an aura on `u` sets off around it (a periodic trigger of an area
+    // damage spell centred on its source), or 0. `harmful` picks the aura side: a bomb put on a
+    // member is harmful to it, a pulse an enemy wears on itself is positive for it. Spell data only.
+    float PulsingAreaRadius(Unit const* u, bool harmful, uint32* remainingMs = nullptr, uint32* auraId = nullptr)
+    {
+        for (auto const& entry : u->GetSpellAuraHolderMap())
+        {
+            SpellAuraHolder const* holder = entry.second;
+            if (!holder || holder->IsPositive() == harmful)
+                continue;
+            SpellEntry const* spell = holder->GetSpellProto();
+            for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+            {
+                if (spell->EffectApplyAuraName[i] != SPELL_AURA_PERIODIC_TRIGGER_SPELL || !spell->EffectTriggerSpell[i])
+                    continue;
+                SpellEntry const* trig = sSpellMgr.GetSpellEntry(spell->EffectTriggerSpell[i]);
+                float radius = 0.0f;
+                if (!trig || !HarmfulArea(trig, radius) || radius <= 0.0f)
+                    continue;
+                bool atSource = false;
+                for (uint8 k = 0; k < MAX_EFFECT_INDEX; ++k)
+                    if (trig->EffectImplicitTargetA[k] == TARGET_LOCATION_CASTER_SRC ||
+                        trig->EffectImplicitTargetA[k] == TARGET_ENUM_UNITS_ENEMY_AOE_AT_SRC_LOC ||
+                        trig->EffectImplicitTargetB[k] == TARGET_ENUM_UNITS_ENEMY_AOE_AT_SRC_LOC)
+                        atSource = true;
+                if (!atSource)
+                    continue;
+                if (remainingMs)
+                    *remainingMs = holder->GetAuraDuration() > 0 ? uint32(holder->GetAuraDuration()) : 8000u;
+                if (auraId)
+                    *auraId = spell->Id;
+                return radius;
+            }
+        }
+        return 0.0f;
+    }
+
+    // Hostile damaging areas on the ground near me, from the live objects and their spell data only
+    // (a rain of fire, a burning patch, a trap): no spell, creature or encounter is named.
+    void CollectGroundHazards(Player* me, std::vector<GroundHazard>& out)
+    {
+        float const range = 40.0f;
+        CellPair pair(MaNGOS::ComputeCellPair(me->GetPositionX(), me->GetPositionY()));
+        Cell cell(pair);
+        cell.SetNoCreate();
+        std::list<WorldObject*> areas;
+        HostileAreasInRange areaCheck{me, range};
+        MaNGOS::WorldObjectListSearcher<HostileAreasInRange> areaSearcher(areas, areaCheck);
+        TypeContainerVisitor<MaNGOS::WorldObjectListSearcher<HostileAreasInRange>, GridTypeMapContainer> areaVisitor(areaSearcher);
+        cell.Visit(pair, areaVisitor, *me->GetMap(), *me, range);
+        for (WorldObject* object : areas)
+        {
+            DynamicObject* area = static_cast<DynamicObject*>(object);
+            SpellEntry const* spell = sSpellMgr.GetSpellEntry(area->GetSpellId());
+            float radius = 0.0f;
+            if (!spell || !HarmfulArea(spell, radius) || !area->IsHostileTo(me))
+                continue;
+            out.push_back({area->GetPositionX(), area->GetPositionY(), std::max(area->GetRadius(), radius) + 1.5f});
+        }
+        std::list<GameObject*> traps;
+        TrapsInRange trapCheck{me, range};
+        MaNGOS::GameObjectListSearcher<TrapsInRange> trapSearcher(traps, trapCheck);
+        TypeContainerVisitor<MaNGOS::GameObjectListSearcher<TrapsInRange>, GridTypeMapContainer> trapVisitor(trapSearcher);
+        cell.Visit(pair, trapVisitor, *me->GetMap(), *me, range);
+        for (GameObject* go : traps)
+        {
+            GameObjectInfo const* info = go->GetGOInfo();
+            if (info->trap.radius == 0 && info->trap.cooldown == 0)
+                continue;   // a one-shot scripted burst, inert afterwards
+            SpellEntry const* spell = sSpellMgr.GetSpellEntry(info->trap.spellId);
+            float radius = 0.0f;
+            // A hostile trap sprung by walking near it is kept away from whatever it does - it may
+            // hatch or call something rather than burn (2026-09-25: Onyxia's eggs, 10 yd, hatched
+            // whelps under the raid all through her first phase).
+            bool const burns = spell && HarmfulArea(spell, radius);
+            if (!spell || (!burns && info->trap.radius == 0))
+                continue;
+            if (!burns)
+            {
+                // it springs on distance in three dimensions: from a ledge above it is no danger
+                // (2026-09-25: the eggs lie in a pit 10 yd below the way into Onyxia's lair)
+                float const dz = std::fabs(go->GetPositionZ() - me->GetPositionZ());
+                float const r = float(info->trap.radius);
+                if (dz >= r)
+                    continue;
+                Unit* owner = go->GetOwner();
+                if (owner ? !owner->IsHostileTo(me) : !go->IsHostileTo(me))
+                    continue;
+                out.push_back({go->GetPositionX(), go->GetPositionY(), std::sqrt(r * r - dz * dz) + 1.5f});
+                continue;
+            }
+            // A trap nobody can spring by walking on it (no trigger radius) goes off only when the
+            // encounter's script fires it: dormant until one of its kind has been seen going off in
+            // this instance (2026-09-25: fifty of Onyxia's lava fissures, dormant until her last
+            // phase, herded the whole raid into one corner behind her tail from the first second).
+            if (info->trap.radius == 0)
+            {
+                static std::set<std::pair<uint32, uint32>> sFired;   // (instance, spell)
+                static std::mutex sFiredLock;
+                std::pair<uint32, uint32> const key{me->GetInstanceId(), info->trap.spellId};
+                std::lock_guard<std::mutex> guard(sFiredLock);
+                if (go->getLootState() == GO_ACTIVATED || go->getLootState() == GO_JUST_DEACTIVATED)
+                    sFired.insert(key);
+                if (!sFired.count(key))
+                    continue;
+            }
+            Unit* owner = go->GetOwner();
+            if (owner ? !owner->IsHostileTo(me) : !go->IsHostileTo(me))
+                continue;
+            out.push_back({go->GetPositionX(), go->GetPositionY(), std::max(float(info->trap.radius), radius) + 1.5f});
+        }
+        // Impacts forecast from a chain of fixed-spot spells (a breath across a room).
+        {
+            std::vector<std::tuple<float, float, float>> fc;
+            SuiRaidTelemetry::ForecastHazards(me, range, fc);
+            for (auto const& f : fc)
+                out.push_back({std::get<0>(f), std::get<1>(f), std::get<2>(f) + 2.0f});
+        }
+        // Units that pulse area damage around themselves: an enemy wearing it (an inferno), or a
+        // member carrying a bomb that will go off around them.
+        std::list<Unit*> units;
+        MaNGOS::AnyUnitInObjectRangeCheck unitCheck(me, range);
+        MaNGOS::UnitListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> unitSearcher(units, unitCheck);
+        Cell::VisitAllObjects(me, unitSearcher, range);
+        for (Unit* u : units)
+        {
+            if (u == me || !u->IsAlive())
+                continue;
+            bool const enemy = u->IsHostileTo(me);
+            bool const member = !enemy && u->IsPlayer() && me->GetGroup() &&
+                me->GetGroup()->IsMember(u->GetObjectGuid());
+            if (!enemy && !member)
+                continue;
+            // An area around a unit reaches from its edge, not its centre: a big body (a boss) adds
+            // its own size (2026-09-25: bots stepped to 22 yd of Baron Geddon's centre and still
+            // burned in his 20 yd Inferno).
+            float const edge = enemy ? 1.5f : 2.0f;   // an area reaches from the centre (+ our size, + margin)
+            if (float const r = PulsingAreaRadius(u, member))
+                out.push_back({u->GetPositionX(), u->GetPositionY(), r + edge});
+            else if (enemy)
+                if (float const pr = SuiRaidTelemetry::PulseRadius(u))
+                    out.push_back({u->GetPositionX(), u->GetPositionY(), pr + edge});
+        }
+    }
+    // Molten or poisonous liquid (lava, slime) at a spot: environmental damage every tick.
+    bool Molten(Player* me, float x, float y, float z)
+    {
+        GridMapLiquidStatus const res = me->GetTerrain()->getLiquidStatus(x, y, z + 0.01f,
+            MAP_LIQUID_TYPE_MAGMA | MAP_LIQUID_TYPE_SLIME, nullptr);
+        return (res & (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER | LIQUID_MAP_WATER_WALK)) != 0;
+    }
+
+    // Idle creatures that would attack us (not in any fight): the positions a repositioning step
+    // must keep out of reach of (2026-09-24: the raid's spreading and stepping drifted into the
+    // Core Hound pack beside Lucifron, and Lucifron joined).
+    void CollectIdleHostiles(Player* me, float range, std::vector<GroundHazard>& out)
+    {
+        std::list<Creature*> near;
+        MaNGOS::AnyUnitInObjectRangeCheck check(me, range);
+        MaNGOS::CreatureListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(near, check);
+        Cell::VisitGridObjects(me, searcher, range);
+        for (Creature* c : near)
+            if (c->IsAlive() && !c->IsInCombat() && !c->IsTotem() && !c->IsCivilian() &&
+                c->GetCreatureType() != CREATURE_TYPE_CRITTER && c->IsHostileTo(me))
+            {
+                out.push_back({c->GetPositionX(), c->GetPositionY(), 25.0f});
+                // A patrol's whole route is its reach (it walks back into the fight).
+                if (c->GetDefaultMovementType() == WAYPOINT_MOTION_TYPE && c->HasStaticDBSpawnData())
+                    if (WaypointPath const* path = sWaypointMgr.GetDefaultPath(c->GetEntry(), c->GetDBTableGUIDLow()))
+                        for (auto const& node : *path)
+                            if (me->GetDistance2d(node.second.x, node.second.y) < range)
+                                out.push_back({node.second.x, node.second.y, 22.0f});
+            }
+    }
+
+    // A spot the navmesh walks to from here in a short path - not a rock top or a pocket that looks
+    // near and is not connected (2026-09-25: escapes onto a plateau beside Baron Geddon left healers
+    // with no path back and no sight of the tank - and Geddon reset, unable to reach them).
+    bool Walkable(Player* me, float x, float y, float z, float slack = 2.0f)
+    {
+        PathInfo path(me);
+        path.calculate(x, y, z, false);
+        if (path.getPathType() & PATHFIND_NOPATH)
+            return false;
+        PointsArray const& pts = path.getPath();
+        if (pts.empty() || (pts.back() - Vector3(x, y, z)).length() > 3.0f)
+            return false;
+        float len = 0.0f;
+        for (size_t k = 1; k < pts.size(); ++k)
+            len += (pts[k] - pts[k - 1]).length();
+        return len <= me->GetDistance(x, y, z) * slack + 5.0f;
+    }
+
+    bool InHazard(std::vector<GroundHazard> const& hazards, float x, float y)
+    {
+        for (GroundHazard const& h : hazards)
+            if ((x - h.x) * (x - h.x) + (y - h.y) * (y - h.y) < h.r * h.r)
+                return true;
+        return false;
+    }
+
+    // The straight way from (x0, y0) to (x1, y1) passes through a circle I do not stand in now
+    // (2026-09-25: a rogue out of the near end of Onyxia's breath stepped back across the line).
+    bool CrossesNewHazard(std::vector<GroundHazard> const& hazards, float x0, float y0, float x1, float y1)
+    {
+        for (GroundHazard const& h : hazards)
+        {
+            float const r2 = h.r * h.r;
+            if ((x0 - h.x) * (x0 - h.x) + (y0 - h.y) * (y0 - h.y) < r2)
+                continue;
+            for (float f : {0.2f, 0.4f, 0.6f, 0.8f})
+            {
+                float const x = x0 + (x1 - x0) * f, y = y0 + (y1 - y0) * f;
+                if ((x - h.x) * (x - h.x) + (y - h.y) * (y - h.y) < r2)
+                    return true;
+            }
+        }
+        return false;
+    }
+}
+
+// [TACTICS] Out of the fire: a member standing in a hostile damaging area steps to the nearest
+// clear spot; a melee member or tank prefers a spot still next to its target (the target follows
+// a tank), a caster the shortest step. What a player sees on the ground, nothing more.
+bool AiBotAI::AvoidGroundHazard()
+{
+    if (!me->IsAlive() || !me->GetGroup() || m_possessed || m_suiManual)
+        return false;
+    uint32 const now = WorldTimer::getMSTime();
+    // Waiting outside a pulse my target stands in: no chase back into it between checks.
+    if (now < m_hazardMeleeHoldUntil && now < m_hazardNextMs)
+        return true;
+    if (now < m_hazardNextMs)
+        return false;
+    m_hazardNextMs = now + 400;
+
+    // I carry a bomb: away from every member until it has gone off (2026-09-24, Baron Geddon's
+    // Living Bomb - recognised from its data: a harmful aura that triggers area damage around me).
+    uint32 bombMs = 0, bombAura = 0;
+    if (float const bomb = PulsingAreaRadius(me, true, &bombMs, &bombAura))
+    {
+        Group* group = me->GetGroup();
+        auto nearest = [&](float x, float y)
+        {
+            float best = 1e9f;
+            for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+                if (Player* m = itr->getSource())
+                    if (m != me && m->IsAlive() && m->GetMap() == me->GetMap())
+                        best = std::min(best, m->GetDistance2d(x, y));
+            return best;
+        };
+        float const need = bomb + 4.0f;
+        if (nearest(me->GetPositionX(), me->GetPositionY()) >= need)
+            return me->IsMoving();   // far enough: stay put (keep casting)
+        std::vector<GroundHazard> idle;
+        CollectIdleHostiles(me, 60.0f, idle);
+        // ...and never into fire on the way (2026-09-25: Baron Geddon's tank carried his Living
+        // Bomb away from the raid straight into his Inferno).
+        std::vector<GroundHazard> burning;
+        CollectGroundHazards(me, burning);
+        {
+            // my own bomb is in that list too: drop the circle centred on me
+            float const mx = me->GetPositionX(), my = me->GetPositionY();
+            burning.erase(std::remove_if(burning.begin(), burning.end(), [mx, my](GroundHazard const& h)
+                { return (h.x - mx) * (h.x - mx) + (h.y - my) * (h.y - my) < 1.0f; }), burning.end());
+        }
+        float bestX = 0, bestY = 0, bestZ = 0, bestD = 1e9f;
+        for (float dist : {12.0f, 18.0f, 24.0f, 30.0f, 38.0f})
+            for (int i = 0; i < 16; ++i)
+            {
+                float const ang = i * float(M_PI) / 8.0f;
+                float x = me->GetPositionX() + dist * std::cos(ang), y = me->GetPositionY() + dist * std::sin(ang);
+                float z = me->GetPositionZ();
+                me->UpdateAllowedPositionZ(x, y, z);
+                if (std::fabs(z - me->GetPositionZ()) > 6.0f || Molten(me, x, y, z) || InHazard(idle, x, y) ||
+                    InHazard(burning, x, y) || nearest(x, y) < need)
+                    continue;
+                if (dist < bestD && Walkable(me, x, y, z))
+                {
+                    bestD = dist;
+                    bestX = x;
+                    bestY = y;
+                    bestZ = z;
+                }
+            }
+        if (bestD > 1e8f)
+            return false;
+        if (me->IsNonMeleeSpellCasted(false))
+            me->InterruptNonMeleeSpells(false);
+        m_repositionUntilMs = now + bombMs + 500;
+        if (Player* anchor = FindEscortBoss())
+        {
+            m_hazardHoldUntil = now + bombMs + 1000;
+            m_hazardAnchorX = anchor->GetPositionX();
+            m_hazardAnchorY = anchor->GetPositionY();
+        }
+        m_hazardNextMs = now + 1000;
+        {
+            std::string from = "?";
+            if (SpellAuraHolder const* h = me->GetSpellAuraHolder(bombAura))
+                if (Unit* c = h->GetCaster())
+                    from = c->GetName();
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: carrying a bomb (%.0f yd, aura %u from %s) - away from the raid",
+                me->GetName(), bomb, bombAura, from.c_str());
+        }
+        me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return true;
+    }
+
+    std::vector<GroundHazard> hazards;
+    CollectGroundHazards(me, hazards);
+    // A melee damage dealer is out of a pulser's circle before its next burst is due: from 3.4k
+    // health the first three ticks of a ramping inferno kill a rogue still walking out (2026-09-25,
+    // Baron Geddon: eight rogues per attempt). The rhythm is the one this creature has shown.
+    if (GetCombatActiveRole() == ROLE_MELEE_DPS)
+        if (Unit* foe = me->GetVictim())
+            if (foe->IsCreature() && foe->IsAlive())
+                if (float const pr = SuiRaidTelemetry::EntryPulseRadius(foe->GetEntry()))
+                {
+                    uint32 const age = SuiRaidTelemetry::PulseAge(foe);
+                    if (age >= 17500 && age <= 30000)
+                        hazards.push_back({foe->GetPositionX(), foe->GetPositionY(),
+                            pr + 1.5f});
+                }
+    bool const molten = Molten(me, me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
+    if (!molten && (hazards.empty() || !InHazard(hazards, me->GetPositionX(), me->GetPositionY())))
+    {
+        // Out of it, but my melee target stands inside a pulse (a boss's inferno): stay out until
+        // it stops instead of chasing back in (2026-09-24: the tanks and rogues stepped out of
+        // Baron Geddon's Inferno and walked straight back to him, ten dead in two seconds).
+        m_hazardMeleeHoldUntil = 0;
+        Unit* victim = me->GetVictim();
+        CombatBotRoles const role = GetCombatActiveRole();
+        if (victim && (role == ROLE_TANK || role == ROLE_MELEE_DPS) && !hazards.empty() &&
+            InHazard(hazards, victim->GetPositionX(), victim->GetPositionY()))
+        {
+            m_hazardMeleeHoldUntil = now + 450;
+            if (me->IsMoving() && me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE)
+                me->StopMoving();
+            return true;
+        }
+        return false;
+    }
+    Unit* target = me->GetVictim();
+    CombatBotRoles const role = GetCombatActiveRole();
+    bool const melee = target && (role == ROLE_TANK || role == ROLE_MELEE_DPS);
+    std::vector<GroundHazard> idle;
+    CollectIdleHostiles(me, 60.0f, idle);
+    // Out toward the raid, not away from it: a boss follows its tank out of every inferno, and
+    // escapes that pick any side walk the fight across the room into the next pack (2026-09-25:
+    // Baron Geddon drifted 100 yd in four Infernos and a Firewalker pack joined).
+    float ax = 0.0f, ay = 0.0f;
+    uint32 an = 0;
+    if (Group* group = me->GetGroup())
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+            if (Player* m = itr->getSource())
+                if (m != me && m->IsAlive() && m->IsInWorld() && m->GetMap() == me->GetMap() &&
+                    me->IsWithinDistInMap(m, 60.0f))
+                {
+                    ax += m->GetPositionX();
+                    ay += m->GetPositionY();
+                    ++an;
+                }
+    float const pull = an ? (role == ROLE_TANK ? 0.8f : 0.3f) : 0.0f;
+    if (an)
+    {
+        ax /= an;
+        ay /= an;
+    }
+    // A tank steps toward the fight's anchor (the raid's camp), not the drifting middle of the raid.
+    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    if (role == ROLE_TANK && SuiAutopilot::FightAnchor(me, fx, fy, fz))
+    {
+        ax = fx;
+        ay = fy;
+    }
+    float bestX = 0, bestY = 0, bestZ = 0, bestScore = 1e9f;
+    struct EscapeSpot { float x, y, z, score; };
+    std::vector<EscapeSpot> spots;
+    for (float dist : {4.0f, 7.0f, 10.0f, 14.0f, 19.0f, 25.0f})
+    {
+        for (int i = 0; i < 16; ++i)
+        {
+            float const angle = i * float(M_PI) / 8.0f;
+            float x = me->GetPositionX() + dist * std::cos(angle), y = me->GetPositionY() + dist * std::sin(angle);
+            float z = me->GetPositionZ();
+            if (InHazard(hazards, x, y) || CrossesNewHazard(hazards, me->GetPositionX(), me->GetPositionY(), x, y))
+                continue;
+            me->UpdateAllowedPositionZ(x, y, z);
+            if (std::fabs(z - me->GetPositionZ()) > 6.0f || !me->IsWithinLOS(x, y, z + 1.5f) || Molten(me, x, y, z))
+                continue;
+            float score = dist;
+            if (melee)
+                score += 2.0f * std::max(0.0f, target->GetDistance2d(x, y) - 4.0f);
+            if (pull > 0.0f)
+                score += pull * std::sqrt((x - ax) * (x - ax) + (y - ay) * (y - ay));
+            if (InHazard(idle, x, y))
+                score += 100.0f;
+            spots.push_back({x, y, z, score});
+        }
+    }
+    std::sort(spots.begin(), spots.end(), [](EscapeSpot const& a, EscapeSpot const& b) { return a.score < b.score; });
+    uint32 probes = 0;
+    for (EscapeSpot const& s : spots)
+    {
+        if (++probes > 8)
+            break;
+        if (!Walkable(me, s.x, s.y, s.z))
+            continue;
+        bestScore = s.score;
+        bestX = s.x;
+        bestY = s.y;
+        bestZ = s.z;
+        break;
+    }
+    if (bestScore > 1e8f)
+    {
+        // Cornered (a wall, lava, a ledge within 25 yd): look further out, without the straight
+        // sight line, and take the nearest spot the navmesh walks to in a short path (2026-09-25:
+        // Baron Geddon's tank stood through a whole Inferno, no step found).
+        for (float dist : {30.0f, 36.0f, 42.0f})
+        {
+            for (int i = 0; i < 16 && bestScore > 1e8f; ++i)
+            {
+                float const angle = i * float(M_PI) / 8.0f;
+                float x = me->GetPositionX() + dist * std::cos(angle), y = me->GetPositionY() + dist * std::sin(angle);
+                float z = me->GetPositionZ();
+                if (InHazard(hazards, x, y) || CrossesNewHazard(hazards, me->GetPositionX(), me->GetPositionY(), x, y))
+                    continue;
+                me->UpdateAllowedPositionZ(x, y, z);
+                if (std::fabs(z - me->GetPositionZ()) > 8.0f || Molten(me, x, y, z) || InHazard(idle, x, y))
+                    continue;
+                PathInfo path(me);
+                path.calculate(x, y, z, false);
+                if (path.getPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE))
+                    continue;
+                float len = 0.0f;
+                PointsArray const& pts = path.getPath();
+                for (size_t k = 1; k < pts.size(); ++k)
+                    len += (pts[k] - pts[k - 1]).length();
+                if (len > dist * 1.6f)
+                    continue;
+                bestScore = dist;
+                bestX = x;
+                bestY = y;
+                bestZ = z;
+            }
+            if (bestScore < 1e8f)
+                break;
+        }
+    }
+    if (bestScore > 1e8f)
+    {
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: in the fire and no way out found", me->GetName());
+        m_hazardNextMs = now + 1000;
+        return false;
+    }
+    m_hazardNextMs = now + 1200;
+    if (Player* anchor = FindEscortBoss())
+    {
+        m_hazardHoldUntil = now + 60000;
+        m_hazardAnchorX = anchor->GetPositionX();
+        m_hazardAnchorY = anchor->GetPositionY();
+    }
+    if (me->IsNonMeleeSpellCasted(false))
+        me->InterruptNonMeleeSpells(false);
+    CB_HIT(me->GetGUIDLow(), "cpp-combat: stepping out of a ground hazard"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: out of the %s -> (%.1f, %.1f)", me->GetName(),
+        molten ? "lava" : "fire", bestX, bestY);
+    me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+    return true;
+}
+
+bool AiBotAI::AvoidFrontalCone()
+{
+    if (!me->IsAlive() || !me->GetGroup() || m_possessed || m_suiManual || !(me->IsInCombat() || HealerOnDuty()))
+        return false;
+    CombatBotRoles const role = GetCombatActiveRole();
+    uint32 const now = WorldTimer::getMSTime();
+    if (now < m_coneNextMs)
+        return false;
+    m_coneNextMs = now + 500;
+
+    // A long breath being cast sweeps the whole line in front of its caster, tank or not (2026-09-25:
+    // Onyxia's Deep Breath across her lair killed twenty in one pass): off that line, sideways.
+    {
+        std::list<Unit*> far;
+        me->GetEnemyListInRadiusAround(me, 110.0f, far);
+        for (Unit* u : far)
+        {
+            if (!u || !u->IsCreature() || !u->IsAlive())
+                continue;
+            Spell* cs = u->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            if (!cs || !cs->m_spellInfo || cs->GetCastTime() < 1000)
+                continue;
+            bool cone = false;
+            for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                if (cs->m_spellInfo->EffectImplicitTargetA[i] == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24 ||
+                    cs->m_spellInfo->EffectImplicitTargetA[i] == TARGET_ENUM_UNITS_ENEMY_IN_CONE_54)
+                    cone = true;
+            if (!cone)
+                continue;
+            float const o = u->GetOrientation(), fx = std::cos(o), fy = std::sin(o);
+            float const dx = me->GetPositionX() - u->GetPositionX(), dy = me->GetPositionY() - u->GetPositionY();
+            float const along = dx * fx + dy * fy;
+            float const lateral = dx * fy - dy * fx;   // signed distance off the line
+            if (along < 0.0f || std::fabs(lateral) > 32.0f || (role == ROLE_TANK && me->GetDistance(u) < 20.0f))
+                continue;
+            float const side = lateral >= 0.0f ? 1.0f : -1.0f;
+            for (float shift : {36.0f, 44.0f})
+            {
+                float const need = shift - std::fabs(lateral);
+                float x = me->GetPositionX() + fy * side * need, y = me->GetPositionY() - fx * side * need;
+                float z = me->GetPositionZ();
+                me->UpdateAllowedPositionZ(x, y, z);
+                if (std::fabs(z - me->GetPositionZ()) > 8.0f || Molten(me, x, y, z) || !Walkable(me, x, y, z, 2.5f))
+                    continue;
+                if (me->IsNonMeleeSpellCasted(false))
+                    me->InterruptNonMeleeSpells(false);
+                m_coneNextMs = now + 2000;
+                m_repositionUntilMs = now + 3000;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: off the line of %s's breath -> (%.1f, %.1f)",
+                    me->GetName(), u->GetName(), x, y);
+                me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                return true;
+            }
+        }
+    }
+    if (role == ROLE_TANK)
+        return false;
+
+    std::list<Unit*> nearby;
+    me->GetEnemyListInRadiusAround(me, 50.0f, nearby);
+    for (Unit* u : nearby)
+    {
+        if (!u || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat())
+            continue;
+        float const cone = SuiRaidTelemetry::EntryConeRadius(u->GetEntry());
+        if (cone <= 0.0f)
+            continue;
+        float const reach = cone + u->GetObjectBoundingRadius() + 3.0f;
+        float const d = me->GetDistance2d(u);
+        // In front means within 70 degrees of where it faces (the cone plus a margin); a kind with a
+        // cone may sweep its tail too (the same cone data, behind it), so its back is no place
+        // either - the sides are (2026-09-25, Onyxia: Tail Sweep 96k on the melee behind her).
+        bool const inFront = u->HasInArc(me, float(M_PI) * 7.0f / 9.0f);
+        bool const behind = !u->HasInArc(me, float(M_PI) * 11.0f / 9.0f);   // within 70 degrees of her back
+        if (d > reach || !(inFront || behind))
+            continue;
+        // A heal or a shot already on its way is finished unless the breath is being cast.
+        if (me->IsNonMeleeSpellCasted(false))
+        {
+            Spell* theirs = u->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            if (!theirs)
+                return false;
+            me->InterruptNonMeleeSpells(false);
+        }
+        // Its side or back, at my own distance (melee: close behind it).
+        bool const melee = role == ROLE_MELEE_DPS;
+        float const bigReach = u->GetCombatReach() >= 8.0f ? std::min(u->GetCombatReach() * 0.5f, 10.0f) : 1.0f;
+        float const keep = melee ? u->GetObjectBoundingRadius() + me->GetObjectBoundingRadius() + bigReach :
+            std::max(d, 12.0f);
+        std::vector<GroundHazard> hazards;
+        CollectGroundHazards(me, hazards);
+        std::vector<GroundHazard> idle;
+        CollectIdleHostiles(me, 60.0f, idle);
+        float bestX = 0, bestY = 0, bestZ = 0, bestScore = 1e9f;
+        // its flanks - behind the shoulder, clear of both its front and its tail
+        for (float off : {1.83f, -1.83f, 1.7f, -1.7f, 1.57f, -1.57f})
+        {
+            float const ang = u->GetOrientation() + off;
+            float x = u->GetPositionX() + keep * std::cos(ang), y = u->GetPositionY() + keep * std::sin(ang);
+            float z = u->GetPositionZ();
+            me->UpdateAllowedPositionZ(x, y, z);
+            if (std::fabs(z - u->GetPositionZ()) > 6.0f || !u->IsWithinLOS(x, y, z + 1.5f) ||
+                Molten(me, x, y, z) || InHazard(hazards, x, y) || InHazard(idle, x, y))
+                continue;
+            float const score = me->GetDistance2d(x, y);
+            if (score < bestScore && Walkable(me, x, y, z))
+            {
+                bestScore = score;
+                bestX = x;
+                bestY = y;
+                bestZ = z;
+            }
+        }
+        if (bestScore > 1e8f)
+            return false;
+        m_coneNextMs = now + 1500;
+        m_repositionUntilMs = now + 2500;
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: out of the front of %s -> (%.1f, %.1f)",
+            me->GetName(), u->GetName(), bestX, bestY);
+        me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return true;
+    }
+    return false;
+}
+
+bool AiBotAI::MaintainRangedSpacing()
+{
+    CombatBotRoles const role = GetCombatActiveRole();
+    // [TACTICS] A wounded melee damage dealer steps out of point-blank area damage (a Molten
+    // Giant's Smash killed the rogues in 22 s) and waits to be healed, then goes back in.
+    // Against a kind that pulses fire around itself, a melee damage dealer cannot take the next
+    // burst below two thirds of its health (2026-09-25: seven rogues died to Baron Geddon's Inferno).
+    Unit* const meleeVictim = me->GetVictim();
+    bool const pulseFoe = meleeVictim && meleeVictim->IsCreature() &&
+        SuiRaidTelemetry::EntryPulseRadius(meleeVictim->GetEntry()) > 0.0f;
+    bool const woundedMelee = role == ROLE_MELEE_DPS && me->IsInCombat() &&
+        (me->GetHealthPercent() < (pulseFoe ? 50.0f : 40.0f) ||
+         (m_meleeSteppedOut && me->GetHealthPercent() < (pulseFoe ? 80.0f : 70.0f)));
+    m_meleeSteppedOut = woundedMelee;
+    if ((role != ROLE_RANGE_DPS && role != ROLE_HEALER && !woundedMelee) ||
+        !(me->IsInCombat() || HealerOnDuty()) || !me->GetGroup() || me->IsMoving() || m_possessed || m_suiManual)
+        return false;
+    uint32 const now = WorldTimer::getMSTime();
+    if (now < m_rangedSpacingNextMs)
+        return false;
+
+    std::list<Unit*> nearby;
+    me->GetEnemyListInRadiusAround(me, 40.0f, nearby);
+    Unit* closest = nullptr;
+    float closestDist = 1e9f;
+    float keepDist = 14.0f;
+    bool pulseKeep = false;
+    float worst = 0.0f;
+    // Healers stay out of a burst circle all fight; a ranged damage dealer stands in it while it
+    // can take it (outside, most spells do not reach: Shazzrah's Arcane Explosion reaches 30 yd,
+    // and with every caster outside the raid did 1.5k/s) and steps out below 60 % until 90 %.
+    bool const pulseOut = role == ROLE_HEALER ||
+        me->GetHealthPercent() < 40.0f || (m_pulseSteppedOut && me->GetHealthPercent() < 70.0f);
+    m_pulseSteppedOut = role != ROLE_HEALER && pulseOut;
+    for (Unit* u : nearby)
+    {
+        if (!u || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat() ||
+            u->HasBreakableByDamageCrowdControlAura())
+            continue;
+        float const d = me->GetDistance(u);
+        // A kind seen pulsing fire around itself (an inferno): ranged and healers stay outside
+        // that circle all fight long - from 1 yd inside it the first four ticks kill a caster
+        // before it can walk out (2026-09-25, Baron Geddon).
+        float keep = 14.0f;
+        bool pulse = false;
+        uint32 const rhythm = SuiRaidTelemetry::EntryBurstInterval(u->GetEntry());
+        // (Keeping every caster out of a rapid burster left the damage to hunters and melee:
+        // Shazzrah's 30 yd explosion is wider than most spells reach - 1.7k/s. Casters stand in
+        // it, drink its school's protection and step out when wounded; healers always keep out.)
+        uint32 kin = 0;
+        for (Unit* o : nearby)
+            if (o && o->IsAlive() && o->IsInCombat() && o->GetEntry() == u->GetEntry())
+                ++kin;
+        // bursting every few seconds, counting every one of its kind in the fight: stand at its rim
+        bool const rapid = rhythm > 0 && rhythm < 10000u * std::max<uint32>(kin, 1u);
+        // a burst that hits for under a quarter of my health is healed through, not danced around
+        uint32 const burstHit = SuiRaidTelemetry::EntryBurstMaxHit(u->GetEntry());
+        bool const light = burstHit > 0 && burstHit * 4 * std::max<uint32>(kin, 1u) < me->GetMaxHealth();
+        if (!woundedMelee && !light && (pulseOut || rapid))
+            if (float const pr = SuiRaidTelemetry::EntryPulseRadius(u->GetEntry()))
+                if (pr + 1.2f - u->GetObjectBoundingRadius() - me->GetObjectBoundingRadius() > keep)
+                {
+                    keep = pr + 1.2f - u->GetObjectBoundingRadius() - me->GetObjectBoundingRadius();
+                    pulse = true;
+                }
+        if (d >= keep)
+            continue;
+        if (keep - d > worst)
+        {
+            worst = keep - d;
+            closestDist = d;
+            closest = u;
+            keepDist = keep;
+            pulseKeep = pulse;
+        }
+    }
+    if (!closest)
+    {
+        // A stepped-out melee holds here (no re-engage) until it has been healed.
+        if (woundedMelee)
+            return true;
+        // A ranged damage dealer whose target is out of sight closes in along the path until it
+        // can see it (2026-09-24: most Frostbolts and every hunter shot failed LINE_OF_SIGHT from
+        // the raid's camp around a corner - mages did less than one rogue).
+        if (role == ROLE_RANGE_DPS && !me->IsNonMeleeSpellCasted(false))
+            if (Unit* target = me->GetVictim())
+                if (target->IsAlive() && !me->IsWithinLOSInMap(target) && target->GetVictim() &&
+                    me->GetGroup()->IsMember(target->GetVictim()->GetCharmerOrOwnerOrOwnGuid()) &&
+                    (!FindEscortBoss() || FindEscortBoss()->IsWithinDistInMap(target, 45.0f)))
+                {
+                    // Only the group's own fight next to the tank: never walk off toward a
+                    // stale target (2026-09-24: a hunter wandered 77 yd and pulled a Firelord).
+                    m_rangedSpacingNextMs = now + 2500;
+                    PathInfo path(me);
+                    path.calculate(target->GetPositionX(), target->GetPositionY(), target->GetPositionZ(), false);
+                    PointsArray const& points = path.getPath();
+                    std::vector<GroundHazard> idleNear;
+                    CollectIdleHostiles(me, 60.0f, idleNear);
+                    // Walk the path in 2 yd steps to the first spot with sight of the target, in
+                    // spell reach, outside a circle it is known to burn and outside an idle
+                    // pack's reach (2026-09-25: walking to 20 yd put the casters inside Baron
+                    // Geddon's Inferno circle, and the keep-out walked them back behind a pillar -
+                    // hundreds of LINE_OF_SIGHT failures a fight).
+                    float keepOut = 0.0f;
+                    if (target->IsCreature())
+                        if (float const pr = SuiRaidTelemetry::EntryPulseRadius(target->GetEntry()))
+                            keepOut = pr + 1.2f - target->GetObjectBoundingRadius();
+                    for (size_t i = 1; i < points.size(); ++i)
+                    {
+                        Vector3 const seg = points[i] - points[i - 1];
+                        float const len = seg.length();
+                        for (float s = 2.0f; s <= len + 0.01f; s += 2.0f)
+                        {
+                            Vector3 const q = points[i - 1] + seg * (len > 0.0f ? std::min(1.0f, s / len) : 1.0f);
+                            float const d = target->GetDistance2d(q.x, q.y);
+                            if (InHazard(idleNear, q.x, q.y) || d < keepOut || d > 30.0f)
+                                continue;
+                            if (!target->IsWithinLOS(q.x, q.y, q.z + 1.5f))
+                                continue;
+                            CB_HIT(me->GetGUIDLow(), "cpp-combat: ranged closing for line of sight"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+                            me->GetMotionMaster()->MovePoint(0, q.x, q.y, q.z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+        // Spread: area damage lands on clumps (2026-09-24: a Lava Surger's Surge - a charge that
+        // burns everyone near where it lands - did 120k to a raid standing in formation). A ranged
+        // member or healer with two or more others within 5 yd steps to the least crowded spot 6-10
+        // yd away that keeps its reach and sight.
+        if (!me->IsNonMeleeSpellCasted(false) && me->IsInCombat())
+        {
+            Group* group = me->GetGroup();
+            auto crowd = [&](float x, float y, float r)
+            {
+                uint32 n = 0;
+                for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+                {
+                    Player* o = itr->getSource();
+                    if (o && o != me && o->IsAlive() && o->IsInWorld() && o->GetMap() == me->GetMap() &&
+                        o->GetDistance2d(x, y) < r)
+                        ++n;
+                }
+                return n;
+            };
+            // A foe in the fight whose spells burst around their target: that far apart, alone.
+            float splash = 0.0f;
+            {
+                std::list<Unit*> foes;
+                me->GetEnemyListInRadiusAround(me, 100.0f, foes);
+                for (Unit* f : foes)
+                    if (f && f->IsCreature() && f->IsAlive() && f->IsInCombat())
+                        splash = std::max(splash, SuiRaidTelemetry::EntrySplashRadius(f->GetEntry()));
+            }
+            float const apart = splash > 0.0f ? std::max(5.0f, splash + 1.0f) : 5.0f;
+            if (crowd(me->GetPositionX(), me->GetPositionY(), apart) >= (splash > 0.0f ? 1u : 2u))
+            {
+                Player* anchor = role == ROLE_HEALER ? ActiveTank() : nullptr;
+                if (!anchor)
+                    anchor = FindEscortBoss();
+                Unit* victim = me->GetVictim();
+                std::vector<GroundHazard> idleNear;
+                CollectIdleHostiles(me, 45.0f, idleNear);
+                std::vector<GroundHazard> burning;
+                CollectGroundHazards(me, burning);
+                float bestX = 0, bestY = 0, bestZ = 0;
+                float const ring = splash > 0.0f ? apart : 6.0f;
+                uint32 bestN = crowd(me->GetPositionX(), me->GetPositionY(), ring);
+                for (float dist : {ring, ring * 1.4f, ring * 1.8f})
+                    for (int i = 0; i < 12; ++i)
+                    {
+                        float const ang = i * float(M_PI) / 6.0f;
+                        float x = me->GetPositionX() + dist * std::cos(ang), y = me->GetPositionY() + dist * std::sin(ang);
+                        float z = me->GetPositionZ();
+                        me->UpdateAllowedPositionZ(x, y, z);
+                        if (std::fabs(z - me->GetPositionZ()) > 4.0f || !me->IsWithinLOS(x, y, z + 1.5f))
+                            continue;
+                        if (me->GetTerrain()->getLiquidStatus(x, y, z + 0.01f, MAP_LIQUID_TYPE_MAGMA | MAP_LIQUID_TYPE_SLIME, nullptr) &
+                            (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER | LIQUID_MAP_WATER_WALK))
+                            continue;
+                        if (anchor && anchor != me && (anchor->GetDistance(x, y, z) > (role == ROLE_HEALER ? 28.0f : 35.0f) ||
+                            !anchor->IsWithinLOS(x, y, z + 1.5f)))
+                            continue;
+                        if (victim && role == ROLE_RANGE_DPS && (victim->GetDistance(x, y, z) > 33.0f ||
+                            !victim->IsWithinLOS(x, y, z + 1.5f)))
+                            continue;
+                        if (InHazard(idleNear, x, y) || InHazard(burning, x, y))
+                            continue;
+                        uint32 const n = crowd(x, y, ring);
+                        if (n < bestN && Walkable(me, x, y, z))
+                        {
+                            bestN = n;
+                            bestX = x;
+                            bestY = y;
+                            bestZ = z;
+                        }
+                    }
+                if (bestX != 0 || bestY != 0)
+                {
+                    m_rangedSpacingNextMs = now + 3000;
+                    CB_HIT(me->GetGUIDLow(), "cpp-combat: spreading out"); m_repositionUntilMs = WorldTimer::getMSTime() + 2000;
+                    me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                    return true;
+                }
+            }
+        }
+        // Nothing too close: a healer that lost reach or sight of the tank closes back in - the
+        // tank actually holding the fight, not the raid's leader (2026-09-25: Baron Geddon's tank
+        // died with all ten healers 51-59 yd away beside the leader).
+        Player* tank = ActiveTank();
+        if (!tank)
+            tank = FindEscortBoss();
+        if (role != ROLE_HEALER || !tank || tank == me || !tank->IsAlive())
+            return false;
+        // The tank's enemy pulses fire around itself: heal from outside that circle (heal range is
+        // 40 yd), rather than walking back into it between bursts.
+        float pulseKeepOut = 0.0f;
+        Unit* tankFoe = nullptr;
+        for (Unit* a : tank->GetAttackers())
+            if (a && a->IsAlive() && a->IsCreature())
+                if (float const pr = SuiRaidTelemetry::EntryPulseRadius(a->GetEntry()))
+                    if (pr + 1.2f - a->GetObjectBoundingRadius() > pulseKeepOut)
+                    {
+                        pulseKeepOut = pr + 1.2f - a->GetObjectBoundingRadius();
+                        tankFoe = a;
+                    }
+        bool const inReach = me->IsWithinDistInMap(tank, pulseKeepOut > 0.0f ? 38.0f : 28.0f) &&
+            me->IsWithinLOSInMap(tank);
+        if (inReach)
+            return false;
+        if (Spell* cast = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+        {
+            // Busy healing someone else while the tank is out of this healer's reach: the heal
+            // can wait, the tank cannot - and a healer always casting never walked back in at
+            // all (2026-09-24: behind a rock; 2026-09-25: 42-83 yd from Baron Geddon's tank).
+            if (cast->m_targets.getUnitTargetGuid() == tank->GetObjectGuid())
+                return false;
+            me->InterruptNonMeleeSpells(false);
+        }
+        else if (me->IsNonMeleeSpellCasted(false))
+            return false;
+        m_rangedSpacingNextMs = now + 2000;
+        // The nearest spot on rings around the tank that sees it, stays out of any circle its enemy
+        // burns and of idle packs, is not lava, and has a path: a walk along the path toward the
+        // tank alone found none in 161 of 186 tries beside Baron Geddon (2026-09-25).
+        std::vector<GroundHazard> idleNear;
+        CollectIdleHostiles(me, 60.0f, idleNear);
+        std::vector<GroundHazard> burning;
+        CollectGroundHazards(me, burning);
+        struct Cand { float x, y, z, score; };
+        std::vector<Cand> cands;
+        float const rings[3] = { pulseKeepOut > 0.0f ? 30.0f : 20.0f, pulseKeepOut > 0.0f ? 34.0f : 26.0f, pulseKeepOut > 0.0f ? 26.0f : 14.0f };
+        for (float r : rings)
+            for (int i = 0; i < 24; ++i)
+            {
+                float const ang = i * float(M_PI) / 12.0f;
+                float x = tank->GetPositionX() + r * std::cos(ang), y = tank->GetPositionY() + r * std::sin(ang);
+                float z = tank->GetPositionZ();
+                me->UpdateAllowedPositionZ(x, y, z);
+                if (std::fabs(z - tank->GetPositionZ()) > 6.0f || Molten(me, x, y, z) ||
+                    InHazard(burning, x, y) || InHazard(idleNear, x, y))
+                    continue;
+                if (tankFoe && tankFoe->GetDistance2d(x, y) < pulseKeepOut)
+                    continue;
+                // ...nor in front of or behind a kind that breathes a cone and sweeps its tail
+                // (2026-09-25: healers closing on Onyxia's tank stood in her Tail Sweep).
+                bool arc = false;
+                for (Unit* a : tank->GetAttackers())
+                    if (a && a->IsAlive() && a->IsCreature())
+                        if (float const cone = SuiRaidTelemetry::EntryConeRadius(a->GetEntry()))
+                            if (a->GetDistance2d(x, y) < cone + a->GetObjectBoundingRadius() + 3.0f)
+                            {
+                                float rel = a->GetAngle(x, y) - a->GetOrientation();
+                                while (rel > float(M_PI)) rel -= 2.0f * float(M_PI);
+                                while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
+                                float const off = std::fabs(rel);
+                                if (off < float(M_PI) * 7.0f / 18.0f || off > float(M_PI) * 11.0f / 18.0f)
+                                    arc = true;
+                            }
+                if (arc)
+                    continue;
+                if (!tank->IsWithinLOS(x, y, z + 1.5f))
+                    continue;
+                cands.push_back({x, y, z, me->GetDistance(x, y, z)});
+            }
+        std::sort(cands.begin(), cands.end(), [](Cand const& a, Cand const& b) { return a.score < b.score; });
+        uint32 tried = 0;
+        for (Cand const& c : cands)
+        {
+            if (++tried > 10)
+                break;
+            PathInfo path(me);
+            path.calculate(c.x, c.y, c.z, false);
+            if (path.getPathType() & PATHFIND_NOPATH)
+                continue;
+            // A ring point a little off the mesh reads "incomplete": fine if the walk ends close.
+            PointsArray const& pts = path.getPath();
+            if (pts.empty() || (path.getPathType() & PATHFIND_INCOMPLETE &&
+                (pts.back() - Vector3(c.x, c.y, c.z)).length() > 4.0f))
+                continue;
+            float walk = 0.0f;
+            for (size_t k = 1; k < pts.size(); ++k)
+                walk += (pts[k] - pts[k - 1]).length();
+            if (walk > c.score * 2.0f + 10.0f)
+                continue;   // a detour round a ridge, not a step into sight
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: closing on %s (%.0f yd%s) -> %.0f yd from it",
+                me->GetName(), tank->GetName(), me->GetDistance(tank), me->IsWithinLOSInMap(tank) ? "" : ", no sight",
+                tank->GetDistance(c.x, c.y, c.z));
+            CB_HIT(me->GetGUIDLow(), "cpp-combat: healer closing to heal range of the tank"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+            me->GetMotionMaster()->MovePoint(0, c.x, c.y, c.z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            return true;
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: cannot reach %s (%.0f yd%s, %u spots, keep-out %.0f)",
+            me->GetName(), tank->GetName(), me->GetDistance(tank), me->IsWithinLOSInMap(tank) ? "" : ", no sight",
+            uint32(cands.size()), pulseKeepOut);
+        return false;
+    }
+    // A cast in progress is kept unless the hostile is close enough for point-blank area
+    // damage to reach (2026-09-24: healers chain-casting beside a Molten Giant never moved
+    // and died to its 10 yd Smash).
+    if (me->IsNonMeleeSpellCasted(false))
+    {
+        // Inside the circle of a kind that bursts every few seconds the cast is dropped too:
+        // healers finishing heal after heal stood 20-30 s in Shazzrah's Arcane Explosion
+        // (2026-09-25). Anything else waits for the cast unless it is point-blank close.
+        if (closestDist > 11.0f && !pulseKeep)
+            return false;
+        me->InterruptNonMeleeSpells(false);
+    }
+    m_rangedSpacingNextMs = now + 2000;
+
+    float dx = me->GetPositionX() - closest->GetPositionX(), dy = me->GetPositionY() - closest->GetPositionY();
+    float len = std::sqrt(dx * dx + dy * dy);
+    if (len < 0.5f)
+    {
+        float const o = me->GetOrientation() + M_PI_F;
+        dx = std::cos(o);
+        dy = std::sin(o);
+        len = 1.0f;
+    }
+    dx /= len;
+    dy /= len;
+    Player* anchor = role == ROLE_HEALER ? ActiveTank() : nullptr;
+    if (!anchor)
+        anchor = FindEscortBoss();
+    float const step = std::max(22.0f, keepDist + 1.0f) - closestDist;
+    std::vector<GroundHazard> idleNear;
+    CollectIdleHostiles(me, 50.0f, idleNear);
+    // Try straight away, then 45 degrees either side, keeping near the anchor.
+    for (float turn : { 0.0f, 0.785f, -0.785f })
+    {
+        float const c = std::cos(turn), s = std::sin(turn);
+        float const ux = dx * c - dy * s, uy = dx * s + dy * c;
+        float x = me->GetPositionX() + ux * step, y = me->GetPositionY() + uy * step;
+        float z = me->GetPositionZ();
+        ReGroundZ(x, y, z, "ranged-spacing");
+        if (std::fabs(z - me->GetPositionZ()) > 5.0f)
+            continue;
+        // Healers keep the tank inside heal range; ranged may use the full shooting range.
+        if (anchor && anchor != me && anchor->GetDistance(x, y, z) > (role == ROLE_HEALER ? (pulseKeep ? 38.0f : 28.0f) : 38.0f))
+            continue;
+        if (InHazard(idleNear, x, y) || !Walkable(me, x, y, z))
+            continue;
+        CB_HIT(me->GetGUIDLow(), "cpp-combat: ranged stepping clear of a close hostile"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+        if (woundedMelee)
+            me->AttackStop();
+        me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return true;
+    }
+    return false;
+}
+
+// [TACTICS] 2026-09-23 telemetry: the tank died at the start of every pull with no heal
+// landing - the healers' in-combat routine only runs once the healer itself is in combat,
+// and at the start of a pull only the tank is.
+Player* AiBotAI::ActiveTank() const
+{
+    Group* group = me->GetGroup();
+    if (!group)
+        return nullptr;
+    Player* best = nullptr;
+    float bestScore = 0.0f;
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != me->GetMap() || !m->IsInCombat() ||
+            !me->IsWithinDistInMap(m, 80.0f))
+            continue;
+        float score = 0.0f;
+        for (Unit* attacker : m->GetAttackers())
+        {
+            if (!attacker || !attacker->IsAlive() || attacker->GetVictim() != m)
+                continue;
+            if (Creature* cr = attacker->ToCreature())
+                score += cr->IsWorldBoss() ? 10.0f : (cr->IsElite() ? 3.0f : 1.0f);
+            else
+                score += 1.0f;
+        }
+        if (score <= 0.0f)
+            continue;
+        if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
+            if (ai->GetCombatActiveRole() == ROLE_TANK)
+                score += 0.5f;
+        if (score > bestScore)
+        {
+            bestScore = score;
+            best = m;
+        }
+    }
+    return best;
+}
+
+bool AiBotAI::HealerOnDuty() const
+{
+    // Healers: whenever the group nearby fights. Everyone else: when the group fights and the
+    // bot already has a target - a caster whose first spell never landed (out of sight) is
+    // not "in combat" yet and used to skip its rotation and its repositioning entirely.
+    if (!me->GetGroup() || (GetCombatActiveRole() != ROLE_HEALER && !me->GetVictim()))
+        return false;
+    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (m && m != me && m->IsAlive() && m->IsInWorld() && m->GetMap() == me->GetMap() &&
+            m->IsInCombat() && !m->GetAttackers().empty() &&
+            me->IsWithinDistInMap(m, GetCombatActiveRole() == ROLE_HEALER ? 80.0f : 40.0f))
+            return true;
+    }
+    return false;
 }

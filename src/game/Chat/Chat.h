@@ -278,6 +278,7 @@ class ChatHandler
         bool HandleBotStartCommand(char * args);
         bool HandleBotAddAiCommand(char* args);
         bool HandleSuiPossessCommand(char* args);
+        bool HandleAutopilotCommand(char* args);
         bool HandleSuiCompanionCommand(char* args);
         bool HandleSuiReleaseCommand(char* args);
         bool HandleSuiWorldStateCommand(char* args);

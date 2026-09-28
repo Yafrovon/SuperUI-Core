@@ -221,6 +221,8 @@ set (game_SRCS
     SuperUiContent/SuiWorld/CRPG/SuiPossess.cpp
     SuperUiContent/SuiWorld/CRPG/SuiCompanion.cpp
     SuperUiContent/SuiWorld/CRPG/SuiTaxi.cpp
+    SuperUiContent/SuiWorld/CRPG/SuiAutopilot.cpp
+    SuperUiContent/SuiWorld/CRPG/SuiRaidTelemetry.cpp
     SuperUiContent/SuiWorld/CRPG/SuiCommanderRaid.cpp
     SuperUiContent/SuiWorld/CRPG/SuiRaidPrepare.cpp
     SuperUiContent/SuiWorld/CRPG/SuiRaidSupply.cpp

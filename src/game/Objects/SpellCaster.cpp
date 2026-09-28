@@ -16,6 +16,7 @@
 
 #include "ObjectMgr.h"
 #include "SpellCaster.h"
+#include "SuperUiContent/SuiWorld/CRPG/SuiRaidTelemetry.h"
 #include "DynamicObject.h"
 #include "GameObject.h"
 #include "Totem.h"
@@ -759,6 +760,7 @@ int32 SpellCaster::DealHeal(Unit* pVictim, uint32 addhealth, SpellEntry const* s
     if (!pVictim || pVictim->IsSuiTacticallyFrozen() ||
         (pUnit && pUnit->IsSuiTacticallyFrozen()))
         return 0;
+    SuiRaidTelemetry::OnHeal(pUnit, pVictim, addhealth, spellProto);
 
     // Script Event HealedBy
     if (pVictim->AI() && pUnit)

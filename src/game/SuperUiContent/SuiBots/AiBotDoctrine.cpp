@@ -14,6 +14,7 @@
  */
 
 #include "AiBotDoctrine.h"
+#include "SuiAutopilot.h"
 #include "AiBotAIMain.h"
 #include "AiBotCircuit.h" // [CIRCUIT] probe macros (CIRCUIT_BOARD.md)
 #include "Player.h"
@@ -44,6 +45,10 @@ DoctrineKind ResolveDoctrine(AiBotAI const& bot)
     // present-but-dark M2 Directed branch (revisit the ranking when the conduct substrate
     // actually lands). Leaving the party un-resolves FindPartyBoss and this drops straight
     // back to the frozen ladder next behaviour tick -- swap == reset, as always.
+    // [AUTOPILOT] The leader runs the escort doctrine as its own anchor.
+    if (SuiAutopilot::IsLeader(bot.GetBotPlayer()))
+        return DoctrineKind::PlayerParty;
+
     if (bot.FindPartyBoss())
     {
         CB_HIT(CbGuid(bot), "cpp-doctrine: resolve, player party, live human in group");

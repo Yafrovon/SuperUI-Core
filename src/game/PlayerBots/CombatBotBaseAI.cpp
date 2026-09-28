@@ -1968,7 +1968,8 @@ bool CombatBotBaseAI::FindAndHealInjuredAlly(float selfHealPercent, float groupH
 template <class T>
 SpellEntry const* CombatBotBaseAI::SelectMostEfficientHealingSpell(Unit const* pTarget, std::set<SpellEntry const*, T>& spellList) const
 {
-    return SelectMostEfficientHealingSpell(pTarget, pTarget->GetMaxHealth() - pTarget->GetHealth(), spellList);
+    int32 const missing = int32(pTarget->GetMaxHealth() - pTarget->GetHealth()) - IncomingGroupHeals(pTarget);
+    return SelectMostEfficientHealingSpell(pTarget, std::max<int32>(missing, 1), spellList);
 }
 
 template <class T>
@@ -2068,7 +2069,7 @@ bool CombatBotBaseAI::IsValidHealTarget(Unit const* pTarget, float healthPercent
     return (pTarget->GetHealthPercent() < healthPercent) &&
             me->IsValidHelpfulTarget(pTarget) &&
             me->IsWithinLOSInMap(pTarget) &&
-            me->IsWithinDist(pTarget, 30.0f);
+            me->IsWithinDist(pTarget, 38.0f);
 }
 
 Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPercent) const
@@ -2090,13 +2091,42 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
     {
         // Players always take priority over pets.  Seeded self remains the
         // choice unless an eligible party member is at lower health.
+        // [TACTICS] (2026-09-23/24) Tank healers and raid healers. Round 1 made every healer
+        // favour the tank by 20-40 points: all ten poured max-rank heals into it, went out of
+        // mana in a minute, and the melee died to area damage nobody healed. Now two in five
+        // healers (by guid) are tank healers - a tank being hit counts 30 points lower for
+        // them and is topped from 95 % - and the rest heal the raid by plain percentage,
+        // taking a tank only in an emergency (under 50 %). A target whose missing health is
+        // already covered by heals other healers are casting is skipped.
+        bool const tankHealer = me->GetGUIDLow() % 5 < 2;
         for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
         {
             Player* pMember = itr->getSource();
-            if (!pMember || pMember == me ||
-                !IsValidHealTarget(pMember, groupHealPercent) ||
-                healthPercent <= pMember->GetHealthPercent())
+            if (!pMember || pMember == me)
                 continue;
+            bool tanking = false;
+            if (IsTankClass(pMember->GetClass()))
+                for (Unit* attacker : pMember->GetAttackers())
+                    if (attacker && attacker->IsCreature() && attacker->GetVictim() == pMember)
+                    {
+                        tanking = true;
+                        break;
+                    }
+            float const hp = pMember->GetHealthPercent();
+            // A tank under 40 % is everyone's emergency: a heal "on its way" can still be cut off
+            // (2026-09-24: the leader died over 8 s with every healer casting on someone else and
+            // no heal landing on him).
+            bool const emergency = tanking && hp < 40.0f;
+            // A tank healer stays on the tank while the raid bleeds from area damage: a 30-point
+            // lean lost the tank to rogues and casters at 25 % every time (2026-09-25, Shazzrah:
+            // "healed 0 in last 8 s" with nine healers casting in range).
+            float const effective = hp - (emergency ? 60.0f : tanking && tankHealer ? 60.0f : (tanking && hp < 50.0f ? 20.0f : 0.0f));
+            if (!IsValidHealTarget(pMember, tanking && tankHealer ? std::max(groupHealPercent, 95.0f) : groupHealPercent) ||
+                healthPercent <= effective)
+                continue;
+            int32 const missing = int32(pMember->GetMaxHealth() - pMember->GetHealth());
+            if (!emergency && IncomingGroupHeals(pMember) * 10 >= missing * 9)
+                continue;   // other healers' casts already cover it
 
             // Avoid all healers picking the same non-tank target once this
             // healer already has a viable candidate.
@@ -2104,7 +2134,7 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
                 AreOthersOnSameTarget(pMember->GetObjectGuid(), false, true))
                 continue;
 
-            healthPercent = pMember->GetHealthPercent();
+            healthPercent = effective;
             pTarget = pMember;
         }
 
@@ -3161,6 +3191,13 @@ bool CombatBotBaseAI::CanTryToCastSpellInternal(Unit const* pTarget, SpellEntry 
     }
 
     SpellRangeEntry const* srange = sSpellRangeStore.LookupEntry(pSpellEntry->rangeIndex);
+    // [TACTICS] 2026-09-24: melee ("combat range") spells use the reach the core itself checks
+    // (Spell::CheckRange -> CanReachWithMeleeSpellAttack), which grows with the model. The
+    // distance-vs-5.5 yd test below refused every melee ability against a large mob (a Molten
+    // Giant), so rogues and warriors only white-hit and tanks built no threat.
+    if (me != pTarget && pSpellEntry->rangeIndex == SPELL_RANGE_IDX_COMBAT)
+        return pSpellEntry->IsNextMeleeSwingSpell() || me->CanReachWithMeleeSpellAttack(pTarget);
+
     if (me != pTarget && pSpellEntry->EffectImplicitTargetA[0] != TARGET_UNIT_CASTER)
     {
         float const dist = me->GetCombatDistance(pTarget);
@@ -3740,4 +3777,26 @@ void CombatBotBaseAI::OnPacketReceived(WorldPacket const* packet)
             return;
         }
     }
+}
+
+// [TACTICS] The base healing of every heal a group member is casting on pTarget right now.
+int32 CombatBotBaseAI::IncomingGroupHeals(Unit const* pTarget) const
+{
+    Group* pGroup = me->GetGroup();
+    if (!pGroup || !pTarget)
+        return 0;
+    int32 incoming = 0;
+    for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+    {
+        Player* pMember = itr->getSource();
+        if (!pMember || pMember == me || !pMember->IsInWorld())
+            continue;
+        Spell* spell = pMember->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        if (!spell || spell->m_targets.getUnitTarget() != pTarget)
+            continue;
+        for (uint32 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            if (spell->m_spellInfo->Effect[i] == SPELL_EFFECT_HEAL)
+                incoming += spell->m_spellInfo->EffectBasePoints[i];
+    }
+    return incoming;
 }

@@ -1076,3 +1076,33 @@ hit is retained in its Spell target record and retried every 50 ms after thaw.
 Arbitrary immediate/proc Spell objects are **not** retained and replayed: those
 effects are suppressed. This is actor/effect suspension, not a claim that the
 entire projectile/world simulation is paused.
+
+
+## Threat meter — CMSG_SUI_THREAT / SMSG_SUI_THREAT (v1, owner 2026-09-22)
+
+The 1.12 protocol never tells a client anyone's threat. The client's Threat Meter add-on pulls
+the top of one creature's threat list about twice a second. Opcodes 876 / 877 (0x036C / 0x036D);
+`NUM_MSG_TYPES` is 878. Capability bit 14 (`THREAT_METER_V1`) advertises the pair, and the
+client sends nothing before it sees that bit.
+
+Request, exactly 10 bytes; any other length, version or row count is dropped:
+
+| Field | Type | Meaning |
+|---|---|---|
+| version | u8 | 1 |
+| rows | u8 | 1..10, how many of the top holders to return |
+| creature | u64 | the unit whose threat list is wanted |
+
+Reply, always on the requesting session, never on a bot's socket-less one:
+
+| Field | Type | Meaning |
+|---|---|---|
+| version | u8 | 1 |
+| creature | u64 | echoes the request |
+| status | u8 | 0 = list follows; 1 = dead, has no threat list, or more than 200 yd from the driven body (the reply ends here) |
+| victim | u64 | the creature's current victim, 0 if none |
+| listSize | u16 | entries on the whole (online) threat list |
+| rows | u8 | rows that follow, sorted by threat, descending |
+| row × rows | u64 guid, f32 threat | raw ThreatManager values |
+| hasSelf | u8 | 1 when the driven body (`GetSuiActor`) is on the list but not among the rows |
+| selfRank, selfThreat | u16, f32 | present only when hasSelf = 1; rank is 1-based |

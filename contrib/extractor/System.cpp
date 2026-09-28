@@ -71,6 +71,9 @@ char output_path[128] = ".";
 char input_path[128] = ".";
 uint32 maxAreaId = 0;
 
+// World Builder: -m 0,1,800 restricts map extraction to these map ids (empty = all maps).
+std::set<uint32> CONF_map_filter;
+
 //**************************************************
 // Extractor options
 //**************************************************
@@ -135,6 +138,7 @@ void Usage(char* prg)
         "-o set output path\n"\
         "-e extract only MAP(1)/DBC(2)/Camera(4) - standard: all(7)\n"\
         "-f height stored as int (less map size but lost some accuracy) 1 by default\n"\
+        "-m comma separated map ids to extract (default: all maps)\n"\
         "Example: %s -f 0 -i \"c:\\games\\game\"", prg, prg);
     exit(1);
 }
@@ -168,6 +172,24 @@ void HandleArgs(int argc, char* arg[])
             case 'f':
                 if (c + 1 < argc)                           // all ok
                     CONF_allow_float_to_int = atoi(arg[(c++) + 1]) != 0;
+                else
+                    Usage(arg[0]);
+                break;
+            case 'm':
+                if (c + 1 < argc)                           // all ok
+                {
+                    std::string list = arg[(c++) + 1];
+                    size_t start = 0;
+                    while (start <= list.size())
+                    {
+                        size_t end = list.find(',', start);
+                        if (end == std::string::npos)
+                            end = list.size();
+                        if (end > start)
+                            CONF_map_filter.insert(uint32(atoi(list.substr(start, end - start).c_str())));
+                        start = end + 1;
+                    }
+                }
                 else
                     Usage(arg[0]);
                 break;
@@ -765,6 +787,8 @@ void ExtractMapsFromMpq()
     printf("Convert map files\n");
     for (uint32 z = 0; z < map_count; ++z)
     {
+        if (!CONF_map_filter.empty() && CONF_map_filter.find(map_ids[z].id) == CONF_map_filter.end())
+            continue;
         printf("Extract %s (%d/%d)                  \n", map_ids[z].name, z + 1, map_count);
         // Loadup map grid data
         sprintf(mpq_map_name, "World\\Maps\\%s\\%s.wdt", map_ids[z].name, map_ids[z].name);
@@ -893,6 +917,15 @@ void LoadCommonMPQFiles()
     for (int i = 0; i < count; ++i)
     {
         sprintf(filename, "%s/Data/%s", input_path, CONF_mpq_list[i]);
+        if (FileExists(filename))
+            new MPQArchive(filename);
+    }
+    // World Builder: numbered patches above patch-2 (patch-3 spells, patch-4 retexture,
+    // patch-7 World Content Packs, ...). Opened in ascending order; the archive set is
+    // push_front, so the highest number wins - the same precedence as the game client.
+    for (int n = 3; n <= 99; ++n)
+    {
+        sprintf(filename, "%s/Data/patch-%d.MPQ", input_path, n);
         if (FileExists(filename))
             new MPQArchive(filename);
     }

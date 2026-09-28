@@ -902,5 +902,9 @@ enum OpcodesList
     SMSG_SUI_TACTICAL_QUEUE                = 873,      // 0x0369
     CMSG_SUI_COMMANDER_RAID                = 874,
     SMSG_SUI_COMMANDER_RAID                = 875,
-    NUM_MSG_TYPES                          = 876
+    // Threat meter (owner 2026-09-22): the top of one creature's threat list plus the
+    // driven body's own row. 1.12 sends no threat to clients; capability 14.
+    CMSG_SUI_THREAT                        = 876,      // 0x036C
+    SMSG_SUI_THREAT                        = 877,      // 0x036D
+    NUM_MSG_TYPES                          = 878
 };

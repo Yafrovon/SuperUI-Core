@@ -18,6 +18,7 @@
 
 #define _CRT_SECURE_NO_DEPRECATE
 #include <cstdio>
+#include <set>
 #include <iostream>
 #include <vector>
 #include <list>
@@ -235,6 +236,9 @@ bool ExtractSingleWmo(std::string& fname)
     return true;
 }
 
+// World Builder: -m 0,1,800 restricts ADT/WDT parsing (dir_bin spawns) to these map ids.
+std::set<uint32> CONF_map_filter;
+
 bool ParsMapFiles()
 {
     char fn[512];
@@ -242,6 +246,8 @@ bool ParsMapFiles()
     StringSet failedPaths;
     for (unsigned int i = 0; i < map_count; ++i)
     {
+        if (!CONF_map_filter.empty() && CONF_map_filter.find(map_ids[i].id) == CONF_map_filter.end())
+            continue;
         sprintf(id, "%03u", map_ids[i].id);
         sprintf(fn, "World\\Maps\\%s\\%s.wdt", map_ids[i].name, map_ids[i].name);
         WDTFile WDT(fn, map_ids[i].name);
@@ -371,6 +377,25 @@ bool processArgv(int argc, char** argv)
                 result = false;
             }
         }
+        else if (strcmp("-m", argv[i]) == 0)
+        {
+            if ((i + 1) < argc)
+            {
+                std::string list = argv[++i];
+                size_t start = 0;
+                while (start <= list.size())
+                {
+                    size_t end = list.find(',', start);
+                    if (end == std::string::npos)
+                        end = list.size();
+                    if (end > start)
+                        CONF_map_filter.insert(uint32(atoi(list.substr(start, end - start).c_str())));
+                    start = end + 1;
+                }
+            }
+            else
+                result = false;
+        }
         else if (strcmp("-?", argv[1]) == 0)
         {
             result = false;
@@ -392,6 +417,7 @@ bool processArgv(int argc, char** argv)
         printf("   -s : small size (data size optimization), ~500MB less vmap data.\n");
         printf("   -l : (default) large size, ~500MB more vmap data. (might contain more details)\n");
         printf("   -d <path>: Path to the vector data source folder.\n");
+        printf("   -m <ids>: comma separated map ids to parse (default: all maps).\n");
         printf("   -? : This message.\n");
     }
     return result;

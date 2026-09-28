@@ -13,12 +13,22 @@
  * existing AiBot spine.
  */
 
+#include "GridNotifiers.h"
+#include "GridNotifiersImpl.h"
+#include "CellImpl.h"
 #include "AiBotAIMain.h"
+#include <map>
+#include <mutex>
+#include "Config/Config.h"
+#include <fstream>
+#include <set>
+#include "SuiRaidTelemetry.h"
 #include "SuiCommanderRaid.h"
 #include "AiBotCircuit.h"   // [CIRCUIT] probe macros (CIRCUIT_BOARD.md)
 #include "CreatureAI.h"
 #include "Group.h"
 #include "Item.h"
+#include "Bag.h"
 #include "MotionMaster.h"
 #include "PlayerBotMgr.h"
 #include "Spell.h"
@@ -175,11 +185,220 @@ bool AiBotAI::HasFastCombatPolicy() const
     return !m_rotation.empty() || HasUsableSpecCombat();
 }
 
+// [TACTICS] An area spell whose area would reach a creature that is not in the fight wakes it
+// (2026-09-24 telemetry: Frost Nova and Arcane Explosion first-struck an idle Molten Giant,
+// Destroyer and Annihilator standing next to the pack being fought). Areas from the spell data.
+namespace
+{
+    std::set<uint32> gKnownRisers;
+    std::mutex gRisersLock;
+    bool gRisersLoaded = false;
+
+    // Learned risers survive a restart (2026-09-25: the first Core Hound pack after every restart
+    // was fought unbalanced until one of them fell): "entry" lines beside mangosd.conf.
+    std::string RisersPath()
+    {
+        std::string conf = sConfig.GetFilename();
+        size_t slash = conf.find_last_of('/');
+        return (slash == std::string::npos ? std::string() : conf.substr(0, slash + 1)) + "sui-autopilot-risers.txt";
+    }
+
+    void LoadRisers()
+    {
+        if (gRisersLoaded)
+            return;
+        gRisersLoaded = true;
+        std::ifstream in(RisersPath());
+        uint32 entry = 0;
+        while (in >> entry)
+            gKnownRisers.insert(entry);
+    }
+}
+
+void AiBotAI::NoteRiser(uint32 entry)
+{
+    std::lock_guard<std::mutex> guard(gRisersLock);
+    LoadRisers();
+    if (gKnownRisers.insert(entry).second)
+        std::ofstream(RisersPath(), std::ios::app) << entry << '\n';
+}
+
+namespace
+{
+    std::set<uint32> gRebounders;
+    std::map<ObjectGuid, float> gLowestSeen;
+    std::mutex gReboundLock;
+    bool gReboundLoaded = false;
+
+    std::string ReboundPath()
+    {
+        std::string conf = sConfig.GetFilename();
+        size_t slash = conf.find_last_of('/');
+        return (slash == std::string::npos ? std::string() : conf.substr(0, slash + 1)) + "sui-autopilot-rebounders.txt";
+    }
+
+    void LoadRebounders()
+    {
+        if (gReboundLoaded)
+            return;
+        gReboundLoaded = true;
+        std::ifstream in(ReboundPath());
+        uint32 entry = 0;
+        while (in >> entry)
+            gRebounders.insert(entry);
+    }
+}
+
+void AiBotAI::ObserveRebound(Unit const* mob)
+{
+    if (!mob || !mob->IsCreature() || !mob->IsAlive())
+        return;
+    std::lock_guard<std::mutex> guard(gReboundLock);
+    LoadRebounders();
+    if (!mob->IsInCombat())
+    {
+        gLowestSeen.erase(mob->GetObjectGuid());
+        return;
+    }
+    float const hp = mob->GetHealthPercent();
+    auto it = gLowestSeen.find(mob->GetObjectGuid());
+    if (it == gLowestSeen.end())
+    {
+        gLowestSeen[mob->GetObjectGuid()] = hp;
+        return;
+    }
+    if (hp < it->second)
+        it->second = hp;
+    else if (it->second <= 55.0f && hp >= 90.0f && gRebounders.insert(mob->GetEntry()).second)
+    {
+        std::ofstream(ReboundPath(), std::ios::app) << mob->GetEntry() << '\n';
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-REBOUND] %s (entry %u) went from %.0f%% back to %.0f%% - its kind is left for last",
+            mob->GetName(), mob->GetEntry(), it->second, hp);
+    }
+}
+
+bool AiBotAI::IsKnownRebounder(uint32 entry)
+{
+    std::lock_guard<std::mutex> guard(gReboundLock);
+    LoadRebounders();
+    return gRebounders.count(entry) != 0;
+}
+
+bool AiBotAI::IsKnownRiser(uint32 entry)
+{
+    std::lock_guard<std::mutex> guard(gRisersLock);
+    LoadRisers();
+    return gKnownRisers.count(entry) != 0;
+}
+
+// [TACTICS] A pack that gets back up must reach the floor together: an area spell is held while
+// it would put a low one down early (its kin still well above it).
+static bool AreaWouldFloorRiserEarly(Player* me, Unit* target, SpellEntry const* spell)
+{
+    bool area = false;
+    float radius = 0.0f;
+    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        uint32 const a = spell->EffectImplicitTargetA[i], b = spell->EffectImplicitTargetB[i];
+        if (a == TARGET_ENUM_UNITS_ENEMY_AOE_AT_SRC_LOC || b == TARGET_ENUM_UNITS_ENEMY_AOE_AT_SRC_LOC ||
+            a == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DEST_LOC || b == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DEST_LOC ||
+            a == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DYNOBJ_LOC || b == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DYNOBJ_LOC ||
+            a == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24 || b == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24)
+        {
+            area = true;
+            if (SpellRadiusEntry const* r = sSpellRadiusStore.LookupEntry(spell->EffectRadiusIndex[i]))
+                radius = std::max(radius, Spells::GetSpellRadius(r));
+        }
+    }
+    if (!area)
+        return false;
+    std::list<Unit*> near;
+    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 45.0f);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(near, check);
+    Cell::VisitAllObjects(me, searcher, 45.0f);
+    for (Unit* low : near)
+    {
+        if (!low->IsCreature() || !low->IsAlive() || !low->IsInCombat() || !AiBotAI::IsKnownRiser(low->GetEntry()) ||
+            low->GetHealthPercent() > 15.0f || low->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD))
+            continue;
+        WorldObject const* center = target ? static_cast<WorldObject const*>(target) : me;
+        if (radius > 0.0f && !low->IsWithinDist(center, radius + 2.0f, false))
+            continue;
+        for (Unit* kin : near)
+            if (kin != low && kin->IsCreature() && kin->IsAlive() && kin->GetEntry() == low->GetEntry() &&
+                !kin->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) && kin->GetHealthPercent() > 25.0f)
+                return true;
+    }
+    return false;
+}
+
+// [TACTICS] No damage-over-time on a pack whose fallen get back up: a DoT keeps ticking after the
+// damage dealers moved on and floors that one alone, and the pack's clock starts early.
+static bool DotOnRiser(Unit* target, SpellEntry const* spell)
+{
+    if (!target || !target->IsCreature() || target == nullptr || !AiBotAI::IsKnownRiser(target->GetEntry()))
+        return false;
+    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        if (spell->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE ||
+            spell->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_LEECH ||
+            spell->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE_PERCENT)
+            return true;
+    return false;
+}
+
+static bool AreaWouldWakeIdle(Player* me, Unit* target, SpellEntry const* spell)
+{
+    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+    {
+        if (!spell->Effect[i])
+            continue;
+        uint32 const a = spell->EffectImplicitTargetA[i], b = spell->EffectImplicitTargetB[i];
+        bool const atSource = a == TARGET_ENUM_UNITS_ENEMY_AOE_AT_SRC_LOC || b == TARGET_ENUM_UNITS_ENEMY_AOE_AT_SRC_LOC ||
+            a == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24 || b == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24;
+        bool const atDest = a == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DEST_LOC || b == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DEST_LOC ||
+            a == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DYNOBJ_LOC || b == TARGET_ENUM_UNITS_ENEMY_AOE_AT_DYNOBJ_LOC;
+        if (!atSource && !atDest)
+            continue;
+        SpellRadiusEntry const* radiusEntry = sSpellRadiusStore.LookupEntry(spell->EffectRadiusIndex[i]);
+        float const radius = radiusEntry ? Spells::GetSpellRadius(radiusEntry) : 0.0f;
+        if (radius <= 0.0f)
+            continue;
+        WorldObject* center = (atDest && target) ? static_cast<WorldObject*>(target) : static_cast<WorldObject*>(me);
+        std::list<Creature*> near;
+        MaNGOS::AnyUnitInObjectRangeCheck check(center, radius + 3.0f);
+        MaNGOS::CreatureListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(near, check);
+        Cell::VisitGridObjects(center, searcher, radius + 3.0f);
+        for (Creature* c : near)
+            if (c->IsAlive() && !c->IsInCombat() && !c->IsTotem() && !c->IsCivilian() &&
+                c->GetCreatureType() != CREATURE_TYPE_CRITTER && me->IsValidAttackTarget(c))
+                return true;
+    }
+    return false;
+}
+
 bool AiBotAI::TrySpecSpell(Unit* target, SpellEntry const* spell)
 {
-    if (!target || !spell || !CanTryToCastSpell(target, spell))
+    if (!target)
         return false;   // cb:fold rotation rung, outcome probed at cast
-    if (DoCastSpell(target, spell) != SPELL_CAST_OK)
+    if (!spell)
+    {
+        SuiRaidTelemetry::OnCastAttempt(me, 0, -2);
+        return false;   // cb:fold rotation rung, outcome probed at cast
+    }
+    if (!CanTryToCastSpell(target, spell))
+    {
+        SuiRaidTelemetry::OnCastAttempt(me, spell->Id, -1);
+        return false;   // cb:fold rotation rung, outcome probed at cast
+    }
+    if (me->GetGroup() && (AreaWouldWakeIdle(me, target, spell) || AreaWouldFloorRiserEarly(me, target, spell) ||
+        DotOnRiser(target, spell)))
+    {
+        SuiRaidTelemetry::OnCastAttempt(me, spell->Id, -3);
+        return false;   // cb:fold rotation rung, outcome probed at cast
+    }
+    SpellCastResult const result = DoCastSpell(target, spell);
+    SuiRaidTelemetry::OnCastAttempt(me, spell->Id, int32(result == SPELL_CAST_OK ? 0 : result));
+    if (result != SPELL_CAST_OK)
         return false;   // cb:fold rotation rung, outcome probed at cast
     CB_HITV(me->GetGUIDLow(), "cpp-spec: spec ladder winner cast", spell->Id);
     return true;
@@ -218,6 +437,35 @@ bool AiBotAI::TrySpecStackingAura(Unit* target, uint32 firstRankSpellId)
     return true;
 }
 
+// Whether a player holding an enemy is a tank whose aggro a splash must respect.  A bot
+// answers with its active role (the encounter's temporary role while one owns it); a
+// human-driven body counts as a tank when its class can tank.  Pets and creatures never.
+bool AiBotAI::IsSpecAoETankHolder(Unit const* holder) const
+{
+    Player const* player = holder ? holder->ToPlayer() : nullptr;
+    if (!player)
+        return false;   // cb:fold hot per-update detail
+    if (AiBotAI const* ai = dynamic_cast<AiBotAI const*>(const_cast<Player*>(player)->AI()))
+        return ai->GetCombatActiveRole() == ROLE_TANK;   // cb:fold hot per-update detail
+    return IsTankClass(player->GetClass());
+}
+
+// Raid aggro practice (2026-09-22): a damage dealer splashes an enemy only while it stays
+// under kSpecAoEThreatShare of the tank's threat on it; the game moves aggro at 110 % in
+// melee and 130 % at range.  An enemy that is already loose on a non-tank has no tank to
+// protect and dies best to the splash.  The old margin (tank >= mine + my whole health)
+// refused every fresh add and summon, so no AoE ever went out on them.
+bool AiBotAI::IsSpecAoEThreatSafe(Unit* enemy) const
+{
+    static float const kSpecAoEThreatShare = 0.8f;
+    Unit* holder = enemy->GetVictim();
+    if (!holder || holder == me || !enemy->CanHaveThreatList() || !IsSpecAoETankHolder(holder))
+        return true;   // cb:fold hot per-update detail
+    float const mine = enemy->GetThreatManager().getThreat(me);
+    float const held = enemy->GetThreatManager().getThreat(holder);
+    return mine < held * kSpecAoEThreatShare;
+}
+
 bool AiBotAI::CanUseSpecAoE(Unit* center, float radius, uint32 minimumTargets) const
 {
     if (!center)
@@ -225,24 +473,24 @@ bool AiBotAI::CanUseSpecAoE(Unit* center, float radius, uint32 minimumTargets) c
 
     std::list<Unit*> enemies;
     me->GetEnemyListInRadiusAround(center, radius, enemies);
+    bool const tank = GetCombatActiveRole() == ROLE_TANK;
     uint32 valid = 0;
     for (Unit* enemy : enemies)
     {
-        if (!enemy || !me->IsValidAttackTarget(enemy))
+        if (!enemy || !enemy->IsAlive() || !me->IsValidAttackTarget(enemy))
             continue;   // cb:fold hot per-update detail
-        // Never splash an assigned/breakable CC target or an uninvolved pack.
-        if (enemy->HasBreakableByDamageCrowdControlAura() ||
-            !enemy->IsInCombat() || !enemy->GetVictim())
+        // Never splash an assigned/breakable CC target, an uninvolved pack, or a unit the
+        // active encounter keeps this member off.
+        if (enemy->HasBreakableByDamageCrowdControlAura() || !enemy->IsInCombat() ||
+            SuiCommanderRaid::ForbidsSplash(me, enemy))
+            return false;   // cb:fold hot per-update detail
+        // In combat but not swinging at anyone yet (a fresh summon or split choosing its
+        // victim): it neither blocks the splash nor counts toward it.
+        if (!enemy->GetVictim())
+            continue;   // cb:fold hot per-update detail
+        if (!tank && !IsSpecAoEThreatSafe(enemy))
             return false;   // cb:fold hot per-update detail
         ++valid;
-
-        if (GetCombatActiveRole() != ROLE_TANK && enemy->CanHaveThreatList() && enemy->GetVictim() != me)
-        {   // cb:fold hot per-update detail
-            float const mine = enemy->GetThreatManager().getThreat(me);
-            float const tank = enemy->GetThreatManager().getThreat(enemy->GetVictim());
-            if (tank < mine + float(me->GetMaxHealth()))
-                return false;   // cb:fold hot per-update detail
-        }
     }
     return valid >= minimumTargets;
 }
@@ -277,6 +525,21 @@ bool AiBotAI::TrySpecTaunt(Unit* target)
 {
     if (!target || GetCombatActiveRole() != ROLE_TANK || target->GetVictim() == me)
         return false;   // cb:fold rotation rung, outcome probed at cast
+    // [TACTICS] Never taunt a mob off another tank who is holding it (owner 2026-09-23).
+    // A taunt is for a mob on a healer or a caster, or a tank that is going down.
+    if (Unit* holder = target->GetVictim())
+        if (holder != me && holder->IsAlive() && holder->GetHealthPercent() > 25.0f &&
+            IsSpecAoETankHolder(holder))
+        {
+            // ...unless that tank holds a stack (three or more on it) and this is not its own
+            // target: the stack is split (owner 2026-09-23: "unless there's a stack").
+            uint32 onHolder = 0;
+            for (Unit* a : holder->GetAttackers())
+                if (a && a->IsAlive() && a->GetVictim() == holder)
+                    ++onHolder;
+            if (onHolder < 3 || holder->GetVictim() == target)
+                return false;   // cb:fold rotation rung, outcome probed at cast
+        }
     for (SpellEntry const* taunt : m_spellListTaunt)
         if (TrySpecSpell(target, taunt))
             return true;   // cb:fold rotation rung, outcome probed at cast
@@ -288,6 +551,8 @@ bool AiBotAI::CommandSpecPet(Unit* target, bool mendHunterPet)
     Pet* pet = me->GetPet();
     if (!pet || !pet->IsAlive())
         return false;   // cb:fold hot per-update detail
+    if (me->GetGroup() && pet->GetCharmInfo() && pet->GetCharmInfo()->GetReactState() == REACT_AGGRESSIVE)
+        pet->GetCharmInfo()->SetReactState(REACT_DEFENSIVE);
 
     if (mendHunterPet && pet->GetHealthPercent() < 55.0f &&
         me->GetHealthPercent() > 35.0f && TrySpecSpell(pet, SP_MEND_PET))
@@ -302,11 +567,82 @@ bool AiBotAI::CommandSpecPet(Unit* target, bool mendHunterPet)
     return false;
 }
 
+// [TACTICS] A raider drinks: a mana potion when the mana runs low, a healing potion when the
+// health does (2026-09-24: the mages stood at 180-410 mana through a Core Hound fight, every
+// Frostbolt and Blizzard refused). What an item does comes from its spell data.
+bool AiBotAI::TryCombatPotion()
+{
+    uint32 const now = WorldTimer::getMSTime();
+    if (now < m_potionNextMs || !me->IsInCombat() || me->IsNonMeleeSpellCasted(false))
+        return false;
+    m_potionNextMs = now + 1000;
+    bool const needMana = me->GetPowerType() == POWER_MANA && me->GetMaxPower(POWER_MANA) > 0 &&
+        me->GetPowerPercent(POWER_MANA) < 25.0f;
+    bool const needHealth = me->GetHealthPercent() < 30.0f;
+    // A protection potion the quartermaster handed out (a school's damage absorbed) goes back up
+    // once it has been burned through: from 3.4k health one Fire Blossom kills a caster
+    // (2026-09-25, Geddon's room). Health and mana emergencies come first.
+    bool const needShield = !needHealth && !needMana && me->GetHealthPercent() < 85.0f;
+    if (!needMana && !needHealth && !needShield)
+        return false;
+    auto consider = [&](Item* item) -> bool
+    {
+        if (!item)
+            return false;
+        ItemPrototype const* proto = item->GetProto();
+        if (!proto || proto->Class != ITEM_CLASS_CONSUMABLE)
+            return false;
+        for (auto const& s : proto->Spells)
+        {
+            if (!s.SpellId || s.SpellTrigger != ITEM_SPELLTRIGGER_ON_USE)
+                continue;
+            SpellEntry const* spell = sSpellMgr.GetSpellEntry(s.SpellId);
+            if (!spell)
+                continue;
+            bool mana = false, heal = false, shield = false;
+            for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+            {
+                if (spell->Effect[i] == SPELL_EFFECT_ENERGIZE && spell->EffectMiscValue[i] == POWER_MANA)
+                    mana = true;
+                if (spell->Effect[i] == SPELL_EFFECT_HEAL)
+                    heal = true;
+                // a school shield, and only for the school that is hurting me right now
+                if (spell->Effect[i] == SPELL_EFFECT_APPLY_AURA && spell->EffectApplyAuraName[i] == SPELL_AURA_SCHOOL_ABSORB &&
+                    (uint32(spell->EffectMiscValue[i]) & SuiRaidTelemetry::RecentDamageSchools(me)))
+                    shield = true;
+            }
+            if (shield && me->HasAura(spell->Id))
+                continue;   // still up
+            if (!((needMana && mana) || (needHealth && heal) || (needShield && shield)))
+                continue;
+            if (!me->IsSpellReady(*spell, proto))
+                continue;
+            if (me->CastSpell(me, spell, false, item) == SPELL_CAST_OK)
+            {
+                m_potionNextMs = now + 3000;
+                return true;
+            }
+        }
+        return false;
+    };
+    for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+        if (consider(me->GetItemByPos(INVENTORY_SLOT_BAG_0, slot)))
+            return true;
+    for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+        if (Bag* b = dynamic_cast<Bag*>(me->GetItemByPos(INVENTORY_SLOT_BAG_0, bag)))
+            for (uint32 slot = 0; slot < b->GetBagSize(); ++slot)
+                if (consider(b->GetItemByPos(uint8(slot))))
+                    return true;
+    return false;
+}
+
 bool AiBotAI::UpdateSpecCombatAI()
 {
     uint8 const spec = GetCombatSpecTab();
     if (spec > 2)
         return false;   // cb:fold hot per-update detail
+    if (TryCombatPotion())
+        return true;   // cb:fold hot per-update detail
 
     // The 250 ms action lane must honor a CC decision immediately rather than
     // waiting for the one-second doctrine tick.  Stop both white swings and the
@@ -969,11 +1305,17 @@ bool AiBotAI::UpdateSpecCombatWarrior(uint8 spec)
         if (TrySpecTaunt(victim)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecInterrupt(victim, {72})) return true;   // cb:fold rotation rung, outcome probed at cast
 
-        if (me->GetHealthPercent() < 35.0f && TrySpecSpell(me, SP_LAST_STAND)) return true;   // cb:fold rotation rung, outcome probed at cast
+        uint32 onMe = 0;
+        for (Unit* a : me->GetAttackers())
+            if (a && a->IsAlive() && a->GetVictim() == me)
+                ++onMe;
+        bool const swamped = onMe >= 4;
+        if ((swamped || me->GetHealthPercent() < 35.0f) && IsWearingShield(me) && TrySpecSpell(me, 871)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if ((me->GetHealthPercent() < 35.0f || (swamped && me->GetHealthPercent() < 70.0f)) &&
+            TrySpecSpell(me, SP_LAST_STAND)) return true;   // cb:fold rotation rung, outcome probed at cast
 
         if (IsWearingShield(me))
         {   // cb:fold rotation rung, outcome probed at cast
-            if (me->GetHealthPercent() < 22.0f && TrySpecSpell(me, 871)) return true;   // cb:fold rotation rung, outcome probed at cast
             if (victim->CanReachWithMeleeAutoAttack(me) && TrySpecAura(me, SP_SHIELD_BLOCK)) return true;   // cb:fold rotation rung, outcome probed at cast
         }
 
@@ -1020,8 +1362,14 @@ bool AiBotAI::UpdateSpecCombatWarrior(uint8 spec)
         if (TrySpecAura(me, SP_DEFENSIVE_STANCE)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecTaunt(victim)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecInterrupt(victim, {72, SP_CONCUSSION_BLOW, 6552})) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (me->GetHealthPercent() < 22.0f && TrySpecSpell(me, 871)) return true; // Shield Wall   // cb:fold rotation rung, outcome probed at cast
-        if (me->GetHealthPercent() < 35.0f && TrySpecSpell(me, SP_LAST_STAND)) return true;   // cb:fold rotation rung, outcome probed at cast
+        uint32 onMe = 0;
+        for (Unit* a : me->GetAttackers())
+            if (a && a->IsAlive() && a->GetVictim() == me)
+                ++onMe;
+        bool const swamped = onMe >= 4;
+        if ((swamped || me->GetHealthPercent() < 35.0f) && TrySpecSpell(me, 871)) return true; // Shield Wall   // cb:fold rotation rung, outcome probed at cast
+        if ((me->GetHealthPercent() < 35.0f || (swamped && me->GetHealthPercent() < 70.0f)) &&
+            TrySpecSpell(me, SP_LAST_STAND)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->CanReachWithMeleeAutoAttack(me) && TrySpecAura(me, SP_SHIELD_BLOCK)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, SP_REVENGE)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, SP_SHIELD_SLAM)) return true;   // cb:fold rotation rung, outcome probed at cast
@@ -1043,6 +1391,7 @@ bool AiBotAI::UpdateSpecCombatWarrior(uint8 spec)
         if (TrySpecSpell(victim, SP_BLOODTHIRST)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (CanUseSpecAoE(victim, 8.0f, 2) && TrySpecSpell(victim, 1680)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (CanUseSpecAoE(me, 10.0f, 2) && TrySpecSpell(me, SP_PIERCING_HOWL)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (me->GetPower(POWER_RAGE) > 300 && CanUseSpecAoE(victim, 8.0f, 2) && TrySpecSpell(victim, 845)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (me->GetPower(POWER_RAGE) > 300 && TrySpecSpell(victim, 78)) return true;   // cb:fold rotation rung, outcome probed at cast
         return false;
     }
@@ -1056,6 +1405,7 @@ bool AiBotAI::UpdateSpecCombatWarrior(uint8 spec)
     if (CanUseSpecAoE(victim, 8.0f, 2) && TrySpecSpell(victim, 1680)) return true;   // cb:fold rotation rung, outcome probed at cast
     if (TrySpecSpell(victim, 7384)) return true; // Overpower is aura-state gated by DBC   // cb:fold rotation rung, outcome probed at cast
     if (victim->GetHealthPercent() > 35.0f && TrySpecAura(victim, 772)) return true;   // cb:fold rotation rung, outcome probed at cast
+    if (me->GetPower(POWER_RAGE) > 300 && CanUseSpecAoE(victim, 8.0f, 2) && TrySpecSpell(victim, 845)) return true;   // cb:fold rotation rung, outcome probed at cast
     if (me->GetPower(POWER_RAGE) > 300 && TrySpecSpell(victim, 78)) return true;   // cb:fold rotation rung, outcome probed at cast
     return false;
 }
@@ -1067,6 +1417,8 @@ bool AiBotAI::UpdateSpecCombatPaladin(uint8 spec)
     // Every Paladin protects allies before dealing damage.  Holy Shock is
     // explicitly evaluated as a heal before its offensive branch.
     Unit* heal = SelectHealTarget(spec == 0 ? 88.0f : 35.0f, spec == 0 ? 82.0f : 28.0f);
+    if (!(heal && heal->GetHealthPercent() < 40.0f) &&
+        TrySpecValuedDispel(m_spells.paladin.pCleanse, 800.0f)) return true;   // cb:fold rotation rung, outcome probed at cast
     if (heal)
     {   // cb:fold rotation rung, outcome probed at cast
         if (heal->GetHealthPercent() < 35.0f && TrySpecSpell(me, SP_DIVINE_FAVOR)) return true;   // cb:fold rotation rung, outcome probed at cast
@@ -1075,9 +1427,7 @@ bool AiBotAI::UpdateSpecCombatPaladin(uint8 spec)
             if (HealInjuredTarget(heal)) return true;   // cb:fold rotation rung, outcome probed at cast
     }
 
-    if (m_spells.paladin.pCleanse)
-        if (Unit* friendUnit = SelectDispelTarget(m_spells.paladin.pCleanse))   // cb:fold rotation rung, outcome probed at cast
-            if (TrySpecSpell(friendUnit, m_spells.paladin.pCleanse)) return true;   // cb:fold rotation rung, outcome probed at cast
+    if (TrySpecValuedDispel(m_spells.paladin.pCleanse, 1.0f)) return true;   // cb:fold rotation rung, outcome probed at cast
 
     if (!victim)
         return false;   // cb:fold rotation rung, outcome probed at cast
@@ -1114,8 +1464,35 @@ bool AiBotAI::UpdateSpecCombatPaladin(uint8 spec)
     return false;
 }
 
+// [TACTICS] An enraged enemy (a buff whose dispel type is Enrage - a frenzy) is calmed by a
+// hunter's Tranquilizing Shot. From the aura's own spell data; no creature is named.
+bool AiBotAI::TrySpecTranquilize()
+{
+    uint32 const kTranquilizingShot = 19801;
+    if (!me->HasSpell(kTranquilizingShot) || !me->IsSpellReady(kTranquilizingShot) || !me->GetGroup())
+        return false;
+    std::list<Unit*> nearby;
+    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 35.0f);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
+    Cell::VisitAllObjects(me, searcher, 35.0f);
+    for (Unit* mob : nearby)
+    {
+        if (!mob->IsAlive() || !mob->IsInCombat() || !IsValidAssistTarget(mob))
+            continue;
+        for (auto const& entry : mob->GetSpellAuraHolderMap())
+        {
+            SpellEntry const* proto = entry.second ? entry.second->GetSpellProto() : nullptr;
+            if (proto && proto->Dispel == DISPEL_ENRAGE && entry.second->IsPositive())
+                if (TrySpecSpell(mob, kTranquilizingShot))
+                    return true;
+        }
+    }
+    return false;
+}
+
 bool AiBotAI::UpdateSpecCombatHunter(uint8 spec)
 {
+    if (TrySpecTranquilize()) return true;   // cb:fold rotation rung, outcome probed at cast
     Unit* victim = me->GetVictim();
     if (!victim)
     {   // cb:fold rotation rung, outcome probed at cast
@@ -1191,6 +1568,7 @@ bool AiBotAI::UpdateSpecCombatHunter(uint8 spec)
         if (Unit* add = SelectSafeSpecAdd(victim))
             if (!HasAuraFromSpellChain(add, 1978) && TrySpecSpell(add, SP_WYVERN_STING)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.hunter.pAimedShot)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (CanUseSpecAoE(victim, 10.0f, 2) && TrySpecSpell(victim, m_spells.hunter.pMultiShot)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 35.0f && TrySpecAura(victim, 1978)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.hunter.pArcaneShot)) return true;   // cb:fold rotation rung, outcome probed at cast
     }
@@ -1285,12 +1663,12 @@ bool AiBotAI::UpdateSpecCombatPriest(uint8 spec)
 {
     Unit* victim = me->GetVictim();
 
-    if (m_spells.priest.pDispelMagic)
-        if (Unit* friendUnit = SelectDispelTarget(m_spells.priest.pDispelMagic))   // cb:fold rotation rung, outcome probed at cast
-            if (TrySpecSpell(friendUnit, m_spells.priest.pDispelMagic)) return true;   // cb:fold rotation rung, outcome probed at cast
+    if (TrySpecValuedDispel(m_spells.priest.pDispelMagic, 400.0f)) return true;   // cb:fold rotation rung, outcome probed at cast
+    if (TrySpecPurgeEnemy(m_spells.priest.pDispelMagic)) return true;   // cb:fold rotation rung, outcome probed at cast
     if (m_spells.priest.pAbolishDisease)
         if (Unit* friendUnit = SelectDispelTarget(m_spells.priest.pAbolishDisease))   // cb:fold rotation rung, outcome probed at cast
             if (TrySpecSpell(friendUnit, m_spells.priest.pAbolishDisease)) return true;   // cb:fold rotation rung, outcome probed at cast
+    if (TrySpecFearWardTank()) return true;   // cb:fold rotation rung, outcome probed at cast
 
     if (spec != 2) // Discipline / Holy healers
     {   // cb:fold rotation rung, outcome probed at cast
@@ -1314,6 +1692,7 @@ bool AiBotAI::UpdateSpecCombatPriest(uint8 spec)
             if (HealInjuredTarget(heal)) return true;   // cb:fold rotation rung, outcome probed at cast
         }
 
+        if (TrySpecValuedDispel(m_spells.priest.pDispelMagic, 1.0f)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim && TrySpecInterrupt(victim, {SP_SILENCE})) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim && me->GetPowerPercent(POWER_MANA) > 55.0f)
         {   // cb:fold rotation rung, outcome probed at cast
@@ -1430,8 +1809,237 @@ bool AiBotAI::UpdateSpecCombatShaman(uint8 spec)
     return false;
 }
 
+namespace
+{
+    std::mutex gDispelClaimLock;
+    std::map<ObjectGuid, uint32> gDispelClaims;   // member -> a dispel just landed there (until ms)
+}
+
+float AiBotAI::DispelValue(Player const* member, uint32 dispelMask)
+{
+    bool const manaUser = member->GetPowerType() == POWER_MANA;
+    bool healer = false;
+    bool tank = false;
+    if (AiBotAI const* ai = dynamic_cast<AiBotAI const*>(const_cast<Player*>(member)->AI()))
+    {
+        healer = ai->GetCombatActiveRole() == ROLE_HEALER;
+        tank = ai->GetCombatActiveRole() == ROLE_TANK;
+    }
+    else
+    {
+        uint8 const cls = member->GetClass();
+        healer = cls == CLASS_PRIEST || cls == CLASS_DRUID || cls == CLASS_SHAMAN || cls == CLASS_PALADIN;
+        tank = cls == CLASS_WARRIOR;
+    }
+
+    float total = 0.0f;
+    for (auto const& entry : member->GetSpellAuraHolderMap())
+    {
+        SpellAuraHolder const* holder = entry.second;
+        SpellEntry const* proto = holder->GetSpellProto();
+        if (!((1 << proto->Dispel) & dispelMask) || holder->IsPositive())
+            continue;
+        float value = 0.0f;
+        bool known = false;
+        for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        {
+            Aura const* aura = holder->GetAuraByEffectIndex(SpellEffectIndex(i));
+            if (!aura)
+                continue;
+            Modifier const* mod = aura->GetModifier();
+            switch (mod->m_auraname)
+            {
+                case SPELL_AURA_PERIODIC_DAMAGE:
+                case SPELL_AURA_PERIODIC_LEECH:
+                {
+                    // damage still to land: a 10 s single-tick "doom" is worth its whole hit
+                    int32 const period = mod->periodictime > 0 ? mod->periodictime : 1000;
+                    int32 const left = aura->GetAuraDuration();
+                    int32 const next = aura->GetAuraPeriodicTimer();
+                    int32 ticks = left < 0 ? 5 : (left >= next ? 1 + (left - next) / period : 1);
+                    ticks = std::min(ticks, 10);
+                    value += std::max(0.0f, mod->m_amount) * ticks;
+                    known = true;
+                    break;
+                }
+                case SPELL_AURA_MOD_CHARM:
+                case SPELL_AURA_MOD_POSSESS:
+                case SPELL_AURA_MOD_FEAR:
+                case SPELL_AURA_MOD_STUN:
+                case SPELL_AURA_MOD_CONFUSE:
+                    value += 4000.0f;   // a body lost to the fight
+                    known = true;
+                    break;
+                case SPELL_AURA_MOD_SILENCE:
+                case SPELL_AURA_MOD_PACIFY_SILENCE:
+                    value += healer ? 2000.0f : (manaUser ? 500.0f : 0.0f);
+                    known = true;
+                    break;
+                case SPELL_AURA_MOD_POWER_COST_SCHOOL_PCT:
+                case SPELL_AURA_MOD_POWER_COST_SCHOOL:
+                    value += manaUser ? (healer ? 1200.0f : 400.0f) : 0.0f;
+                    known = true;
+                    break;
+                case SPELL_AURA_PERIODIC_MANA_LEECH:
+                case SPELL_AURA_POWER_BURN_MANA:
+                    value += manaUser ? (healer ? 1000.0f : 400.0f) : 0.0f;
+                    known = true;
+                    break;
+                case SPELL_AURA_MOD_ROOT:
+                    value += 300.0f;
+                    known = true;
+                    break;
+                case SPELL_AURA_MOD_DECREASE_SPEED:
+                    value += 150.0f;
+                    known = true;
+                    break;
+                case SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN:
+                    // by how much: Shazzrah's Curse doubles every explosion the raid takes
+                    value += mod->m_amount > 0 ? std::max(400.0f, 15.0f * mod->m_amount) : 0.0f;
+                    known = true;
+                    break;
+                case SPELL_AURA_MOD_HEALING_PCT:
+                    value += mod->m_amount < 0 ? 400.0f : 0.0f;
+                    known = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+        total += known ? value : 50.0f;
+    }
+    return tank ? total * 1.5f : total;
+}
+
+Player* AiBotAI::SelectValuedDispelTarget(SpellEntry const* spell, float minValue) const
+{
+    if (!spell)
+        return nullptr;
+    uint32 mask = 0;
+    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        if (spell->Effect[i] == SPELL_EFFECT_DISPEL)
+            mask |= Spells::GetDispellMask(DispelType(spell->EffectMiscValue[i]));
+    if (!mask)
+        return nullptr;
+
+    Group* group = me->GetGroup();
+    if (!group)
+        return DispelValue(me, mask) >= minValue ? me : nullptr;
+
+    uint32 const now = WorldTimer::getMSTime();
+    Player* best = nullptr;
+    float bestValue = 0.0f;
+    std::lock_guard<std::mutex> guard(gDispelClaimLock);
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != me->GetMap() || m->IsGameMaster())
+            continue;
+        // a member a creature has charmed is hostile for now, and the dispel is what frees it
+        bool const charmed = !m->GetCharmerGuid().IsEmpty() && !m->GetCharmerGuid().IsPlayer();
+        if (!me->IsWithinDistInMap(m, 30.0f) || !(charmed || me->IsValidHelpfulTarget(m)) || !me->IsWithinLOSInMap(m))
+            continue;
+        float value = DispelValue(m, mask);
+        if (value < minValue)
+            continue;
+        auto claim = gDispelClaims.find(m->GetObjectGuid());
+        if (claim != gDispelClaims.end() && claim->second > now)
+            value *= 0.25f;   // another dispeller just worked there
+        if (value > bestValue)
+        {
+            best = m;
+            bestValue = value;
+        }
+    }
+    return best;
+}
+
+bool AiBotAI::TrySpecValuedDispel(SpellEntry const* spell, float minValue)
+{
+    Player* target = SelectValuedDispelTarget(spell, minValue);
+    if (!target || !TrySpecSpell(target, spell))
+        return false;
+    std::lock_guard<std::mutex> guard(gDispelClaimLock);
+    gDispelClaims[target->GetObjectGuid()] = WorldTimer::getMSTime() + 800;
+    return true;
+}
+
+bool AiBotAI::TrySpecPurgeEnemy(SpellEntry const* spell)
+{
+    if (!spell || !me->IsInCombat())
+        return false;
+    uint32 mask = 0;
+    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        if (spell->Effect[i] == SPELL_EFFECT_DISPEL)
+            mask |= Spells::GetDispellMask(DispelType(spell->EffectMiscValue[i]));
+    if (!mask)
+        return false;
+    std::list<Unit*> enemies;
+    me->GetEnemyListInRadiusAround(me, 30.0f, enemies);
+    for (Unit* u : enemies)
+    {
+        if (!u || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat() || !u->GetVictim() ||
+            !me->IsWithinLOSInMap(u))
+            continue;
+        bool worth = false;
+        for (auto const& entry : u->GetSpellAuraHolderMap())
+        {
+            SpellAuraHolder const* h = entry.second;
+            if (!h || !h->IsPositive() || !((1 << h->GetSpellProto()->Dispel) & mask))
+                continue;
+            for (uint8 i = 0; i < MAX_EFFECT_INDEX && !worth; ++i)
+                if (Aura const* a = h->GetAuraByEffectIndex(SpellEffectIndex(i)))
+                {
+                    Modifier const* m = a->GetModifier();
+                    switch (m->m_auraname)
+                    {
+                        case SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN: worth = m->m_amount < 0; break;
+                        case SPELL_AURA_MOD_DAMAGE_PERCENT_DONE:  worth = m->m_amount > 0; break;
+                        case SPELL_AURA_SCHOOL_ABSORB:
+                        case SPELL_AURA_MOD_ATTACKSPEED:
+                        case SPELL_AURA_MOD_MELEE_HASTE:
+                        case SPELL_AURA_REFLECT_SPELLS:
+                        case SPELL_AURA_REFLECT_SPELLS_SCHOOL:     worth = true; break;
+                        default: break;
+                    }
+                }
+            if (worth)
+                break;
+        }
+        if (worth && TrySpecSpell(u, spell))
+            return true;
+    }
+    return false;
+}
+
+// [TACTICS] A priest who has Fear Ward keeps it on a tank that lacks it (a feared tank drops
+// the boss on the healers). Ordinary raid practice; no encounter is named.
+bool AiBotAI::TrySpecFearWardTank()
+{
+    uint32 const kFearWard = 6346;
+    if (!me->HasSpell(kFearWard) || !me->IsSpellReady(kFearWard) || !me->GetGroup())
+        return false;
+    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || !m->IsAlive() || m->HasAura(kFearWard) || !m->IsWithinDistInMap(me, 30.0f))
+            continue;
+        AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
+        if (!ai || ai->GetCombatActiveRole() != ROLE_TANK)
+            continue;
+        if (TrySpecSpell(m, kFearWard))
+            return true;
+    }
+    return false;
+}
+
 bool AiBotAI::UpdateSpecCombatMage(uint8 spec)
 {
+    // [TACTICS] A mage is the raid's decurser, not only its own (a curse on the healers doubles
+    // their mana costs; one on the tank can kill it).
+    if (TrySpecValuedDispel(m_spells.mage.pRemoveLesserCurse, 1.0f)) return true;   // cb:fold rotation rung, outcome probed at cast
+    if (TrySpecPolymorphSpareElite()) return true;   // cb:fold rotation rung, outcome probed at cast
+
     Unit* victim = me->GetVictim();
     if (!victim)
         return false;   // cb:fold rotation rung, outcome probed at cast
@@ -1444,7 +2052,7 @@ bool AiBotAI::UpdateSpecCombatMage(uint8 spec)
         if (TrySpecSpell(add, m_spells.mage.pPolymorph)) return true;   // cb:fold rotation rung, outcome probed at cast
 
     if (me->GetHealthPercent() < 25.0f && TrySpecSpell(me, m_spells.mage.pIceBlock)) return true;   // cb:fold rotation rung, outcome probed at cast
-    if (me->GetPowerPercent(POWER_MANA) < 12.0f &&
+    if (me->GetPowerPercent(POWER_MANA) < 20.0f &&
         GetAttackersInRangeCount(10.0f) == 0 && TrySpecSpell(me, m_spells.mage.pEvocation)) return true;   // cb:fold rotation rung, outcome probed at cast
 
     if (spec == 0) // Arcane
@@ -1458,7 +2066,7 @@ bool AiBotAI::UpdateSpecCombatMage(uint8 spec)
             if (TrySpecSpell(victim, m_spells.mage.pFireball)) return true;   // cb:fold rotation rung, outcome probed at cast
             if (TrySpecSpell(victim, m_spells.mage.pFrostbolt)) return true;   // cb:fold rotation rung, outcome probed at cast
         }
-        if (CanUseSpecAoE(me, 8.0f, 3) && TrySpecSpell(me, m_spells.mage.pArcaneExplosion)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (CanUseSpecAoE(me, 10.0f, 3) && TrySpecSpell(me, m_spells.mage.pArcaneExplosion)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, SP_ARCANE_MISSILES)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.mage.pFrostbolt)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.mage.pFireball)) return true;   // cb:fold rotation rung, outcome probed at cast
@@ -1467,6 +2075,7 @@ bool AiBotAI::UpdateSpecCombatMage(uint8 spec)
     {   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 60.0f && TrySpecSpell(me, SP_COMBUSTION)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (CanUseSpecAoE(me, 10.0f, 3) && TrySpecSpell(me, SP_BLAST_WAVE)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (CanUseSpecAoE(me, 10.0f, 3) && TrySpecSpell(me, m_spells.mage.pArcaneExplosion)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() < 22.0f && TrySpecSpell(victim, m_spells.mage.pFireBlast)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 25.0f && TrySpecSpell(victim, m_spells.mage.pFireball)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.mage.pScorch)) return true;   // cb:fold rotation rung, outcome probed at cast
@@ -1477,7 +2086,11 @@ bool AiBotAI::UpdateSpecCombatMage(uint8 spec)
         if (TrySpecAura(me, SP_ICE_BARRIER)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (GetAttackersInRangeCount(8.0f) > 0 && CanUseSpecAoE(me, 10.0f, 1) &&
             TrySpecSpell(me, m_spells.mage.pFrostNova)) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (CanUseSpecAoE(victim, 10.0f, 3) && TrySpecSpell(victim, m_spells.mage.pBlizzard)) return true;   // cb:fold rotation rung, outcome probed at cast
+        // Mana discipline: the area spells are the expensive ones (a Blizzard is 1400 mana).
+        if (me->GetPowerPercent(POWER_MANA) > 25.0f &&
+            CanUseSpecAoE(me, 10.0f, 3) && TrySpecSpell(me, m_spells.mage.pArcaneExplosion)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (me->GetPowerPercent(POWER_MANA) > 30.0f &&
+            CanUseSpecAoE(victim, 10.0f, 2) && TrySpecSpell(victim, m_spells.mage.pBlizzard)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (me->GetHealthPercent() < 35.0f &&
             !me->IsSpellReady(SP_ICE_BARRIER) && TrySpecSpell(me, SP_COLD_SNAP)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.mage.pFrostbolt)) return true;   // cb:fold rotation rung, outcome probed at cast
@@ -1490,8 +2103,156 @@ bool AiBotAI::UpdateSpecCombatMage(uint8 spec)
     return false;
 }
 
+static bool IsBanishedUnit(Unit const* u)
+{
+    for (auto const& entry : u->GetSpellAuraHolderMap())
+        if (entry.second && entry.second->HasMechanic(MECHANIC_BANISH))
+            return true;
+    return false;
+}
+
+// [TACTICS] More elites on the raid than tanks to hold them: a warlock banishes a spare one
+// (an elite no tank is holding, never a boss). The spell's own creature-type rule decides what
+// can be banished; a banished elite is re-banished when it wakes if the raid is still short.
+bool AiBotAI::TrySpecPolymorphSpareElite()
+{
+    SpellEntry const* poly = m_spells.mage.pPolymorph;
+    Group* group = me->GetGroup();
+    if (!poly || !group || me->IsNonMeleeSpellCasted(false) || !me->IsInCombat())
+        return false;
+    uint32 tanks = 0;
+    std::set<Unit*> castTargets;   // sheep other mages are already casting
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || !m->IsAlive() || m->GetMap() != me->GetMap())
+            continue;
+        if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
+            if (ai->GetCombatActiveRole() == ROLE_TANK)
+                ++tanks;
+        if (Spell* s = m->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+            if (s->m_spellInfo && s->m_spellInfo->SpellIconID == poly->SpellIconID)
+                if (Unit* u = s->m_targets.getUnitTarget())
+                    castTargets.insert(u);
+    }
+    std::list<Unit*> nearby;
+    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 30.0f);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
+    Cell::VisitAllObjects(me, searcher, 30.0f);
+    uint32 active = 0;
+    Unit* spare = nullptr;
+    int spareScore = -1;
+    uint32 spareHitters = 1000;
+    for (Unit* u : nearby)
+    {
+        if (!u->IsCreature() || !u->IsAlive() || !u->IsInCombat() || !static_cast<Creature*>(u)->IsElite())
+            continue;
+        Unit* v = u->GetVictim();
+        Player* vp = v ? v->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+        if (!vp || !group->IsMember(vp->GetObjectGuid()))
+            continue;
+        if (IsBanishedUnit(u) || castTargets.count(u) || u->HasBreakableByDamageCrowdControlAura())
+            continue;   // already controlled
+        ++active;
+        if (static_cast<Creature*>(u)->IsWorldBoss() || u->IsImmuneToMechanic(MECHANIC_POLYMORPH))
+            continue;
+        // a sheep under a damage-over-time (an Immolate, a Rain of Fire it stands in) breaks at the
+        // next tick (2026-09-25: 9 of 14 broken sheep on Majordomo's healers)
+        if (u->HasAuraType(SPELL_AURA_PERIODIC_DAMAGE) || u->HasAuraType(SPELL_AURA_PERIODIC_LEECH))
+            continue;
+        uint32 hitters = 0;   // the raid's own damage on it: sheep the one nobody is killing
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+            if (Player* m = itr->getSource())
+                if (m->IsAlive() && m->GetVictim() == u)
+                    ++hitters;
+        AiBotAI* holderAi = dynamic_cast<AiBotAI*>(vp->AI());
+        bool const onTank = holderAi && holderAi->GetCombatActiveRole() == ROLE_TANK;
+        int const score = onTank ? (vp->GetVictim() == u ? 0 : 1) : 2;
+        if ((score > spareScore || (score == spareScore && hitters < spareHitters)) && CanTryToCastSpell(u, poly))
+        {
+            spareScore = score;
+            spareHitters = hitters;
+            spare = u;
+        }
+    }
+    uint32 const cap = std::max<uint32>(1u, (tanks + 1) / 2);
+    if (!spare || active <= cap || spareScore == 0)
+        return false;
+    if (!TrySpecSpell(spare, poly))
+        return false;
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: polymorph %s (guid %u) - %u elites on the raid, %u tanks",
+        me->GetName(), spare->GetName(), spare->GetGUIDLow(), active, tanks);
+    return true;
+}
+
+bool AiBotAI::TrySpecBanishSpareElite()
+{
+    SpellEntry const* banish = m_spells.warlock.pBanish;
+    Group* group = me->GetGroup();
+    if (!banish || !group || me->IsNonMeleeSpellCasted(false))
+        return false;
+    uint32 tanks = 0;
+    std::set<Unit*> castTargets;   // banishes other warlocks are already casting
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || !m->IsAlive() || m->GetMap() != me->GetMap())
+            continue;
+        if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
+            if (ai->GetCombatActiveRole() == ROLE_TANK)
+                ++tanks;
+        if (Spell* s = m->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+            if (s->m_spellInfo && s->m_spellInfo->SpellIconID == banish->SpellIconID)
+                if (Unit* u = s->m_targets.getUnitTarget())
+                    castTargets.insert(u);
+    }
+    std::list<Unit*> nearby;
+    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 35.0f);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
+    Cell::VisitAllObjects(me, searcher, 35.0f);
+    uint32 active = 0;
+    Unit* spare = nullptr;
+    int spareScore = -1;
+    for (Unit* u : nearby)
+    {
+        if (!u->IsCreature() || !u->IsAlive() || !u->IsInCombat() || !static_cast<Creature*>(u)->IsElite())
+            continue;
+        Unit* v = u->GetVictim();
+        Player* vp = v ? v->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+        if (!vp || !group->IsMember(vp->GetObjectGuid()))
+            continue;
+        if (IsBanishedUnit(u) || castTargets.count(u) || u->HasBreakableByDamageCrowdControlAura())
+            continue;   // already controlled
+        ++active;
+        if (static_cast<Creature*>(u)->IsWorldBoss())
+            continue;
+        AiBotAI* holderAi = dynamic_cast<AiBotAI*>(vp->AI());
+        bool const onTank = holderAi && holderAi->GetCombatActiveRole() == ROLE_TANK;
+        // Prefer one no tank holds (it is killing someone), then any but a tank's own target.
+        int const score = onTank ? (vp->GetVictim() == u ? 0 : 1) : 2;
+        if (score > spareScore && CanTryToCastSpell(u, banish))
+        {
+            spareScore = score;
+            spare = u;
+        }
+    }
+    // Two at a time for four tanks: a pack fought whole spreads the tanks and the heals over every
+    // elite at once (2026-09-25: Firewalker + Flameguard + two Lava Elementals wiped the raid again
+    // and again with five warlocks never banishing - the old rule waited for more elites than tanks).
+    uint32 const cap = std::max<uint32>(1u, (tanks + 1) / 2);
+    if (!spare || active <= cap || spareScore == 0)
+        return false;
+    if (!TrySpecSpell(spare, banish))
+        return false;
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: banish %s (guid %u) - %u elites on the raid, %u tanks",
+        me->GetName(), spare->GetName(), spare->GetGUIDLow(), active, tanks);
+    return true;
+}
+
 bool AiBotAI::UpdateSpecCombatWarlock(uint8 spec)
 {
+    if (TrySpecBanishSpareElite()) return true;   // cb:fold rotation rung, outcome probed at cast
+
     Unit* victim = me->GetVictim();
     if (!victim)
         return false;   // cb:fold rotation rung, outcome probed at cast
@@ -1545,7 +2306,7 @@ bool AiBotAI::UpdateSpecCombatWarlock(uint8 spec)
         bool const immolated = HasAuraFromSpellChain(victim, 348);
         if (!immolated && victim->GetHealthPercent() > 28.0f && TrySpecSpell(victim, m_spells.warlock.pImmolate)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (immolated && victim->GetHealthPercent() < 45.0f && TrySpecSpell(victim, m_spells.warlock.pConflagrate)) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (CanUseSpecAoE(victim, 10.0f, 3) && me->GetHealthPercent() > 70.0f &&
+        if (CanUseSpecAoE(victim, 10.0f, 2) && me->GetHealthPercent() > 70.0f &&
             TrySpecSpell(victim, m_spells.warlock.pRainOfFire)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.warlock.pShadowBolt)) return true;   // cb:fold rotation rung, outcome probed at cast
     }
@@ -1690,7 +2451,7 @@ bool AiBotAI::UpdateSpecCombatDruid(uint8 spec)
         if (TrySpecAura(me, 24858)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 45.0f && TrySpecAura(victim, 5570)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 35.0f && TrySpecAura(victim, 8921)) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (CanUseSpecAoE(victim, 10.0f, 3) && TrySpecSpell(victim, m_spells.druid.pHurricane)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (CanUseSpecAoE(victim, 10.0f, 2) && TrySpecSpell(victim, m_spells.druid.pHurricane)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 35.0f && TrySpecSpell(victim, m_spells.druid.pStarfire)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.druid.pWrath)) return true;   // cb:fold rotation rung, outcome probed at cast
         return false;

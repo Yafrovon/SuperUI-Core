@@ -62,6 +62,8 @@ namespace SuiPortal
     // Localized server-authoritative Command View freeze and five-action FIFO.
     constexpr uint32 CAPABILITY_COMMANDER_RAID_V1 = 1u << 13;
     constexpr uint32 CAPABILITY_TACTICAL_FREEZE_V1 = 1u << 12;
+    // Threat meter v1: CMSG/SMSG_SUI_THREAT. Never sent before this bit is observed.
+    constexpr uint32 CAPABILITY_THREAT_METER_V1 = 1u << 14;
 
     // Append the backwards-compatible capability trailer and, when all six
     // server-authored destinations are available, the fixed-row cast-prewarm

@@ -56,7 +56,9 @@
  * Line endings: LF (C++ repo convention).
  */
 
+#include <algorithm>
 #include "AiBotDoctrine.h"
+#include "SuiAutopilot.h"
 #include "AiBotAIMain.h"
 #include "AiBotCircuit.h" // [CIRCUIT] probe macros (CIRCUIT_BOARD.md)
 #include "Player.h"
@@ -71,6 +73,10 @@
 
 #include <memory>
 #include <list>
+#include <mutex>
+#include <unordered_map>
+#include "ObjectMgr.h"
+#include "SpellMgr.h"
 
 namespace
 {
@@ -152,7 +158,25 @@ private:
             return nullptr;
         }
 
+        // [TACTICS] A tank's first duty is the group's safety, not the anchor's target.
+        if (bot.GetCombatActiveRole() == ROLE_TANK)
+            if (Unit* duty = TankDuty(bot, me))
+            {
+                TraceFocus(me, duty, "tank duty");
+                return duty;
+            }
+        // [TACTICS] Damage dealers kill what makes the fight worse first.
+        if (bot.GetCombatActiveRole() != ROLE_TANK && bot.GetCombatActiveRole() != ROLE_HEALER)
+            if (Unit* first = KillPriority(bot, me))
+            {
+                TraceFocus(me, first, "kill order");
+                return first;
+            }
+
         Player* boss = bot.FindPartyBoss();
+        // [AUTOPILOT] The leader is its own anchor: rungs 3/3b defend the group around it.
+        if (!boss && SuiAutopilot::IsLeader(me))
+            boss = me;
         if (!boss || !boss->IsInWorld())
         {
             CB_HIT(me->GetGUIDLow(), "cpp-doctrine: pparty, boss gone, standing down");
@@ -344,6 +368,352 @@ private:
                 ba ? ba->GetName() : "(none)", ba ? (bot.IsValidAssistTarget(ba) ? 1u : 0u) : 0u);
         }
         return nullptr;
+    }
+
+    // [TACTICS] Tank duty (owner 2026-09-23: "if I'm tanking a mob, another tank shouldn't
+    // steal it from me"). In order:
+    //   1. keep a mob I am holding (its victim is me) - a tank does not drop what it holds;
+    //   2. take a loose mob: one beating on a group member who is NOT a tank (a healer, a
+    //      caster), nearest first, skipping mobs another tank is already turning toward;
+    //   3. nothing loose: no duty - the ordinary ladder assists the anchor's target, and the
+    //      taunt rule (TrySpecTaunt) keeps this tank from ripping a mob off another tank.
+    // A loose mob a tank has just gone for is its own for a few seconds: three tanks used to pick
+    // the same loose elite in the same second and all switch together (2026-09-25).
+    static std::mutex& TankClaimLock() { static std::mutex m; return m; }
+    static std::map<ObjectGuid, std::pair<ObjectGuid, uint32>>& TankClaims()
+    {
+        static std::map<ObjectGuid, std::pair<ObjectGuid, uint32>> claims;
+        return claims;
+    }
+
+    Unit* TankDuty(AiBotAI& bot, Player* me)
+    {
+        Unit* held = me->GetVictim();
+        if (held && !(held->IsAlive() && held->GetVictim() == me && bot.IsValidAssistTarget(held)))
+            held = nullptr;
+        bool const heldElite = held && held->IsCreature() && static_cast<Creature*>(held)->IsElite();
+        if (held && heldElite)
+        {
+            // ...unless a boss is loose on someone who is not a tank and no other tank is going:
+            // the boss outranks a trash elite (2026-09-25, Majordomo among his adds).
+            bool looseBoss = false;
+            if (!static_cast<Creature*>(held)->IsWorldBoss())
+            {
+                std::list<Unit*> around;
+                MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck bossCheck(me, me, 40.0f);
+                MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> bossSearcher(around, bossCheck);
+                Cell::VisitAllObjects(me, bossSearcher, 40.0f);
+                uint32 const nowMs = WorldTimer::getMSTime();
+                for (Unit* u : around)
+                {
+                    if (!u->IsCreature() || !u->IsAlive() || !static_cast<Creature*>(u)->IsWorldBoss())
+                        continue;
+                    Unit* v = u->GetVictim();
+                    Player* vp = v ? v->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+                    if (!vp || bot.IsSpecAoETankHolder(vp))
+                        continue;
+                    std::lock_guard<std::mutex> guard(TankClaimLock());
+                    auto c = TankClaims().find(u->GetObjectGuid());
+                    if (c != TankClaims().end() && c->second.first != me->GetObjectGuid() && nowMs < c->second.second)
+                        continue;
+                    looseBoss = true;
+                }
+            }
+            if (!looseBoss)
+                return held;
+        }
+
+        Group* group = me->GetGroup();
+        if (!group)
+            return nullptr;
+        std::list<Unit*> nearby;
+        MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 60.0f);
+        MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
+        Cell::VisitAllObjects(me, searcher, 60.0f);
+
+        Unit* best = nullptr;
+        float bestDist = 1e9f;
+        for (Unit* mob : nearby)
+        {
+            if (!mob->IsCreature() || !mob->IsAlive())
+                continue;
+            Unit* victim = mob->GetVictim();
+            Player* victimPlayer = victim ? victim->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+            if (!victimPlayer || victimPlayer == me || !group->IsMember(victimPlayer->GetObjectGuid()))
+                continue;
+            if (victim == victimPlayer && bot.IsSpecAoETankHolder(victimPlayer))
+            {
+                // On a tank already: not loose - unless that tank is taking several at once
+                // and this one is not its own target (2026-09-24: two Molten Giants on one
+                // tank killed it in under a second while the spare tanks stood by).
+                uint32 onHim = 0;
+                for (Unit* a : victimPlayer->GetAttackers())
+                    if (a && a->IsCreature() && a->GetVictim() == victimPlayer)
+                        ++onHim;
+                if (onHim < 2 || victimPlayer->GetVictim() == mob)
+                    continue;
+            }
+            if (!bot.IsValidAssistTarget(mob))
+                continue;
+            bool claimed = false;
+            for (GroupReference* itr = group->GetFirstMember(); itr && !claimed; itr = itr->next())
+            {
+                Player* other = itr->getSource();
+                // Claimed means held: a tank hitting a mob that is beating on a warlock has not
+                // got it (2026-09-25: a Flameguard killed three warlocks while one tank swung at it
+                // and the other tanks counted it as taken).
+                if (other && other != me && other->IsAlive() && other->GetVictim() == mob &&
+                    mob->GetVictim() == other && bot.IsSpecAoETankHolder(other))
+                    claimed = true;
+            }
+            if (claimed)
+                continue;
+            {
+                std::lock_guard<std::mutex> guard(TankClaimLock());
+                auto c = TankClaims().find(mob->GetObjectGuid());
+                if (c != TankClaims().end() && c->second.first != me->GetObjectGuid() &&
+                    WorldTimer::getMSTime() < c->second.second)
+                    if (Player* other = me->GetMap()->GetPlayer(c->second.first))
+                        if (other->IsAlive())
+                            continue;   // another tank is on its way to it
+            }
+            // A boss loose on the raid first, then elites (an elite loose on the raid kills; an imp
+            // does not), then nearest (2026-09-25: Majordomo walked through the healers while all
+            // four tanks held his adds).
+            bool const elite = static_cast<Creature*>(mob)->IsElite();
+            bool const boss = static_cast<Creature*>(mob)->IsWorldBoss();
+            float const d = me->GetDistance(mob) - (elite ? 1000.0f : 0.0f) - (boss ? 2000.0f : 0.0f);
+            if (d < bestDist)
+            {
+                bestDist = d;
+                best = mob;
+            }
+        }
+        if (held && !(best && best->IsCreature() && static_cast<Creature*>(best)->IsElite()))
+            return held;   // keep what I hold unless a loose elite needs me
+        if (best)
+        {
+            std::lock_guard<std::mutex> guard(TankClaimLock());
+            TankClaims()[best->GetObjectGuid()] = std::make_pair(me->GetObjectGuid(), WorldTimer::getMSTime() + 4000);
+        }
+        return best;
+    }
+
+    // [TACTICS] Raiding kill order, derived per creature entry from its own spell list:
+    // 0 summoner (it adds to the fight), 1 healer (it undoes the damage), 2 caster (its
+    // damage ignores the tank), 3 everything else. Cached; a script-driven creature whose
+    // spells live only in its C++ AI ranks 3 and is simply assisted as before.
+    static uint8 KillRank(Creature const* c)
+    {
+        static std::mutex lock;
+        static std::unordered_map<uint32, uint8> cache;
+        std::lock_guard<std::mutex> guard(lock);
+        auto found = cache.find(c->GetEntry());
+        if (found != cache.end())
+            return found->second;
+        uint8 rank = 3;
+        CreatureInfo const* info = c->GetCreatureInfo();
+        std::vector<uint32> spells;
+        if (info)
+        {
+            if (info->spell_list_id)
+                if (CreatureSpellsList const* list = sObjectMgr.GetCreatureSpellsList(info->spell_list_id))
+                    for (CreatureSpellsEntry const& e : *list)
+                        spells.push_back(e.spellId);
+            for (uint32 id : info->spells)
+                if (id)
+                    spells.push_back(id);
+            if (info->unit_class == CLASS_MAGE)
+                rank = 2;
+        }
+        // An aura that fires a spell every few seconds (a Firewalker's Fire Blossom) is that spell:
+        // follow the trigger so the one throwing bolts at the casters counts as a caster.
+        for (size_t k = 0; k < spells.size() && k < 64; ++k)
+            if (SpellEntry const* spell = sSpellMgr.GetSpellEntry(spells[k]))
+                for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                    if (spell->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_TRIGGER_SPELL && spell->EffectTriggerSpell[i])
+                        spells.push_back(spell->EffectTriggerSpell[i]);
+        for (uint32 id : spells)
+        {
+            SpellEntry const* spell = sSpellMgr.GetSpellEntry(id);
+            if (!spell)
+                continue;
+            for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+            {
+                uint32 const effect = spell->Effect[i];
+                if (effect == SPELL_EFFECT_SUMMON || effect == SPELL_EFFECT_SUMMON_WILD ||
+                    effect == SPELL_EFFECT_SUMMON_GUARDIAN)
+                    rank = 0;
+                else if ((effect == SPELL_EFFECT_HEAL || effect == SPELL_EFFECT_HEAL_MAX_HEALTH) &&
+                    rank > 1)
+                    rank = 1;
+                else if (effect == SPELL_EFFECT_SCHOOL_DAMAGE && rank > 2 &&
+                    spell->rangeIndex > 1)
+                    rank = 2;
+            }
+        }
+        cache.emplace(c->GetEntry(), rank);
+        return rank;
+    }
+
+    Unit* KillPriority(AiBotAI& bot, Player* me)
+    {
+        Group* group = me->GetGroup();
+        if (!group)
+            return nullptr;
+        std::list<Unit*> nearby;
+        MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 45.0f);   // ranged stand 35-40 yd out
+        MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
+        Cell::VisitAllObjects(me, searcher, 45.0f);
+
+        Unit* anchorVictim = nullptr;
+        if (Player* anchor = bot.FindEscortBoss())
+            anchorVictim = anchor->GetVictim();
+        uint8 anchorRank = 7;   // (ranks are doubled: awake 2r, sheeped 2r+1)
+        if (anchorVictim && anchorVictim->IsCreature())
+            anchorRank = uint8(KillRank(static_cast<Creature*>(anchorVictim)) * 2 +
+                (anchorVictim->HasBreakableByDamageCrowdControlAura() ? 1 : 0));
+        // A kind that heals itself whole is below everything else (the anchor's own target too).
+        for (Unit* mob : nearby)
+            AiBotAI::ObserveRebound(mob);
+        if (anchorVictim && AiBotAI::IsKnownRebounder(anchorVictim->GetEntry()))
+            anchorRank = 8;
+
+        // A pack whose fallen get back up (one lies "dead" while its kin fight on - Core Hounds
+        // rise again unless the whole pack is down) dies together: damage goes to the healthiest
+        // standing member of that kind, so they all reach the floor at once.
+        // Learned once seen, so the next pack of that kind is balanced from the first hit.
+        static std::set<uint32> knownRisers;
+        static std::mutex risersLock;
+        std::set<uint32> risers;
+        {
+            std::lock_guard<std::mutex> guard(risersLock);
+            for (Unit* mob : nearby)
+                if (mob->IsCreature() && mob->IsAlive() && mob->IsInCombat() &&
+                    (mob->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) || mob->GetStandState() == UNIT_STAND_STATE_DEAD))
+                {
+                    knownRisers.insert(mob->GetEntry());
+                    AiBotAI::NoteRiser(mob->GetEntry());
+                    static std::map<ObjectGuid, uint32> logged;
+                    uint32 const nowMs = WorldTimer::getMSTime();
+                    if (nowMs - logged[mob->GetObjectGuid()] > 12000)
+                    {
+                        logged[mob->GetObjectGuid()] = nowMs;
+                        std::string kin;
+                        for (Unit* k : nearby)
+                            if (k != mob && k->IsCreature() && k->IsAlive() && k->GetEntry() == mob->GetEntry() && k->IsInCombat())
+                                kin += std::to_string(int(k->GetHealthPercent())) + (k->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) ? "(down) " : " ");
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-RISER] %s (guid %u) is down; its kin at %s",
+                            mob->GetName(), mob->GetGUIDLow(), kin.c_str());
+                    }
+                }
+            for (Unit* mob : nearby)
+                if (mob->IsCreature() && mob->IsInCombat() &&
+                    (knownRisers.count(mob->GetEntry()) || AiBotAI::IsKnownRiser(mob->GetEntry())))
+                    risers.insert(mob->GetEntry());
+        }
+        if (!risers.empty())
+        {
+            // Two phases: bring every standing one down evenly to a quarter (the healthiest
+            // first, keeping the current target unless it is 10 points ahead), then finish them
+            // lowest first in one burst, inside the time the fallen lie on the floor.
+            Unit* healthiest = nullptr;
+            Unit* lowest = nullptr;
+            bool allLow = true;
+            std::vector<Unit*> standing;
+            // The pack's revival looks 100 yd around each fallen one, so the balance does too: a
+            // kin tanked further out than my own scan still has to come down with the rest.
+            std::list<Unit*> riserPool(nearby.begin(), nearby.end());
+            {
+                std::set<ObjectGuid> seen;
+                for (Unit* mob : nearby)
+                    seen.insert(mob->GetObjectGuid());
+                for (uint32 entry : risers)
+                {
+                    std::list<Creature*> kin;
+                    me->GetCreatureListWithEntryInGrid(kin, entry, 100.0f);
+                    for (Creature* k : kin)
+                        if (seen.insert(k->GetObjectGuid()).second)
+                            riserPool.push_back(k);
+                }
+            }
+            for (Unit* mob : riserPool)
+            {
+                if (!mob->IsCreature() || !mob->IsAlive() || !mob->IsInCombat() || !risers.count(mob->GetEntry()) ||
+                    !bot.IsValidAssistTarget(mob))
+                    continue;
+                standing.push_back(mob);
+                float const hp = mob->GetHealthPercent();
+                if (hp > 8.0f)
+                    allLow = false;
+                if (!healthiest || hp > healthiest->GetHealthPercent())
+                    healthiest = mob;
+                if (!lowest || hp < lowest->GetHealthPercent())
+                    lowest = mob;
+            }
+            if (healthiest)
+            {
+                if (allLow)
+                {
+                    // one burst, spread: each bot keeps to its own share of the standing kin
+                    std::sort(standing.begin(), standing.end(), [](Unit* a, Unit* b)
+                        { return a->GetGUIDLow() < b->GetGUIDLow(); });
+                    Unit* share = standing[me->GetGUIDLow() % standing.size()];
+                    return share ? share : lowest;
+                }
+                // Each bot keeps its own share of the pack (by guid) and only helps the healthiest
+                // when its own has fallen well behind: "the healthiest" alone had every damage
+                // dealer switching targets every second (2026-09-25: 20-36 switches each in 40 s,
+                // melee running between tanks, raid damage under 2k/s).
+                std::sort(standing.begin(), standing.end(), [](Unit* x, Unit* y)
+                    { return x->GetGUIDLow() < y->GetGUIDLow(); });
+                Unit* share = standing[me->GetGUIDLow() % standing.size()];
+                Unit* current = me->GetVictim();
+                if (current && current->IsAlive() && risers.count(current->GetEntry()) &&
+                    std::find(standing.begin(), standing.end(), current) != standing.end() &&
+                    current->GetHealthPercent() > 8.0f &&
+                    current->GetHealthPercent() + 15.0f >= healthiest->GetHealthPercent())
+                    return current;
+                if (share && share->GetHealthPercent() > 8.0f &&
+                    share->GetHealthPercent() + 15.0f >= healthiest->GetHealthPercent())
+                    return share;
+                return healthiest;
+            }
+        }
+
+        Unit* best = nullptr;
+        uint8 bestRank = anchorRank;
+        float bestHealth = 101.0f;
+        for (Unit* mob : nearby)
+        {
+            if (!mob->IsCreature() || !mob->IsAlive() || !mob->IsInCombat())
+                continue;
+            Unit* victim = mob->GetVictim();
+            Player* victimPlayer = victim ? victim->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+            if (!victimPlayer || !group->IsMember(victimPlayer->GetObjectGuid()))
+                continue;
+            if (!bot.IsValidAssistTarget(mob) || AiBotAI::IsKnownRebounder(mob->GetEntry()))
+                continue;
+            // an awake one of a rank before a sheeped one of the same rank; a sheep before a worse rank
+            uint8 rank = uint8(KillRank(static_cast<Creature*>(mob)) * 2 +
+                (mob->HasBreakableByDamageCrowdControlAura() ? 1 : 0));
+            // Peel: a small add chewing on a healer or a caster dies before anything else
+            // (2026-09-25: Onyxia's whelps killed 18 while the damage stayed on her).
+            // Ranged damage dealers peel only what chews on themselves: a stream of small adds
+            // otherwise keeps every caster off the boss for good (2026-09-25: Onyxia's second
+            // phase took six minutes, her whelps drawing all the ranged damage the whole time).
+            if (!static_cast<Creature*>(mob)->IsElite() && victimPlayer &&
+                (bot.GetCombatActiveRole() != ROLE_RANGE_DPS || victimPlayer == me))
+                if (AiBotAI* vai = dynamic_cast<AiBotAI*>(victimPlayer->AI()))
+                    if (vai->GetCombatActiveRole() != ROLE_TANK)
+                        rank = 0;
+            if (rank > bestRank || (rank == bestRank && (best == nullptr ? rank >= anchorRank : mob->GetHealthPercent() >= bestHealth)))
+                continue;
+            best = mob;
+            bestRank = rank;
+            bestHealth = mob->GetHealthPercent();
+        }
+        return best;
     }
 
     // Log only when the resolved focus CHANGES (never per-tick) — the TeamAuto tracer pattern.

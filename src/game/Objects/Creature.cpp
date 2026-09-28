@@ -973,7 +973,13 @@ void Creature::Update(uint32 update_diff, uint32 diff)
                 {
                     // Reset after 24 secs
                     if (leash || (m_targetNotReachableTimer > 24000))
+                    {
+                        if (IsWorldBoss() || (IsElite() && GetMap()->IsDungeon()))
+                            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[EVADE] %s: %s (victim %s, %.1f yd)", GetName(),
+                                leash ? "leash" : "target unreachable 24 s",
+                                GetVictim() ? GetVictim()->GetName() : "-", GetVictim() ? GetDistance(GetVictim()) : -1.0f);
                         AI()->EnterEvadeMode();
+                    }
                     else if (!IsEvadeBecauseTargetNotReachable())
                         AI()->UpdateAI(diff);   // AI not react good at real update delays (while freeze in non-active part of map)
                 }

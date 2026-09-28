@@ -1,4 +1,6 @@
 #include "SuiCommanderRaid.h"
+#include "SuperUiContent/SuiWorld/CRPG/SuiRaidTelemetry.h"
+#include "SuperUiContent/SuiWorld/CRPG/SuiAutopilot.h"
 /*
  * Copyright (C) 2005-2011 MaNGOS <http://getmangos.com/>
  * Copyright (C) 2009-2011 MaNGOSZero <https://github.com/mangos/zero>
@@ -241,7 +243,8 @@ void Unit::Update(uint32 update_diff, uint32 p_time)
     if (IsSuiTacticallyFrozen())
         return;
 
-    if (IsCreature() && SuiCommanderRaid::Watches(GetEntry()))
+    if (IsCreature() && (SuiCommanderRaid::Watches(GetEntry()) ||
+        SuiCommanderRaid::WatchesSummonerOf(static_cast<Creature*>(this))))
         SuiCommanderRaid::ObserveUnit(this, update_diff);
 
     // Buffer spell system update time to save on performance when players are updated twice per
@@ -688,6 +691,7 @@ uint32 Unit::DealDamage(Unit* pVictim, uint32 damage, CleanDamage const* cleanDa
     // and retried after thaw; arbitrary proc objects are intentionally not kept.
     if (!pVictim || IsSuiTacticallyFrozen() || pVictim->IsSuiTacticallyFrozen())
         return 0;
+    SuiRaidTelemetry::OnDamage(this, pVictim, damage, spellProto);
 
     // World of Warcraft Client Patch 1.7.0 (2005-09-13)
     // - Fixed bug where self-inflicted damage, like Poisonous Blood, wouldn't
@@ -1005,6 +1009,8 @@ uint32 Unit::DealDamage(Unit* pVictim, uint32 damage, CleanDamage const* cleanDa
 
 void Unit::Kill(Unit* pVictim, SpellEntry const* spellProto, bool durabilityLoss)
 {
+    SuiRaidTelemetry::OnKill(this, pVictim);
+    SuiAutopilot::NoteKill(this, pVictim);
     SuiRts::OnUnitKill(this, pVictim);
 
     // find player: owner of controlled `this` or `this` itself maybe
@@ -7862,6 +7868,15 @@ bool Unit::SelectHostileTarget()
     }
 
     // enter in evade mode in other case
+    if (((Creature*)this)->IsWorldBoss() || (((Creature*)this)->IsElite() && GetMap()->IsDungeon()))
+    {
+        Unit* v = GetVictim();
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
+            "[EVADE] %s: no hostile target - threat list %u, attackers %u, victim %s (%.1f yd), movegen %u",
+            GetName(), uint32(m_threatManager.getThreatList().size()), uint32(m_attackers.size()),
+            v ? v->GetName() : "-", v ? GetDistance(v) : -1.0f,
+            uint32(GetMotionMaster()->GetCurrentMovementGeneratorType()));
+    }
     OnLeaveCombat();
 
     if (m_isCreatureLinkingTrigger)
