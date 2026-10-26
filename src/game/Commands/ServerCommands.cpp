@@ -1424,10 +1424,26 @@ bool ChatHandler::HandleReloadSpellTargetPositionCommand(char* /*args*/)
     return true;
 }
 
+// SuperUI (MSUIClient SPELL_CREATOR_PLAN.md D5): the Spell Creator's new index rows, live. Send it
+// BEFORE .reload spell_template, so no spell names a row the stores do not hold yet.
+bool ChatHandler::HandleReloadSpellIndexCommand(char* /*args*/)
+{
+    // The same folder World::SetInitialWorldSettings loads the stores from: DataDir/<build>/.
+    std::string const report = ReloadSpellIndexStores(sWorld.GetDataPath() + std::to_string(SUPPORTED_CLIENT_BUILD) + "/");
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "%s", report.c_str());
+    SendSysMessage(report.c_str());
+    return true;
+}
+
 bool ChatHandler::HandleReloadSpellTemplateCommand(char* /*args*/)
 {
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "Re-Loading Spell Definitions...");
     sSpellMgr.LoadSpells();
+    // SuperUI (MSUIClient SPELL_CREATOR_PLAN.md P0.7): the derived per-spell data World.cpp builds
+    // once at startup - Internal flags and AllowedTargetMask - must be rebuilt too, or a spell
+    // added since the server started has AllowedTargetMask 0 and the passive anticheat rejects
+    // every targeted cast of it ("unexpected target mask (64) when none were expected").
+    sSpellMgr.AssignInternalSpellFlags();
     SendSysMessage("DB table `spell_template` reloaded.");
     sSpellModMgr.LoadSpellMods();
     SendSysMessage("DB table `spell_mod` reloaded.");

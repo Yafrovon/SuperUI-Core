@@ -1548,7 +1548,11 @@ void Spell::EffectTriggerMissileSpell(SpellEffectIndex effect_idx)
     if (m_CastItem)
         DEBUG_FILTER_LOG(LOG_FILTER_SPELL_CAST, "WORLD: cast Item spellId - %i", spellInfo->Id);
 
-    m_caster->CastSpell(m_targets.m_destX, m_targets.m_destY, m_targets.m_destZ, spellInfo, true, m_CastItem, nullptr, m_originalCasterGUID);
+    SpellCastResult result = m_caster->CastSpell(m_targets.m_destX, m_targets.m_destY, m_targets.m_destZ, spellInfo, true, m_CastItem, nullptr, m_originalCasterGUID);
+    // SuperUI (MSUIClient SPELL_CREATOR_PLAN.md P4.1): a workshop child spell is cast here when its
+    // parent lands; the result says whether it really went off.
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[SUI-SPELL] trigger-missile spell=%u -> %u at (%.1f,%.1f,%.1f) result=%u",
+        m_spellInfo->Id, triggeredSpellId, m_targets.m_destX, m_targets.m_destY, m_targets.m_destZ, uint32(result));
 }
 
 void Spell::EffectTeleportUnits(SpellEffectIndex effIdx)
@@ -4940,6 +4944,16 @@ void Spell::EffectSummonTotem(SpellEffectIndex effIdx)
     float angle = slot < MAX_TOTEM_SLOT ? M_PI_F / MAX_TOTEM_SLOT - (slot * 2 * M_PI_F / MAX_TOTEM_SLOT) : 0;
 
     CreatureCreatePos pos(m_casterUnit, m_casterUnit->GetOrientation(), 2.0f, angle);
+
+    // SuperUI (MSUIClient SPELL_CREATOR_PLAN.md P4.2): a deferred-destination spell plants its totem -
+    // a workshop ACTOR, e.g. a lingering orb that zaps - where its missile LANDED, not at the caster's feet.
+    // Gated by SPELL_CUSTOM_DEFERRED_DEST, so every stock totem keeps its stock placement.
+    if (m_spellInfo->HasAttribute(SPELL_CUSTOM_DEFERRED_DEST) && (m_targets.m_targetMask & TARGET_FLAG_DEST_LOCATION))
+    {
+        pos = CreatureCreatePos(m_casterUnit->GetMap(), m_targets.m_destX, m_targets.m_destY, m_targets.m_destZ, m_casterUnit->GetOrientation());
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[SUI-SPELL] totem-at-dest spell=%u creature=%u at (%.1f,%.1f,%.1f)",
+            m_spellInfo->Id, uint32(m_spellInfo->EffectMiscValue[effIdx]), m_targets.m_destX, m_targets.m_destY, m_targets.m_destZ);
+    }
 
     CreatureInfo const* cinfo = sObjectMgr.GetCreatureTemplate(m_spellInfo->EffectMiscValue[effIdx]);
     if (!cinfo)

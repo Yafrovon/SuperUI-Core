@@ -3728,6 +3728,22 @@ void Spell::cast(bool skipCheck)
             m_casterUnit->ProcDamageAndSpell(ProcSystemArguments(nullptr, m_procAttacker, PROC_FLAG_NONE, PROC_EX_NORMAL_HIT, 1, 1, m_attackType, m_spellInfo, this));
     }
 
+    // SuperUI deferred destination (SPELL_CUSTOM_DEFERRED_DEST): the cast-time targets served
+    // validation and the cast-end procs above; the real ones are filled when the missile lands.
+    if (m_delayed && ShouldDeferDestination())
+    {
+        float dist = m_caster->GetDistance(m_targets.m_destX, m_targets.m_destY, m_targets.m_destZ, SizeFactor::None);
+        if (dist < 5.0f)
+            dist = 5.0f;                                        // the same floor unit delays use (AddUnitTarget)
+        m_deferredDestDelay = (uint64)floor(dist / m_spellInfo->speed * 1000.0f);
+        m_UniqueTargetInfo.clear();
+        m_UniqueGOTargetInfo.clear();
+        m_delayMoment = m_deferredDestDelay;
+        m_deferredDest = true;
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[SUI-SPELL] deferred-dest launch spell=%u caster=%s dist=%.2f speed=%.2f arrivalMs=%llu",
+            m_spellInfo->Id, m_caster->GetName(), dist, m_spellInfo->speed, (unsigned long long)m_deferredDestDelay);
+    }
+
     // Okay, everything is prepared. Now we need to distinguish between immediate and evented delayed spells
     if (m_delayed)
     {
@@ -3861,9 +3877,50 @@ void Spell::handle_immediate()
         finish(true);                                       // successfully finish spell cast (not last in case autorepeat or channel spell)
 }
 
+bool Spell::ShouldDeferDestination() const
+{
+    return m_spellInfo->HasAttribute(SPELL_CUSTOM_DEFERRED_DEST) &&
+           m_spellInfo->speed > 0.0f &&
+           (m_targets.m_targetMask & TARGET_FLAG_DEST_LOCATION) &&
+           !m_spellInfo->IsChanneledSpell();
+}
+
+void Spell::ArriveAtDeferredDestination(uint64 t_offset)
+{
+    m_deferredDest = false;
+    m_UniqueTargetInfo.clear();
+    m_UniqueGOTargetInfo.clear();
+    FillTargetMap();
+    for (auto& ihit : m_UniqueTargetInfo)
+    {
+        ihit.timeDelay = t_offset;                              // everything at the point lands NOW
+        HandleDelayedSpellLaunch(&ihit);
+    }
+    for (auto& ighit : m_UniqueGOTargetInfo)
+        ighit.timeDelay = t_offset;
+    for (auto const& ihit : m_UniqueTargetInfo)
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[SUI-SPELL] deferred-dest target spell=%u guid=%s caster=%u effectMask=0x%X",
+            m_spellInfo->Id, ihit.targetGUID.GetString().c_str(), ihit.targetGUID == m_caster->GetObjectGuid() ? 1u : 0u, ihit.effectMask);
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[SUI-SPELL] deferred-dest arrival spell=%u caster=%s atMs=%llu plannedMs=%llu units=%u gos=%u dest=(%.1f,%.1f,%.1f)",
+        m_spellInfo->Id, m_caster->GetName(), (unsigned long long)t_offset, (unsigned long long)m_deferredDestDelay,
+        (uint32)m_UniqueTargetInfo.size(), (uint32)m_UniqueGOTargetInfo.size(),
+        m_targets.m_destX, m_targets.m_destY, m_targets.m_destZ);
+}
+
 uint64 Spell::handle_delayed(uint64 t_offset)
 {
     uint64 next_time = 0;
+
+    // SuperUI deferred destination: nothing happens until the missile reaches the point; then the
+    // area is filled and the ground phase below (persistent areas, send-event) runs at arrival.
+    if (m_deferredDest)
+    {
+        if (t_offset < m_deferredDestDelay)
+            return m_deferredDestDelay;
+        ArriveAtDeferredDestination(t_offset);
+        if (m_spellState == SPELL_STATE_FINISHED)
+            return 0;
+    }
 
     if (!m_immediateHandled)
     {

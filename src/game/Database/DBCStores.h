@@ -107,6 +107,9 @@ extern DBCStorage <WMOAreaTableEntry>            sWMOAreaTableStore;
 extern DBCStorage <WorldSafeLocsEntry>           sWorldSafeLocsStore;
 
 void LoadDBCStores(std::string const& dataPath);
+// SuperUI (SPELL_CREATOR_PLAN.md D5): merge new SpellCastTimes / SpellDuration / SpellRadius /
+// SpellRange rows from the dbc dir into the running stores; returns a one-line report.
+std::string ReloadSpellIndexStores(std::string const& dataPath);
 
 char const* GetUnitRaceName(uint8 race, uint8 locale);
 char const* GetUnitClassName(uint8 class_, uint8 locale);

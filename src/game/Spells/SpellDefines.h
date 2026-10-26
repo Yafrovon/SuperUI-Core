@@ -975,6 +975,10 @@ enum SpellAttributesCustom
     SPELL_CUSTOM_SEND_CHANNEL_VISUAL        = 0x800,     // Will periodically send the channeling spell visual kit
     SPELL_CUSTOM_SEPARATE_AURA_PER_CASTER   = 0x1000,    // Each caster has his own aura slot, instead of replacing others
     SPELL_CUSTOM_TRIGGER_WEAPON_PROCS       = 0x2000,    // Can trigger weapon enchants and on hit effects
+    SPELL_CUSTOM_DEFERRED_DEST              = 0x4000,    // SuperUI (MSUIClient SPELL_CREATOR_PLAN.md D3): a dest-targeted
+                                                         // spell with speed applies its destination effects and fills its
+                                                         // area-at-dest targets when the missile ARRIVES (dist/speed),
+                                                         // not at cast time
 };
 
 // Custom flags assigned by the core based on spell template data

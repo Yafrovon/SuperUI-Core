@@ -870,6 +870,7 @@ class ChatHandler
         bool HandleReloadSpellScriptsCommand(char* args);
         bool HandleReloadSpellTargetPositionCommand(char* args);
         bool HandleReloadSpellTemplateCommand(char* args);
+        bool HandleReloadSpellIndexCommand(char* args);
         bool HandleReloadSpellThreatsCommand(char* args);
         bool HandleReloadSpellPetAurasCommand(char* args);
         bool HandleReloadItemTemplate(char* args);

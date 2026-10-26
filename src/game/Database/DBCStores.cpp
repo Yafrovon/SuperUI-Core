@@ -28,6 +28,7 @@
 
 #include <map>
 #include <vector>
+#include <sstream>
 #include <regex>
 
 struct WMOAreaTableTripple
@@ -625,4 +626,17 @@ uint8 ValidateName(std::wstring const& name)
             return CHAR_NAME_RESERVED;       
 
     return CHAR_NAME_SUCCESS;
+}
+
+std::string ReloadSpellIndexStores(std::string const& dataPath)
+{
+    std::string const dbcPath = dataPath + "dbc/";
+    uint32 const castTimes = sSpellCastTimesStore.MergeNewRowsFrom((dbcPath + "SpellCastTimes.dbc").c_str());
+    uint32 const durations = sSpellDurationStore.MergeNewRowsFrom((dbcPath + "SpellDuration.dbc").c_str());
+    uint32 const radii = sSpellRadiusStore.MergeNewRowsFrom((dbcPath + "SpellRadius.dbc").c_str());
+    uint32 const ranges = sSpellRangeStore.MergeNewRowsFrom((dbcPath + "SpellRange.dbc").c_str());
+    std::ostringstream report;
+    report << "[SUI] spell index rows merged: castTimes +" << castTimes << " durations +" << durations
+           << " radii +" << radii << " ranges +" << ranges;
+    return report.str();
 }

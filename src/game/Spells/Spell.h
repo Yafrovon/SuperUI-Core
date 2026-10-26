@@ -403,6 +403,12 @@ class Spell
         uint64 m_delayStart = 0;                            // time of spell delay start, filled by event handler, zero = just started
         uint64 m_delayMoment = 0;                           // moment of next delay call, used internally
         bool m_immediateHandled = false;                    // were immediate actions handled? (used by delayed spells only)
+        // SPELL_CUSTOM_DEFERRED_DEST: the missile is still in the air; targets are filled and the
+        // ground phase runs at m_deferredDestDelay ms after launch (ArriveAtDeferredDestination).
+        bool m_deferredDest = false;
+        uint64 m_deferredDestDelay = 0;
+        bool ShouldDeferDestination() const;
+        void ArriveAtDeferredDestination(uint64 t_offset);
 
         // Channeled spells system
         typedef std::list<SpellAuraHolder*> SpellAuraHolderList;
