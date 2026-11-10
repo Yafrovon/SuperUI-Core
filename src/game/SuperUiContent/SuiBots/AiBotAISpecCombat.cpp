@@ -24,14 +24,17 @@
 #include <set>
 #include "SuiRaidTelemetry.h"
 #include "SuiCommanderRaid.h"
+#include "SuiRaidPlaybook.h"
 #include "AiBotCircuit.h"   // [CIRCUIT] probe macros (CIRCUIT_BOARD.md)
 #include "CreatureAI.h"
+#include "TemporarySummon.h"
 #include "Group.h"
 #include "Item.h"
 #include "Bag.h"
 #include "MotionMaster.h"
 #include "PlayerBotMgr.h"
 #include "Spell.h"
+#include "ObjectMgr.h"
 #include "SpellAuras.h"
 #include "Totem.h"
 
@@ -172,6 +175,8 @@ uint8 AiBotAI::GetCombatSpecTab() const
 CombatBotRoles AiBotAI::GetCombatActiveRole() const
 {
     if (SuiCommanderRaid::Owns(me)) return GetRole(); // temporary encounter role
+    if (m_offTank && me->IsInCombat())
+        return ROLE_TANK;   // an off-tank on duty (UpdateOffTankDuty)
     return GetCombatSpecTab() <= 2 ? botEntry->activeRole : GetRole();
 }
 
@@ -247,12 +252,53 @@ namespace
         while (in >> entry)
             gRebounders.insert(entry);
     }
+
+    // A kind whose own spell list holds a heal (a Flamewaker Priest's Dark Mending), from its data only.
+    bool KindHeals(Creature const* c)
+    {
+        static std::mutex lock;
+        static std::map<uint32, bool> cache;
+        std::lock_guard<std::mutex> guard(lock);
+        auto found = cache.find(c->GetEntry());
+        if (found != cache.end())
+            return found->second;
+        std::vector<uint32> spells;
+        if (CreatureInfo const* info = c->GetCreatureInfo())
+        {
+            if (info->spell_list_id)
+                if (CreatureSpellsList const* list = sObjectMgr.GetCreatureSpellsList(info->spell_list_id))
+                    for (CreatureSpellsEntry const& e : *list)
+                        spells.push_back(e.spellId);
+            for (uint32 id : info->spells)
+                if (id)
+                    spells.push_back(id);
+        }
+        bool heals = false;
+        for (uint32 id : spells)
+            if (SpellEntry const* spell = sSpellMgr.GetSpellEntry(id))
+                for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                    if (spell->Effect[i] == SPELL_EFFECT_HEAL || spell->Effect[i] == SPELL_EFFECT_HEAL_MAX_HEALTH)
+                        heals = true;
+        cache.emplace(c->GetEntry(), heals);
+        return heals;
+    }
 }
 
 void AiBotAI::ObserveRebound(Unit const* mob)
 {
     if (!mob || !mob->IsCreature() || !mob->IsAlive())
         return;
+    // A creature walking home after a wipe heals whole, and a splitting kind comes back fresh: neither
+    // rebounds (2026-11-03: Lava Spawn, Onyxia, Shazzrah and Majordomo's healers had all been learned
+    // this way and were left for last).
+    // A kind that gets back up from the floor stands at full again too (2026-11-03: Core Hound).
+    if (const_cast<Creature*>(static_cast<Creature const*>(mob))->IsInEvadeMode() || !mob->GetVictim() ||
+        AiBotAI::IsKnownMultiplier(mob->GetEntry()) || AiBotAI::IsKnownRiser(mob->GetEntry()))
+    {
+        std::lock_guard<std::mutex> guard(gReboundLock);
+        gLowestSeen.erase(mob->GetObjectGuid());
+        return;
+    }
     std::lock_guard<std::mutex> guard(gReboundLock);
     LoadRebounders();
     if (!mob->IsInCombat())
@@ -269,12 +315,388 @@ void AiBotAI::ObserveRebound(Unit const* mob)
     }
     if (hp < it->second)
         it->second = hp;
-    else if (it->second <= 55.0f && hp >= 90.0f && gRebounders.insert(mob->GetEntry()).second)
+    else if (it->second <= 55.0f && hp >= 90.0f && !gRebounders.count(mob->GetEntry()))
     {
+        // Healed back by another creature in the fight is not its own rebound: that healer dies first
+        // (2026-11-06: Sulfuron went 30 -> 91 % under his priests' Dark Mending and was learned; with
+        // the priests learned the same way in week 1, the kill order skipped all five - wipe).
+        std::list<Creature*> kin;
+        MaNGOS::AnyUnitInObjectRangeCheck check(mob, 40.0f);
+        MaNGOS::CreatureListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(kin, check);
+        Cell::VisitGridObjects(mob, searcher, 40.0f);
+        for (Creature* k : kin)
+            if (k != mob && k->IsAlive() && k->IsInCombat() && !k->IsHostileTo(mob) && KindHeals(k))
+            {
+                gLowestSeen.erase(mob->GetObjectGuid());
+                return;
+            }
+        // ...nor is a rebound under an aura another creature put on it: Majordomo's script makes his last add
+        // his Champion (21090) at full health, the Elite was learned as healing itself whole and left for last,
+        // and the raid beat on Majordomo for 110 s beside it (2026-11-09, attempt 57: seven adds dead).
+        for (auto const& entry : mob->GetSpellAuraHolderMap())
+            if (entry.second && entry.second->GetCasterGuid() != mob->GetObjectGuid() && entry.second->GetCasterGuid().IsCreature())
+            {
+                gLowestSeen.erase(mob->GetObjectGuid());
+                return;
+            }
+        gRebounders.insert(mob->GetEntry());
         std::ofstream(ReboundPath(), std::ios::app) << mob->GetEntry() << '\n';
         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-REBOUND] %s (entry %u) went from %.0f%% back to %.0f%% - its kind is left for last",
             mob->GetName(), mob->GetEntry(), it->second, hp);
     }
+}
+
+// Adds the playbook woke on purpose: no mage sheeps them again while the raid kills them.
+static std::mutex gReleasedLock;
+static std::map<ObjectGuid, uint32> gReleased;   // add -> until ms
+static std::map<ObjectGuid, uint32> gReleasedAt; // add -> when first released
+
+static bool RecentlyReleased(Unit const* u)
+{
+    std::lock_guard<std::mutex> guard(gReleasedLock);
+    auto it = gReleased.find(u->GetObjectGuid());
+    return it != gReleased.end() && WorldTimer::getMSTime() < it->second;
+}
+
+bool AiBotAI::WasPlaybookReleased(Unit const* u)
+{
+    return u && RecentlyReleased(u);
+}
+
+uint32 AiBotAI::PlaybookReleaseAgeMs(Unit const* u)
+{
+    std::lock_guard<std::mutex> guard(gReleasedLock);
+    auto it = u ? gReleasedAt.find(u->GetObjectGuid()) : gReleasedAt.end();
+    return it == gReleasedAt.end() ? 0xFFFFFFFFu : WorldTimer::getMSTime() - it->second;
+}
+
+// A tank that can force an enemy onto itself (warrior Taunt, druid Growl). A paladin tank cannot.
+bool AiBotAI::TankCanTaunt(Player* p)
+{
+    return p && (p->HasSpell(355) || p->HasSpell(6795));
+}
+
+// Off-tank on demand (owner 2026-11-09: "rather than it be a tank, it's a warrior/druid who OTs"): a melee
+// damage dealer with a taunt deals damage until the fight has more awake elites on the group than living
+// tanks, then tanks - every tank rule counts it while on duty (GetCombatActiveRole). It goes back to damage
+// once the other tanks have been enough for 8 s and nothing holds on it. The 6 s before it steps in let the
+// opening's sheeps land (Majordomo's nine adds all come at the puller; four are sheeped within ~3 s).
+void AiBotAI::UpdateOffTankDuty()
+{
+    bool const able = botEntry && GetCombatSpecTab() <= 2 && botEntry->activeRole == ROLE_MELEE_DPS &&
+        TankCanTaunt(me) && me->IsAlive() && me->IsInCombat() && me->GetGroup() && !SuiCommanderRaid::Owns(me);
+    if (!able)
+    {
+        if (m_offTank)
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-OFFTANK] %s: off duty (fight over)", me->GetName());
+        m_offTank = false;
+        m_offTankShortSinceMs = m_offTankEnoughSinceMs = m_offTankLooseSinceMs = m_offTankFightMs = 0;
+        m_offTankBoss = false;
+        return;
+    }
+    if (!m_offTankFightMs)
+        m_offTankFightMs = WorldTimer::getMSTime();
+    Group* group = me->GetGroup();
+    // A boss whose adds die in an order (playbook killOrder) wants every tank it can get: the off-tank tanks his
+    // whole fight as a full tank. With a 6th tank one is free from the pull, so the sheeped Healers die one after
+    // another before any Elite, and none is left to wake immune at the 4th death of eight (2026-11-09, Majordomo:
+    // attempts 59-72 all collapsed at that wake-up).
+    {
+        std::list<Unit*> wide;
+        MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck wideCheck(me, me, 100.0f);
+        MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> wideSearcher(wide, wideCheck);
+        Cell::VisitAllObjects(me, wideSearcher, 100.0f);
+        bool ordered = false;
+        for (Unit* b : wide)
+            if (b->IsCreature() && b->IsAlive() && b->IsInCombat() && static_cast<Creature*>(b)->IsWorldBoss())
+                for (Unit* a : wide)
+                    if (a != b && a->IsCreature() && a->IsAlive() && SuiRaidPlaybook::KillOrder(b->GetEntry(), a->GetEntry()) >= 0)
+                    {
+                        ordered = true;
+                        break;
+                    }
+        if (ordered)
+        {
+            if (!m_offTankBoss)
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-OFFTANK] %s: tanks the whole fight - its boss orders its adds", me->GetName());
+            m_offTank = m_offTankBoss = true;
+            return;
+        }
+        m_offTankBoss = false;
+    }
+    // an enemy a member is sheeping right now is not awake (2026-11-09, Majordomo attempt 53: the off-tank
+    // stepped in at +4 s, "7 awake for 5 tanks", while four Polymorphs were still in flight)
+    std::set<Unit const*> beingControlled;
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+        if (Player* m = itr->getSource())
+            if (Spell* s = m->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+                if (s->m_spellInfo && (s->m_spellInfo->Mechanic == MECHANIC_POLYMORPH || s->m_spellInfo->Mechanic == MECHANIC_BANISH ||
+                    s->m_spellInfo->Mechanic == MECHANIC_SHACKLE || s->m_spellInfo->EffectMechanic[0] == MECHANIC_POLYMORPH))
+                    if (Unit* t = s->m_targets.getUnitTarget())
+                        beingControlled.insert(t);
+    std::list<Unit*> nearby;
+    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 60.0f);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
+    Cell::VisitAllObjects(me, searcher, 60.0f);
+    int elites = 0;
+    bool held = false, loose = false, looseBoss = false;
+    for (Unit* u : nearby)
+    {
+        if (!u->IsCreature() || !u->IsAlive() || !u->IsInCombat() || u->HasBreakableByDamageCrowdControlAura() ||
+            beingControlled.count(u))
+            continue;
+        Creature const* c = static_cast<Creature const*>(u);
+        if (!c->IsElite() && !c->IsWorldBoss())
+            continue;
+        Unit* v = u->GetVictim();
+        Player* vp = v ? v->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+        if (!vp || !group->IsMember(vp->GetObjectGuid()))
+            continue;
+        ++elites;
+        if (v == me)
+            held = true;
+        // ...or one is loose on someone who is not a tank: Majordomo's threat resets with every teleport and
+        // he killed two healers while the five tanks were "enough" (2026-11-09, Majordomo attempt 54)
+        else if (v == vp && !IsSpecAoETankHolder(vp))
+        {
+            loose = true;
+            looseBoss = looseBoss || c->IsWorldBoss();
+        }
+    }
+    int tanks = 0;   // the others: an off-tank counts itself out, so it stays while the fight needs it
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* p = itr->getSource();
+        if (p && p != me && p->IsAlive() && p->IsInMap(me) && p->IsWithinDistInMap(me, 80.0f) && IsSpecAoETankHolder(p))
+            ++tanks;
+    }
+    bool const shortOfTanks = elites > tanks;
+    uint32 const now = WorldTimer::getMSTime();
+    if (loose)
+    {
+        if (!m_offTankLooseSinceMs)
+            m_offTankLooseSinceMs = now;
+    }
+    else
+        m_offTankLooseSinceMs = 0;
+    if (shortOfTanks || loose)
+    {
+        m_offTankEnoughSinceMs = 0;
+        if (!m_offTankShortSinceMs)
+            m_offTankShortSinceMs = now;
+    }
+    else
+    {
+        m_offTankShortSinceMs = 0;
+        if (!m_offTankEnoughSinceMs)
+            m_offTankEnoughSinceMs = now;
+    }
+    // (the pull's first 8 s belong to crowd control: at +3 s the off-tank took a Healer loose on a priest, the
+    // mages scored a held one "don't sheep" and the next Polymorph went out at +14 s - attempt 66)
+    if (!m_offTank && ((shortOfTanks && now - m_offTankShortSinceMs >= 6000) ||
+        (m_offTankLooseSinceMs && now - m_offTankLooseSinceMs >= (looseBoss ? 1000u : 3000u) && now - m_offTankFightMs >= 8000)))
+    {
+        m_offTank = true;
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-OFFTANK] %s: tanks - %d awake elites on the group for %d tanks%s",
+            me->GetName(), elites, tanks, loose ? ", one loose on a non-tank" : "");
+    }
+    else if (m_offTank && !shortOfTanks && !loose && !held && now - m_offTankEnoughSinceMs >= 8000)
+    {
+        m_offTank = false;
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-OFFTANK] %s: back to damage - %d awake elites for %d tanks",
+            me->GetName(), elites, tanks);
+    }
+}
+
+// A paladin's Lay on Hands on a group member under 15 % that an elite is beating on, a tank first - even
+// mid-cast: Holy Light ran 2.5 s of every 3 and the rotation's own check never came round while a tank fell
+// from 40 % to dead (2026-11-08, Majordomo attempts 39-43: no Lay on Hands in seventeen tank deaths).
+bool AiBotAI::TryLayOnHandsSave()
+{
+    if (me->GetClass() != CLASS_PALADIN || !me->IsInCombat() || !me->GetGroup())
+        return false;
+    SpellEntry const* loh = nullptr;
+    for (uint32 id : {10310u, 2800u, 633u})
+        if (me->HasSpell(id))
+        {
+            if (me->IsSpellReady(id))
+                loh = sSpellMgr.GetSpellEntry(id);
+            break;
+        }
+    if (!loh)
+        return false;
+    Player* best = nullptr;
+    bool bestTank = false;
+    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* p = itr->getSource();
+        if (!p || p == me || !p->IsAlive() || !p->IsInMap(me) || p->GetHealthPercent() >= 15.0f ||
+            !me->IsWithinDistInMap(p, 38.0f) || !me->IsWithinLOSInMap(p))
+            continue;
+        bool held = false;
+        for (Unit* a : p->GetAttackers())
+            if (a && a->IsCreature() && a->GetVictim() == p && static_cast<Creature*>(a)->IsElite())
+                held = true;
+        if (!held)
+            continue;
+        bool const tank = IsSpecAoETankHolder(p);
+        if (!best || (tank && !bestTank) || (tank == bestTank && p->GetHealthPercent() < best->GetHealthPercent()))
+        {
+            best = p;
+            bestTank = tank;
+        }
+    }
+    if (!best)
+        return false;
+    // one paladin's Lay on Hands per dying member (attempt 45: two landed on the same priest in one second)
+    static std::mutex lohLock;
+    static std::map<ObjectGuid, uint32> lohUntil;
+    {
+        std::lock_guard<std::mutex> guard(lohLock);
+        uint32 const now = WorldTimer::getMSTime();
+        auto it = lohUntil.find(best->GetObjectGuid());
+        if (it != lohUntil.end() && now < it->second)
+            return false;
+        lohUntil[best->GetObjectGuid()] = now + 8000;
+    }
+    float const hp = best->GetHealthPercent();
+    bool const wasCasting = me->IsNonMeleeSpellCasted(false, false, true);
+    if (wasCasting)
+        me->InterruptNonMeleeSpells(false);
+    if (DoCastSpell(best, loh) != SPELL_CAST_OK)
+    {
+        std::lock_guard<std::mutex> guard(lohLock);
+        lohUntil.erase(best->GetObjectGuid());
+        return false;
+    }
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: Lay on Hands on %s at %.0f%%%s",
+        me->GetName(), best->GetName(), hp, wasCasting ? " (cast cut short)" : "");
+    return true;
+}
+
+Unit* AiBotAI::PlaybookReleaseTarget(Player* me, bool* noFreeTank)
+{
+    if (noFreeTank)
+        *noFreeTank = false;
+    if (!me || !me->IsInCombat() || !me->GetGroup())
+        return nullptr;
+    // (100 yd: a member on an add tanked 50 yd from the boss is still in his fight - 2026-11-09, attempt 63)
+    std::list<Unit*> nearby;
+    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 100.0f);
+    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
+    Cell::VisitAllObjects(me, searcher, 100.0f);
+    uint32 boss = 0;
+    Unit* bossUnit = nullptr;
+    for (Unit* u : nearby)
+        if (u->IsCreature() && u->IsAlive() && u->IsInCombat() && static_cast<Creature*>(u)->IsWorldBoss())
+        {
+            boss = u->GetEntry();
+            bossUnit = u;
+            break;
+        }
+    if (!boss)
+        return nullptr;
+    // The adds are counted round the boss, the same for every member: from a caster's own 60 yd an awake
+    // add out of reach looked dead, and a hunter shot a sheep "released" at 2 s (2026-11-07, Majordomo).
+    nearby.clear();
+    {
+        MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck around(bossUnit, me, 90.0f);
+        MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> all(nearby, around);
+        Cell::VisitAllObjects(bossUnit, all, 90.0f);
+    }
+    // 2026-11-06, Majordomo: his Healers turn immune to Polymorph once half his adds are down, so they
+    // die first, one at a time, while the others stay sheeped (four woken at once killed 34 in 35 s).
+    int minAwake = 1000;
+    Unit* best = nullptr;
+    int bestK = 1000;
+    for (Unit* u : nearby)
+    {
+        if (!u->IsCreature() || !u->IsAlive() || !u->IsInCombat())
+            continue;
+        int const k = SuiRaidPlaybook::KillOrder(boss, u->GetEntry());
+        if (k < 0)
+            continue;
+        if (!u->HasBreakableByDamageCrowdControlAura())
+            minAwake = std::min(minAwake, k);
+        else if (k < bestK || (k == bestK && best && u->GetGUIDLow() < best->GetGUIDLow()))
+        {
+            bestK = k;
+            best = u;
+        }
+    }
+    // A sheep is woken only for a tank with nothing to hold: every awake enemy (the boss too) already has
+    // one (2026-11-08, Majordomo with five tanks: four Elites, the boss and the released Healer were six,
+    // the Healer went untanked and Shadow Shocked all eight melee dead in 12 s). Until a tank is free the
+    // raid kills the next awake kind in the order, and its death frees one.
+    int awake = 0;
+    for (Unit* u : nearby)
+        if (u->IsCreature() && u->IsAlive() && u->IsInCombat() && !u->HasBreakableByDamageCrowdControlAura())
+            ++awake;
+    int tanks = 0, taunters = 0, freeTaunters = 0;
+    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* p = itr->getSource();
+        if (!p || !p->IsAlive() || !p->IsInMap(bossUnit) || !p->IsWithinDistInMap(bossUnit, 100.0f))
+            continue;
+        AiBotAI const* ai = dynamic_cast<AiBotAI const*>(p->AI());
+        if (!(ai ? ai->GetCombatActiveRole() == ROLE_TANK : IsTankClass(p->GetClass())))
+            continue;
+        bool holds = false;
+        for (Unit* u : nearby)
+            if (u->IsAlive() && u->IsInCombat() && !u->HasBreakableByDamageCrowdControlAura() && u->GetVictim() == p)
+            {
+                holds = true;
+                break;
+            }
+        // An off-tank counts only for what it holds and is never a free tank: on duty for a moment it let a
+        // Healer go at +5 s, then went back to damage with nobody for it (2026-11-09, Majordomo attempt 53).
+        bool const offTank = ai && ai->IsOffTankOnDuty();
+        if (offTank && !holds)
+            continue;
+        ++tanks;
+        if (!TankCanTaunt(p) || offTank)
+            continue;
+        ++taunters;
+        if (!holds)
+            ++freeTaunters;
+    }
+    // ...and that tank can taunt: a paladin tank (no taunt, little threat) kept a Healer he woke on him 2-17 %
+    // of its life (2026-11-08, Majordomo attempts 42-43). While every taunting tank holds something the sheep
+    // sleeps on; the free paladin takes the boss meanwhile (TankDuty), whose threat resets every 20-30 s.
+    bool const noTaunter = taunters > 0 && freeTaunters == 0;
+    if (noFreeTank)
+        *noFreeTank = tanks <= awake;
+    if (!best || bestK >= minAwake)
+        return nullptr;
+    bool fresh = false;
+    {
+        std::lock_guard<std::mutex> guard(gReleasedLock);
+        static uint32 holdLogMs = 0;
+        uint32 const now = WorldTimer::getMSTime();
+        auto it = gReleased.find(best->GetObjectGuid());
+        bool const already = it != gReleased.end() && now < it->second;
+        if ((tanks <= awake || noTaunter) && !already)
+        {
+            if (now - holdLogMs > 10000)
+            {
+                holdLogMs = now;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-RELEASE] %s (guid %u) stays sheeped: %d tanks for %d awake, %d of %d taunting tanks free",
+                    best->GetName(), best->GetGUIDLow(), tanks, awake, freeTaunters, taunters);
+            }
+            return nullptr;
+        }
+        fresh = !already;
+        // (10 min, not 60 s: the record is refreshed only while the add sleeps, and a woken Healer that took 117 s to
+        // die stopped counting as released at 60 s - the kill order's floor no longer held its Elites, 2026-11-09,
+        // Majordomo attempt 77)
+        gReleased[best->GetObjectGuid()] = now + 600000;
+        if (fresh)
+            gReleasedAt[best->GetObjectGuid()] = now;
+    }
+    if (fresh)
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-RELEASE] %s (guid %u) released: %d tanks for %d awake",
+            best->GetName(), best->GetGUIDLow(), tanks, awake);
+    return best;
 }
 
 bool AiBotAI::IsKnownRebounder(uint32 entry)
@@ -282,6 +704,57 @@ bool AiBotAI::IsKnownRebounder(uint32 entry)
     std::lock_guard<std::mutex> guard(gReboundLock);
     LoadRebounders();
     return gRebounders.count(entry) != 0;
+}
+
+namespace
+{
+    std::set<uint32> gMultipliers;
+    std::mutex gMultiplierLock;
+    bool gMultipliersLoaded = false;
+
+    std::string MultipliersPath()
+    {
+        std::string conf = sConfig.GetFilename();
+        size_t slash = conf.find_last_of('/');
+        return (slash == std::string::npos ? std::string() : conf.substr(0, slash + 1)) + "sui-autopilot-multipliers.txt";
+    }
+
+    void LoadMultipliers()
+    {
+        if (gMultipliersLoaded)
+            return;
+        gMultipliersLoaded = true;
+        std::ifstream in(MultipliersPath());
+        uint32 entry = 0;
+        while (in >> entry)
+            gMultipliers.insert(entry);
+    }
+}
+
+void AiBotAI::ObserveMultiplier(Unit const* mob)
+{
+    // 2026-11-03: a Firelord's Lava Spawns split every 10 s in combat; the raid spread 172k damage
+    // over 122 of them, killed none, and 175 of them buried it.
+    if (!mob || !mob->IsCreature() || !static_cast<Creature const*>(mob)->IsTemporarySummon())
+        return;
+    ObjectGuid const summoner = static_cast<TemporarySummon const*>(mob)->GetSummonerGuid();
+    if (!summoner.IsCreature() || summoner.GetEntry() != mob->GetEntry())
+        return;
+    std::lock_guard<std::mutex> guard(gMultiplierLock);
+    LoadMultipliers();
+    if (gMultipliers.insert(mob->GetEntry()).second)
+    {
+        std::ofstream(MultipliersPath(), std::ios::app) << mob->GetEntry() << '\n';
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-MULTIPLY] %s (entry %u) is summoned by its own kind - it dies first, oldest first",
+            mob->GetName(), mob->GetEntry());
+    }
+}
+
+bool AiBotAI::IsKnownMultiplier(uint32 entry)
+{
+    std::lock_guard<std::mutex> guard(gMultiplierLock);
+    LoadMultipliers();
+    return gMultipliers.count(entry) != 0;
 }
 
 bool AiBotAI::IsKnownRiser(uint32 entry)
@@ -319,14 +792,14 @@ static bool AreaWouldFloorRiserEarly(Player* me, Unit* target, SpellEntry const*
     for (Unit* low : near)
     {
         if (!low->IsCreature() || !low->IsAlive() || !low->IsInCombat() || !AiBotAI::IsKnownRiser(low->GetEntry()) ||
-            low->GetHealthPercent() > 15.0f || low->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD))
+            low->GetHealthPercent() > 20.0f || low->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD))
             continue;
         WorldObject const* center = target ? static_cast<WorldObject const*>(target) : me;
         if (radius > 0.0f && !low->IsWithinDist(center, radius + 2.0f, false))
             continue;
         for (Unit* kin : near)
             if (kin != low && kin->IsCreature() && kin->IsAlive() && kin->GetEntry() == low->GetEntry() &&
-                !kin->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) && kin->GetHealthPercent() > 25.0f)
+                !kin->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) && kin->GetHealthPercent() > 20.0f)
                 return true;
     }
     return false;
@@ -390,6 +863,14 @@ bool AiBotAI::TrySpecSpell(Unit* target, SpellEntry const* spell)
         SuiRaidTelemetry::OnCastAttempt(me, spell->Id, -1);
         return false;   // cb:fold rotation rung, outcome probed at cast
     }
+    // No magic into an enemy that reflects it: it comes back at me - a Polymorph sheeps the mage
+    // (2026-11-06, Majordomo's Magic Reflection on his adds, 10 s of every 30).
+    if (target != me && spell->DmgClass == SPELL_DAMAGE_CLASS_MAGIC && me->IsValidAttackTarget(target) &&
+        (target->HasAuraType(SPELL_AURA_REFLECT_SPELLS) || target->HasAuraType(SPELL_AURA_REFLECT_SPELLS_SCHOOL)))
+    {
+        SuiRaidTelemetry::OnCastAttempt(me, spell->Id, -4);
+        return false;   // cb:fold rotation rung, outcome probed at cast
+    }
     if (me->GetGroup() && (AreaWouldWakeIdle(me, target, spell) || AreaWouldFloorRiserEarly(me, target, spell) ||
         DotOnRiser(target, spell)))
     {
@@ -398,6 +879,11 @@ bool AiBotAI::TrySpecSpell(Unit* target, SpellEntry const* spell)
     }
     SpellCastResult const result = DoCastSpell(target, spell);
     SuiRaidTelemetry::OnCastAttempt(me, spell->Id, int32(result == SPELL_CAST_OK ? 0 : result));
+    if (result == SPELL_FAILED_LINE_OF_SIGHT)
+    {
+        m_losRefusedGuid = target->GetObjectGuid();
+        m_losRefusedMs = WorldTimer::getMSTime();
+    }
     if (result != SPELL_CAST_OK)
         return false;   // cb:fold rotation rung, outcome probed at cast
     CB_HITV(me->GetGUIDLow(), "cpp-spec: spec ladder winner cast", spell->Id);
@@ -466,14 +952,153 @@ bool AiBotAI::IsSpecAoEThreatSafe(Unit* enemy) const
     return mine < held * kSpecAoEThreatShare;
 }
 
+namespace
+{
+    float const kSplashCcWander = 6.0f;
+
+    // An enemy a group member is putting to sleep right now (Polymorph, Shackle, Hibernate, Sap, Gouge in
+    // flight): a splash cast during that cast lands on the sheep (2026-11-08, Majordomo: one Blizzard at
+    // 2 s broke two fresh sheeps - it went out while the Polymorphs were still being cast).
+    bool CrowdControlBeingCastNear(Player* me, float x, float y, float radius)
+    {
+        uint32 const ccMask = (1u << (MECHANIC_POLYMORPH - 1)) | (1u << (MECHANIC_SHACKLE - 1)) |
+            (1u << (MECHANIC_SLEEP - 1)) | (1u << (MECHANIC_SAPPED - 1)) | (1u << (MECHANIC_KNOCKOUT - 1));
+        Group* group = me->GetGroup();
+        if (!group)
+            return false;
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+        {
+            Player* m = itr->getSource();
+            if (!m || !m->IsAlive() || m->GetMap() != me->GetMap())
+                continue;
+            Spell* cast = m->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            if (!cast || !cast->m_spellInfo || !(cast->m_spellInfo->GetSpellMechanicMask(7) & ccMask))
+                continue;
+            Unit* t = cast->m_targets.getUnitTarget();
+            if (t && t->IsAlive() && t->GetDistance2d(x, y) < radius + t->GetObjectBoundingRadius())
+                return true;
+        }
+        return false;
+    }
+
+    bool CrowdControlledEnemyNear(Player* me, float x, float y, float radius)
+    {
+        if (CrowdControlBeingCastNear(me, x, y, radius))
+            return true;
+        std::list<Unit*> enemies;
+        me->GetEnemyListInRadiusAround(me, 50.0f, enemies);
+        for (Unit* u : enemies)
+            if (u && u->IsAlive() && u->HasBreakableByDamageCrowdControlAura() &&
+                u->GetDistance2d(x, y) < radius + u->GetObjectBoundingRadius())
+                return true;
+        return false;
+    }
+
+    // A splash already running when a crowd-controlled enemy comes into it: a channelled area
+    // (Blizzard, Rain of Fire, Hurricane, Volley) is stopped, a melee splash buff (Blade Flurry,
+    // Sweeping Strikes) is dropped. The gate above only sees the moment of the cast; the area runs
+    // 8 s and the buff 15 s while the sheep walks about (2026-11-06, Majordomo: a broken Healer
+    // runs loose with no tank free, and its Shadow Shock reaches 20 yd).
+    void StopSplashNearCrowdControl(Player* me)
+    {
+        if (Spell* channel = me->GetCurrentSpell(CURRENT_CHANNELED_SPELL))
+            if (SpellEntry const* spell = channel->m_spellInfo)
+                if (channel->m_targets.m_targetMask & TARGET_FLAG_DEST_LOCATION)
+                {
+                    float radius = 0.0f;
+                    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                        if (SpellRadiusEntry const* entry = sSpellRadiusStore.LookupEntry(spell->EffectRadiusIndex[i]))
+                            radius = std::max(radius, Spells::GetSpellRadius(entry));
+                    if (radius > 0.0f && CrowdControlledEnemyNear(me, channel->m_targets.m_destX,
+                            channel->m_targets.m_destY, radius + 2.0f))
+                    {
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: stops %s - a crowd-controlled enemy is in it",
+                            me->GetName(), spell->SpellName[0].c_str());
+                        me->InterruptSpell(CURRENT_CHANNELED_SPELL);
+                    }
+                }
+        for (uint32 buff : { uint32(SP_BLADE_FLURRY), uint32(SP_SWEEPING_STRIKES) })
+            if (me->HasAura(buff) && CrowdControlledEnemyNear(me, me->GetPositionX(), me->GetPositionY(),
+                    8.0f + me->GetObjectBoundingRadius()))
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: drops splash buff %u - a crowd-controlled enemy is in reach",
+                    me->GetName(), buff);
+                me->RemoveAurasDueToSpell(buff);
+            }
+    }
+
+    // Consecration lies on the ground for 8 s while a sheep wanders and the tank's mob moves it: the
+    // cast-time check (area + 6 yd) is too short (2026-11-08, Majordomo: a Protection paladin's
+    // Consecration broke two fresh sheeps 16 s into the pull).
+    bool ConsecrationNearSheep(Player* me)
+    {
+        return CrowdControlledEnemyNear(me, me->GetPositionX(), me->GetPositionY(), 20.0f);
+    }
+
+    // Multi-Shot jumps up to 10 yd from each target to the next, three targets: a sheep 20 yd from the
+    // first is in reach (2026-11-08, Majordomo: a Multi-Shot broke a sleeping Healer with every splash
+    // check at 16 yd passing).
+    bool MultiShotNearSheep(Player* me, Unit* target)
+    {
+        return CrowdControlledEnemyNear(me, target->GetPositionX(), target->GetPositionY(),
+            2.0f * CHAIN_SPELL_JUMP_RADIUS + kSplashCcWander);
+    }
+
+    // A channelled area of a group member (Blizzard, Rain of Fire, Volley) over this enemy: a sheep
+    // landed in it breaks at the next tick, before the channel's own stop sees it (2026-11-07,
+    // Majordomo: one Blizzard broke two fresh sheeps at 7 s).
+    bool InGroupChannelArea(Player* me, Unit* u)
+    {
+        Group* group = me->GetGroup();
+        if (!group)
+            return false;
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+        {
+            Player* m = itr->getSource();
+            if (!m || !m->IsAlive() || m->GetMap() != me->GetMap())
+                continue;
+            Spell* channel = m->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+            if (!channel || !channel->m_spellInfo || !(channel->m_targets.m_targetMask & TARGET_FLAG_DEST_LOCATION))
+                continue;
+            float radius = 0.0f;
+            for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                if (SpellRadiusEntry const* entry = sSpellRadiusStore.LookupEntry(channel->m_spellInfo->EffectRadiusIndex[i]))
+                    radius = std::max(radius, Spells::GetSpellRadius(entry));
+            if (radius > 0.0f && u->GetDistance2d(channel->m_targets.m_destX, channel->m_targets.m_destY) <
+                    radius + 2.0f + u->GetObjectBoundingRadius())
+                return true;
+        }
+        return false;
+    }
+
+    // a spell that hurts its target (a cast of Polymorph on a sheep is its renewal, not a break)
+    bool DamagingSpell(SpellEntry const* spell)
+    {
+        for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+            if (spell->Effect[i] == SPELL_EFFECT_SCHOOL_DAMAGE || spell->Effect[i] == SPELL_EFFECT_WEAPON_DAMAGE ||
+                spell->Effect[i] == SPELL_EFFECT_NORMALIZED_WEAPON_DMG || spell->Effect[i] == SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL ||
+                spell->Effect[i] == SPELL_EFFECT_WEAPON_PERCENT_DAMAGE ||
+                (spell->Effect[i] == SPELL_EFFECT_APPLY_AURA &&
+                 (spell->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_DAMAGE ||
+                  spell->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_LEECH)))
+                return true;
+        return false;
+    }
+}
+
 bool AiBotAI::CanUseSpecAoE(Unit* center, float radius, uint32 minimumTargets) const
 {
     if (!center)
         return false;   // cb:fold hot per-update detail
 
     std::list<Unit*> enemies;
-    me->GetEnemyListInRadiusAround(center, radius, enemies);
+    // A crowd-controlled enemy is looked for a little past the area: a sheep wanders while it
+    // waits (2026-11-06, Majordomo: 68 of 89 broken sheeps were splashes - Blade Flurry, Blizzard,
+    // Multi-Shot, Frost Nova, Rain of Fire - mostly a sheep that walked in after the check).
+    me->GetEnemyListInRadiusAround(center, radius + kSplashCcWander, enemies);
     bool const tank = GetCombatActiveRole() == ROLE_TANK;
+    if (CrowdControlBeingCastNear(me, center->GetPositionX(), center->GetPositionY(), radius + kSplashCcWander))
+        return false;   // cb:fold hot per-update detail
     uint32 valid = 0;
     for (Unit* enemy : enemies)
     {
@@ -481,12 +1106,20 @@ bool AiBotAI::CanUseSpecAoE(Unit* center, float radius, uint32 minimumTargets) c
             continue;   // cb:fold hot per-update detail
         // Never splash an assigned/breakable CC target, an uninvolved pack, or a unit the
         // active encounter keeps this member off.
-        if (enemy->HasBreakableByDamageCrowdControlAura() || !enemy->IsInCombat() ||
-            SuiCommanderRaid::ForbidsSplash(me, enemy))
+        if (enemy->HasBreakableByDamageCrowdControlAura())
+            return false;   // cb:fold hot per-update detail
+        if (enemy != center && !center->IsWithinDistInMap(enemy, radius))
+            continue;   // cb:fold hot per-update detail
+        if (!enemy->IsInCombat() || SuiCommanderRaid::ForbidsSplash(me, enemy))
             return false;   // cb:fold hot per-update detail
         // In combat but not swinging at anyone yet (a fresh summon or split choosing its
         // victim): it neither blocks the splash nor counts toward it.
         if (!enemy->GetVictim())
+            continue;   // cb:fold hot per-update detail
+        // A kind that heals itself whole is no target for a splash either: the damage is lost
+        // (2026-11-05, Golemagg: his two Core Ragers made three targets, and every mage channelled
+        // Blizzard and every warlock Rain of Fire for ~80 s of a 199 s fight - 170 dps each).
+        if (enemy->IsCreature() && IsKnownRebounder(enemy->GetEntry()))
             continue;   // cb:fold hot per-update detail
         if (!tank && !IsSpecAoEThreatSafe(enemy))
             return false;   // cb:fold hot per-update detail
@@ -518,6 +1151,61 @@ bool AiBotAI::TrySpecInterrupt(Unit* target, std::initializer_list<uint32> spell
     for (uint32 id : spellIds)
         if (TrySpecSpell(target, id))
             return true;   // cb:fold rotation rung, outcome probed at cast
+    return false;
+}
+
+// [TACTICS] An interrupt is for any enemy near me casting at the raid, not only my own target: the
+// damage dealers all hit one kill target while the tanked adds cast freely (2026-11-08, Majordomo: the
+// Elites' Fireball, Fire Blast and Blast Wave did ~130k a fight; a Counterspell locks an Elite's fire
+// school for 10 s). One interrupt per cast: the others keep theirs for the next one.
+bool AiBotAI::TrySpecInterruptNearby(std::initializer_list<uint32> spellIds, float range)
+{
+    if (!me->IsInCombat())
+        return false;
+    bool ready = false;
+    for (uint32 id : spellIds)
+        if (me->HasSpell(id) && me->IsSpellReady(id))
+            ready = true;
+    if (!ready)
+        return false;
+    static std::map<ObjectGuid, uint32> claims;
+    static std::mutex claimsLock;
+    std::list<Unit*> around;
+    me->GetEnemyListInRadiusAround(me, range, around);
+    uint32 const now = WorldTimer::getMSTime();
+    for (Unit* u : around)
+    {
+        if (!u || !u->IsAlive() || !u->IsCreature() || !u->IsInCombat() || u->HasBreakableByDamageCrowdControlAura())
+            continue;
+        Spell* cast = u->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+        if (!cast)
+            cast = u->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
+        if (!cast || !cast->m_spellInfo || cast->m_spellInfo->PreventionType != SPELL_PREVENTION_TYPE_SILENCE)
+            continue;
+        {
+            std::lock_guard<std::mutex> guard(claimsLock);
+            auto c = claims.find(u->GetObjectGuid());
+            if (c != claims.end() && now < c->second)
+                continue;
+        }
+        if (!me->IsWithinLOSInMap(u))
+            continue;
+        for (uint32 id : spellIds)
+            if (TrySpecSpell(u, id))
+            {
+                {
+                    std::lock_guard<std::mutex> guard(claimsLock);
+                    claims[u->GetObjectGuid()] = now + 1500;
+                }
+                if (now >= m_interruptLogMs)
+                {
+                    m_interruptLogMs = now + 10000;
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-INTERRUPT] %s: interrupts %s's %s (%.0f yd)",
+                        me->GetName(), u->GetName(), cast->m_spellInfo->SpellName[0].c_str(), me->GetDistance(u));
+                }
+                return true;
+            }
+    }
     return false;
 }
 
@@ -582,15 +1270,23 @@ bool AiBotAI::TryCombatPotion()
     // A protection potion the quartermaster handed out (a school's damage absorbed) goes back up
     // once it has been burned through: from 3.4k health one Fire Blossom kills a caster
     // (2026-09-25, Geddon's room). Health and mana emergencies come first.
-    bool const needShield = !needHealth && !needMana && me->GetHealthPercent() < 85.0f;
+    // The potions share one cooldown: a healer's goes to mana, and a caster tops its shield up only while
+    // its mana is high (2026-11-07, Majordomo: every Major Mana Potion was refused on cooldown - the
+    // Fire Protection top-ups had taken it - and nine healers ran dry with ten potions each).
+    bool const manaUser = me->GetPowerType() == POWER_MANA && me->GetMaxPower(POWER_MANA) > 0;
+    bool const needShield = !needHealth && !needMana && me->GetHealthPercent() < 85.0f &&
+        (!manaUser || (GetCombatActiveRole() != ROLE_HEALER && me->GetPowerPercent(POWER_MANA) >= 60.0f));
     if (!needMana && !needHealth && !needShield)
         return false;
+    // (diagnostic 2026-11-07: healers at 1 % mana carried ten Major Mana Potions untouched)
+    std::string why;
     auto consider = [&](Item* item) -> bool
     {
         if (!item)
             return false;
         ItemPrototype const* proto = item->GetProto();
-        if (!proto || proto->Class != ITEM_CLASS_CONSUMABLE)
+        // (runes are trade goods: a Demonic Rune's mana has its own cooldown beside the potions)
+        if (!proto || (proto->Class != ITEM_CLASS_CONSUMABLE && proto->Class != ITEM_CLASS_TRADE_GOODS))
             return false;
         for (auto const& s : proto->Spells)
         {
@@ -599,11 +1295,13 @@ bool AiBotAI::TryCombatPotion()
             SpellEntry const* spell = sSpellMgr.GetSpellEntry(s.SpellId);
             if (!spell)
                 continue;
-            bool mana = false, heal = false, shield = false;
+            bool mana = false, heal = false, shield = false, hurts = false;
             for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
             {
                 if (spell->Effect[i] == SPELL_EFFECT_ENERGIZE && spell->EffectMiscValue[i] == POWER_MANA)
                     mana = true;
+                if (spell->Effect[i] == SPELL_EFFECT_SCHOOL_DAMAGE)
+                    hurts = true;   // a rune's price in health
                 if (spell->Effect[i] == SPELL_EFFECT_HEAL)
                     heal = true;
                 // a school shield, and only for the school that is hurting me right now
@@ -613,15 +1311,24 @@ bool AiBotAI::TryCombatPotion()
             }
             if (shield && me->HasAura(spell->Id))
                 continue;   // still up
+            if (hurts && me->GetHealthPercent() < 60.0f)
+                continue;
             if (!((needMana && mana) || (needHealth && heal) || (needShield && shield)))
                 continue;
             if (!me->IsSpellReady(*spell, proto))
+            {
+                if (mana)
+                    why += " " + std::to_string(spell->Id) + ":cooldown";
                 continue;
-            if (me->CastSpell(me, spell, false, item) == SPELL_CAST_OK)
+            }
+            SpellCastResult const res = me->CastSpell(me, spell, false, item);
+            if (res == SPELL_CAST_OK)
             {
                 m_potionNextMs = now + 3000;
                 return true;
             }
+            if (mana)
+                why += " " + std::to_string(spell->Id) + ":cast" + std::to_string(uint32(res));
         }
         return false;
     };
@@ -633,6 +1340,12 @@ bool AiBotAI::TryCombatPotion()
             for (uint32 slot = 0; slot < b->GetBagSize(); ++slot)
                 if (consider(b->GetItemByPos(uint8(slot))))
                     return true;
+    if (needMana && now >= m_potionWhyLogMs)
+    {
+        m_potionWhyLogMs = now + 10000;
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-POTION] %s: mana %.0f%% and nothing drunk:%s",
+            me->GetName(), me->GetPowerPercent(POWER_MANA), why.empty() ? " no mana item found" : why.c_str());
+    }
     return false;
 }
 
@@ -644,21 +1357,59 @@ bool AiBotAI::UpdateSpecCombatAI()
     if (TryCombatPotion())
         return true;   // cb:fold hot per-update detail
 
+    // A damaging cast on its way at a unit that has been crowd-controlled since it began is stopped,
+    // whatever my victim is now (2026-11-08, Majordomo: a warlock's Immolate landed on a Healer two
+    // seconds after a mage re-sheeped it).
+    for (CurrentSpellTypes type : { CURRENT_AUTOREPEAT_SPELL, CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL })
+        if (Spell* cast = me->GetCurrentSpell(type))
+            if (Unit* at = cast->m_targets.getUnitTarget())
+                if (at != me && at->IsAlive() && at->HasBreakableByDamageCrowdControlAura() &&
+                    at != PlaybookReleaseTarget(me) && cast->m_spellInfo && DamagingSpell(cast->m_spellInfo))
+                    me->InterruptSpell(type);
+
     // The 250 ms action lane must honor a CC decision immediately rather than
     // waiting for the one-second doctrine tick.  Stop both white swings and the
     // commanded pet; the normal target authority will select a legal target.
     if (Unit* victim = me->GetVictim())
     {   // cb:fold hot per-update detail
-        if (victim->HasBreakableByDamageCrowdControlAura())
+        if (victim->HasBreakableByDamageCrowdControlAura() && victim != PlaybookReleaseTarget(me))
         {   // cb:fold hot per-update detail
             CB_HITV(me->GetGUIDLow(), "cpp-spec: halt, victim under breakable cc", victim->GetEntry());
             if (Pet* pet = me->GetPet())
                 if (pet->GetVictim() == victim)   // cb:fold hot per-update detail
                     pet->AttackStop();   // cb:fold hot per-update detail
             me->AttackStop(false);
+            // ...and the shot or spell on its way at it (2026-11-06: 7 sheeps broken by a wand's
+            // Shoot, 4 by Frostbolt - the swing stopped, the auto-repeat did not)
+            for (CurrentSpellTypes type : { CURRENT_AUTOREPEAT_SPELL, CURRENT_GENERIC_SPELL })
+                if (Spell* cast = me->GetCurrentSpell(type))
+                    if (cast->m_targets.getUnitTargetGuid() == victim->GetObjectGuid() &&
+                        cast->m_spellInfo && DamagingSpell(cast->m_spellInfo))
+                        me->InterruptSpell(type);
+            return true;
+        }
+        // A melee damage dealer waits out an elite's damage shield: every hit comes back (2026-11-08,
+        // Majordomo: five rogues on a Flamewaker Healer died within 4 s to Damage Shield 21075 and Shadow Shock).
+        // (below 75 % only: the shield is up 10 s of every 30, a third of the melee's time, and they now step out
+        // of a bursting kind at 65 % - 2026-11-09, Majordomo: rogues at ~120 dps each)
+        if (GetCombatActiveRole() == ROLE_MELEE_DPS && victim->IsCreature() && static_cast<Creature*>(victim)->IsElite() &&
+            victim->HasAuraType(SPELL_AURA_DAMAGE_SHIELD) && me->GetHealthPercent() < 75.0f)
+        {   // cb:fold hot per-update detail
+            uint32 const nowMs = WorldTimer::getMSTime();
+            if (nowMs - m_damageShieldLogMs > 10000)
+            {
+                m_damageShieldLogMs = nowMs;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-MELEE] %s: waits out %s's damage shield",
+                    me->GetName(), victim->GetName());
+            }
+            if (Pet* pet = me->GetPet())
+                if (pet->GetVictim() == victim)
+                    pet->AttackStop();
+            me->AttackStop(false);
             return true;
         }
     }
+    StopSplashNearCrowdControl(me);
 
     switch (me->GetClass())
     {
@@ -1414,6 +2165,38 @@ bool AiBotAI::UpdateSpecCombatPaladin(uint8 spec)
 {
     Unit* victim = me->GetVictim();
 
+    // A paladin tank an elite is about to kill shields itself: in this version its mobs keep swinging at the
+    // Divine Shield for nothing, 12 s for the healers to catch up, and Lay on Hands itself after that
+    // (2026-11-08, Majordomo attempt 49: the paladin tank went from 96 % to dead in 6 s under one Elite and
+    // the add cycle lost its fifth tank at 44 s).
+    if (spec == 1 && me->IsInCombat() && me->GetHealthPercent() < 25.0f && !me->HasAura(25771))
+    {
+        bool held = false;
+        for (Unit* a : me->GetAttackers())
+            if (a && a->IsCreature() && a->GetVictim() == me && static_cast<Creature*>(a)->IsElite())
+                held = true;
+        if (held)
+        {
+            float const hp = me->GetHealthPercent();
+            if (TrySpecSpell(me, 642))
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: Divine Shield at %.0f%%", me->GetName(), hp);
+                return true;
+            }
+            if (hp < 15.0f)
+                for (uint32 id : {10310u, 2800u, 633u})
+                    if (me->HasSpell(id))
+                    {
+                        if (me->IsSpellReady(id) && DoCastSpell(me, sSpellMgr.GetSpellEntry(id)) == SPELL_CAST_OK)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: Lay on Hands on itself at %.0f%%", me->GetName(), hp);
+                            return true;
+                        }
+                        break;
+                    }
+        }
+    }
+
     // Every Paladin protects allies before dealing damage.  Holy Shock is
     // explicitly evaluated as a heal before its offensive branch.
     Unit* heal = SelectHealTarget(spec == 0 ? 88.0f : 35.0f, spec == 0 ? 82.0f : 28.0f);
@@ -1421,6 +2204,21 @@ bool AiBotAI::UpdateSpecCombatPaladin(uint8 spec)
         TrySpecValuedDispel(m_spells.paladin.pCleanse, 800.0f)) return true;   // cb:fold rotation rung, outcome probed at cast
     if (heal)
     {   // cb:fold rotation rung, outcome probed at cast
+        // A tank about to die gets Lay on Hands: one save an hour, worth all this paladin's mana - a dead tank
+        // ends the add cycle (2026-11-08, Majordomo: the first tank died at 27-103 s in most attempts).
+        if (heal != me && heal->GetHealthPercent() < 15.0f && heal->IsPlayer())
+        {
+            bool held = false;
+            for (Unit* a : heal->GetAttackers())
+                if (a && a->IsCreature() && a->GetVictim() == heal && static_cast<Creature*>(a)->IsElite())
+                    held = true;
+            if (held && TrySpecSpell(heal, 10310))
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: Lay on Hands on %s at %.0f%%",
+                    me->GetName(), heal->GetName(), heal->GetHealthPercent());
+                return true;
+            }
+        }
         if (heal->GetHealthPercent() < 35.0f && TrySpecSpell(me, SP_DIVINE_FAVOR)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (heal->GetHealthPercent() < 65.0f && TrySpecSpell(heal, SP_HOLY_SHOCK)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (spec == 0 || heal->GetHealthPercent() < 28.0f)
@@ -1440,7 +2238,7 @@ bool AiBotAI::UpdateSpecCombatPaladin(uint8 spec)
     {   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecAura(me, 25780)) return true; // Righteous Fury   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecAura(me, SP_HOLY_SHIELD)) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (CanUseSpecAoE(me, 8.0f, 2) && TrySpecSpell(me, m_spells.paladin.pConsecration)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (CanUseSpecAoE(me, 8.0f, 2) && !ConsecrationNearSheep(me) && TrySpecSpell(me, m_spells.paladin.pConsecration)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.paladin.pJudgement)) return true;   // cb:fold rotation rung, outcome probed at cast
         return false; // never bubble/BoP the active tank automatically
     }
@@ -1452,14 +2250,14 @@ bool AiBotAI::UpdateSpecCombatPaladin(uint8 spec)
         if (victim->GetHealthPercent() < 20.0f && TrySpecSpell(victim, m_spells.paladin.pHammerOfWrath)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.paladin.pJudgement)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (me->GetPowerPercent(POWER_MANA) > 65.0f && CanUseSpecAoE(me, 8.0f, 2) &&
-            TrySpecSpell(me, m_spells.paladin.pConsecration)) return true;   // cb:fold rotation rung, outcome probed at cast
+            !ConsecrationNearSheep(me) && TrySpecSpell(me, m_spells.paladin.pConsecration)) return true;   // cb:fold rotation rung, outcome probed at cast
         return false;
     }
 
     // Holy: offense only after the healing/cleanse pass above.
     if (me->GetPowerPercent(POWER_MANA) > 55.0f && TrySpecSpell(victim, SP_HOLY_SHOCK)) return true;   // cb:fold rotation rung, outcome probed at cast
     if (me->GetPowerPercent(POWER_MANA) > 70.0f && CanUseSpecAoE(me, 8.0f, 2) &&
-        TrySpecSpell(me, m_spells.paladin.pConsecration)) return true;   // cb:fold rotation rung, outcome probed at cast
+        !ConsecrationNearSheep(me) && TrySpecSpell(me, m_spells.paladin.pConsecration)) return true;   // cb:fold rotation rung, outcome probed at cast
     if (TrySpecSpell(victim, m_spells.paladin.pJudgement)) return true;   // cb:fold rotation rung, outcome probed at cast
     return false;
 }
@@ -1551,7 +2349,7 @@ bool AiBotAI::UpdateSpecCombatHunter(uint8 spec)
         if (petReady && victim->GetHealthPercent() > 55.0f && TrySpecSpell(pet, SP_BESTIAL_WRATH)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 35.0f && TrySpecAura(victim, 1978)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.hunter.pArcaneShot)) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (CanUseSpecAoE(victim, 10.0f, 2) && TrySpecSpell(victim, m_spells.hunter.pMultiShot)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (CanUseSpecAoE(victim, 10.0f, 2) && !MultiShotNearSheep(me, victim) && TrySpecSpell(victim, m_spells.hunter.pMultiShot)) return true;   // cb:fold rotation rung, outcome probed at cast
     }
     else if (spec == 1) // Marksmanship
     {   // cb:fold rotation rung, outcome probed at cast
@@ -1559,7 +2357,7 @@ bool AiBotAI::UpdateSpecCombatHunter(uint8 spec)
             if (TrySpecSpell(add, SP_SCATTER_SHOT)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 55.0f && TrySpecSpell(me, SP_RAPID_FIRE)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.hunter.pAimedShot)) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (CanUseSpecAoE(victim, 10.0f, 2) && TrySpecSpell(victim, m_spells.hunter.pMultiShot)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (CanUseSpecAoE(victim, 10.0f, 2) && !MultiShotNearSheep(me, victim) && TrySpecSpell(victim, m_spells.hunter.pMultiShot)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.hunter.pArcaneShot)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 35.0f && TrySpecAura(victim, 1978)) return true;   // cb:fold rotation rung, outcome probed at cast
     }
@@ -1568,7 +2366,7 @@ bool AiBotAI::UpdateSpecCombatHunter(uint8 spec)
         if (Unit* add = SelectSafeSpecAdd(victim))
             if (!HasAuraFromSpellChain(add, 1978) && TrySpecSpell(add, SP_WYVERN_STING)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.hunter.pAimedShot)) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (CanUseSpecAoE(victim, 10.0f, 2) && TrySpecSpell(victim, m_spells.hunter.pMultiShot)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (CanUseSpecAoE(victim, 10.0f, 2) && !MultiShotNearSheep(me, victim) && TrySpecSpell(victim, m_spells.hunter.pMultiShot)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim->GetHealthPercent() > 35.0f && TrySpecAura(victim, 1978)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, m_spells.hunter.pArcaneShot)) return true;   // cb:fold rotation rung, outcome probed at cast
     }
@@ -1611,7 +2409,7 @@ bool AiBotAI::UpdateSpecCombatRogue(uint8 spec)
         }
     }
 
-    if (TrySpecInterrupt(victim, {1766, 1776})) return true; // Kick before Gouge   // cb:fold rotation rung, outcome probed at cast
+    if (TrySpecInterrupt(victim, {1766, 1776}) || TrySpecInterruptNearby({1766}, 8.0f)) return true; // Kick before Gouge   // cb:fold rotation rung, outcome probed at cast
     if (me->GetHealthPercent() < 35.0f && victim->GetVictim() == me &&
         TrySpecSpell(me, m_spells.rogue.pEvasion)) return true;   // cb:fold rotation rung, outcome probed at cast
 
@@ -1694,7 +2492,10 @@ bool AiBotAI::UpdateSpecCombatPriest(uint8 spec)
 
         if (TrySpecValuedDispel(m_spells.priest.pDispelMagic, 1.0f)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (victim && TrySpecInterrupt(victim, {SP_SILENCE})) return true;   // cb:fold rotation rung, outcome probed at cast
-        if (victim && me->GetPowerPercent(POWER_MANA) > 55.0f)
+        // A raid's healer keeps its mana and its cast bar for heals: a Holy Fire is 3.5 s the tank
+        // waits through (2026-11-05, Golemagg: the priests cast 8-20 Smites and Holy Fires each and
+        // the healers were dry at 130 s, the boss at 15 %).
+        if (victim && me->GetPowerPercent(POWER_MANA) > 55.0f && !(me->GetGroup() && me->GetGroup()->isRaidGroup()))
         {   // cb:fold rotation rung, outcome probed at cast
             if (spec == 0 && victim->GetHealthPercent() > 60.0f &&
                 me->GetPowerPercent(POWER_MANA) > 70.0f &&
@@ -2044,7 +2845,7 @@ bool AiBotAI::UpdateSpecCombatMage(uint8 spec)
     if (!victim)
         return false;   // cb:fold rotation rung, outcome probed at cast
 
-    if (TrySpecInterrupt(victim, {2139})) return true;   // cb:fold rotation rung, outcome probed at cast
+    if (TrySpecInterrupt(victim, {2139}) || TrySpecInterruptNearby({2139}, 30.0f)) return true;   // cb:fold rotation rung, outcome probed at cast
 
     // Polymorph is strictly add-only.  The legacy target mix-up (select add,
     // cast on primary) cannot occur because the selected add is passed through.
@@ -2111,9 +2912,28 @@ static bool IsBanishedUnit(Unit const* u)
     return false;
 }
 
+// The unit this caster already holds under its own control of that mechanic. One per caster in
+// this game: a second Banish or Polymorph frees the first (2026-11-03, Garr: four warlocks
+// re-banished a new Firesworn every 2-3 s, each cast waking the one before - none stayed out).
+static Unit* OwnControlled(Player const* me, std::list<Unit*> const& nearby, Mechanics mechanic)
+{
+    for (Unit* u : nearby)
+        if (u->IsAlive())
+            for (auto const& entry : u->GetSpellAuraHolderMap())
+                if (entry.second && entry.second->HasMechanic(mechanic) && entry.second->GetCasterGuid() == me->GetObjectGuid())
+                    return u;
+    return nullptr;
+}
+
 // [TACTICS] More elites on the raid than tanks to hold them: a warlock banishes a spare one
 // (an elite no tank is holding, never a boss). The spell's own creature-type rule decides what
 // can be banished; a banished elite is re-banished when it wakes if the raid is still short.
+// A sheep claimed by the mage who started it, for the cast: mages deciding in the same tick do not see
+// each other's casts yet (2026-11-06, Majordomo: 12 Polymorphs on four Healers in 7 s, two mages per
+// Healer, each new sheep replacing the last - one Healer stayed awake and killed the raid).
+static std::mutex gPolyClaimLock;
+static std::map<ObjectGuid, std::pair<ObjectGuid, uint32>> gPolyClaims;   // target -> (mage, until ms)
+
 bool AiBotAI::TrySpecPolymorphSpareElite()
 {
     SpellEntry const* poly = m_spells.mage.pPolymorph;
@@ -2139,10 +2959,74 @@ bool AiBotAI::TrySpecPolymorphSpareElite()
     MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 30.0f);
     MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
     Cell::VisitAllObjects(me, searcher, 30.0f);
+    // (my sheep is looked for further out than I cast: a sheep 30-45 yd away ran out unrenewed and woke
+    // 20 s before the last Elite died - 2026-11-07, Majordomo)
+    std::list<Unit*> wide;
+    {
+        MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck wideCheck(me, me, 45.0f);
+        MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> wideSearcher(wide, wideCheck);
+        Cell::VisitAllObjects(me, wideSearcher, 45.0f);
+    }
+    if (Unit* mine = OwnControlled(me, wide, MECHANIC_POLYMORPH))
+    {
+        // My sheep stands; a new one would wake it. It is renewed in its last seconds, not left to
+        // run out (2026-11-06, Majordomo: four Healers sheeped in the first 4 s all woke together
+        // 50 s later and the raid died inside 40 s).
+        int32 left = -1;
+        for (auto const& entry : mine->GetSpellAuraHolderMap())
+            if (entry.second && entry.second->HasMechanic(MECHANIC_POLYMORPH) && entry.second->GetCasterGuid() == me->GetObjectGuid())
+                left = entry.second->GetAuraDuration();
+        // (cast straight: the spell gate refuses a target already wearing the aura)
+        // 12 s ahead: a 10 s spell reflection on it would otherwise outlast the window
+        bool const reflects = mine->HasAuraType(SPELL_AURA_REFLECT_SPELLS) || mine->HasAuraType(SPELL_AURA_REFLECT_SPELLS_SCHOOL);
+        if (left >= 0 && left < 12000 && !reflects && mine != PlaybookReleaseTarget(me) &&
+            (me->GetDistance(mine) > 28.0f || !me->IsWithinLOSInMap(mine)))
+        {
+            // out of reach: walk in to renew it
+            float dx = me->GetPositionX() - mine->GetPositionX(), dy = me->GetPositionY() - mine->GetPositionY();
+            float const len = std::max(0.5f, std::sqrt(dx * dx + dy * dy));
+            // In reach but out of sight, a spot 22 yd out on my own line was where I stood: the mage "walked"
+            // 12 s without moving and the sheep ran out (2026-11-08, Majordomo attempt 46). Closer in, and
+            // round the sheep, to a spot that sees it.
+            float const r = len > 28.0f ? 22.0f : std::max(8.0f, std::min(15.0f, len - 4.0f));
+            float const base = std::atan2(dy, dx);
+            float x = mine->GetPositionX() + dx / len * 6.0f, y = mine->GetPositionY() + dy / len * 6.0f;
+            float z = mine->GetPositionZ();
+            me->UpdateAllowedPositionZ(x, y, z);
+            for (float turn : { 0.0f, 0.524f, -0.524f, 1.047f, -1.047f, 1.571f, -1.571f })
+            {
+                float cx = mine->GetPositionX() + std::cos(base + turn) * r, cy = mine->GetPositionY() + std::sin(base + turn) * r;
+                float cz = mine->GetPositionZ();
+                me->UpdateAllowedPositionZ(cx, cy, cz);
+                if (std::fabs(cz - mine->GetPositionZ()) > 6.0f ||
+                    !me->IsWithinLOSAtPosition(cx, cy, cz, mine->GetPositionX(), mine->GetPositionY(), mine->GetPositionZ(), true, 1.0f))
+                    continue;
+                x = cx;
+                y = cy;
+                z = cz;
+                break;
+            }
+            if (!me->IsMoving())
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: walks into reach to renew the polymorph on %s (guid %u, %.0f yd), %d ms left",
+                    me->GetName(), mine->GetName(), mine->GetGUIDLow(), me->GetDistance(mine), left);
+                me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            }
+            return true;
+        }
+        if (left >= 0 && left < 12000 && !reflects && mine != PlaybookReleaseTarget(me) && DoCastSpell(mine, poly) == SPELL_CAST_OK)
+        {
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: renews the polymorph on %s (guid %u), %d ms left",
+                me->GetName(), mine->GetName(), mine->GetGUIDLow(), left);
+            return true;
+        }
+        return false;
+    }
     uint32 active = 0;
     Unit* spare = nullptr;
     int spareScore = -1;
     uint32 spareHitters = 1000;
+    bool spareBursts = false;
     for (Unit* u : nearby)
     {
         if (!u->IsCreature() || !u->IsAlive() || !u->IsInCombat() || !static_cast<Creature*>(u)->IsElite())
@@ -2156,6 +3040,16 @@ bool AiBotAI::TrySpecPolymorphSpareElite()
         ++active;
         if (static_cast<Creature*>(u)->IsWorldBoss() || u->IsImmuneToMechanic(MECHANIC_POLYMORPH))
             continue;
+        {
+            std::lock_guard<std::mutex> guard(gPolyClaimLock);
+            auto c = gPolyClaims.find(u->GetObjectGuid());
+            if (c != gPolyClaims.end() && c->second.first != me->GetObjectGuid() && WorldTimer::getMSTime() < c->second.second)
+                continue;   // another mage is sheeping it
+        }
+        if (RecentlyReleased(u))
+            continue;   // the playbook's next kill, woken on purpose
+        if (InGroupChannelArea(me, u))
+            continue;
         // a sheep under a damage-over-time (an Immolate, a Rain of Fire it stands in) breaks at the
         // next tick (2026-09-25: 9 of 14 broken sheep on Majordomo's healers)
         if (u->HasAuraType(SPELL_AURA_PERIODIC_DAMAGE) || u->HasAuraType(SPELL_AURA_PERIODIC_LEECH))
@@ -2165,21 +3059,38 @@ bool AiBotAI::TrySpecPolymorphSpareElite()
             if (Player* m = itr->getSource())
                 if (m->IsAlive() && m->GetVictim() == u)
                     ++hitters;
+        // the raid's kill target: a sheep would only stop the kill - once it is being killed; at the
+        // pull every damage dealer's first pick still counts as "hitting" (2026-11-06: no sheep for 14 s)
+        if (hitters >= 3 && u->GetHealthPercent() < 90.0f)
+            continue;
         AiBotAI* holderAi = dynamic_cast<AiBotAI*>(vp->AI());
-        bool const onTank = holderAi && holderAi->GetCombatActiveRole() == ROLE_TANK;
-        int const score = onTank ? (vp->GetVictim() == u ? 0 : 1) : 2;
+        // A burster held by a tank still hits everyone around that tank: it is sheeped like a loose one
+        // unless the raid is killing it (2026-11-07, Majordomo with five tanks: the fifth tank took the
+        // fourth Healer, so it was never sheeped and its Shadow Shocks killed from 12 s on).
+        bool const bursts = hitters < 3 && SuiRaidTelemetry::EntryPulseRadius(u->GetEntry()) > 0.0f;
+        // (an off-tank's add is loose all the same: the sheep frees it - 2026-11-09, attempt 66)
+        bool const onTank = holderAi && holderAi->GetCombatActiveRole() == ROLE_TANK && !holderAi->IsOffTankOnDuty() && !bursts;
+        // a healer kind first: it undoes the raid's damage and a tank is better spent on an elite
+        // that hits (2026-11-06, Majordomo: one Flamewaker Healer sheeped of four in the first minute)
+        int const score = (onTank ? (vp->GetVictim() == u ? 0 : 1) : 2) * 2 +
+            (KindHeals(static_cast<Creature const*>(u)) ? 1 : 0);
         if ((score > spareScore || (score == spareScore && hitters < spareHitters)) && CanTryToCastSpell(u, poly))
         {
             spareScore = score;
             spareHitters = hitters;
             spare = u;
+            spareBursts = bursts;
         }
     }
     uint32 const cap = std::max<uint32>(1u, (tanks + 1) / 2);
-    if (!spare || active <= cap || spareScore == 0)
+    if (!spare || (active <= cap && !spareBursts) || spareScore / 2 == 0)
         return false;
     if (!TrySpecSpell(spare, poly))
         return false;
+    {
+        std::lock_guard<std::mutex> guard(gPolyClaimLock);
+        gPolyClaims[spare->GetObjectGuid()] = std::make_pair(me->GetObjectGuid(), WorldTimer::getMSTime() + 2500);
+    }
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: polymorph %s (guid %u) - %u elites on the raid, %u tanks",
         me->GetName(), spare->GetName(), spare->GetGUIDLow(), active, tanks);
     return true;
@@ -2210,6 +3121,8 @@ bool AiBotAI::TrySpecBanishSpareElite()
     MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 35.0f);
     MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(nearby, check);
     Cell::VisitAllObjects(me, searcher, 35.0f);
+    if (OwnControlled(me, nearby, MECHANIC_BANISH))
+        return false;   // my banish holds; a new one would free it
     uint32 active = 0;
     Unit* spare = nullptr;
     int spareScore = -1;
@@ -2225,6 +3138,15 @@ bool AiBotAI::TrySpecBanishSpareElite()
             continue;   // already controlled
         ++active;
         if (static_cast<Creature*>(u)->IsWorldBoss())
+            continue;
+        // Never the one the raid is killing: a banish makes it immune and sends the damage dealers
+        // elsewhere (the loose one the raid peels is exactly the one "no tank holds").
+        uint32 hitters = 0;
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+            if (Player* m = itr->getSource())
+                if (m != me && m->IsAlive() && m->GetVictim() == u)
+                    ++hitters;
+        if (hitters >= 3 || u->GetHealthPercent() < 80.0f)
             continue;
         AiBotAI* holderAi = dynamic_cast<AiBotAI*>(vp->AI());
         bool const onTank = holderAi && holderAi->GetCombatActiveRole() == ROLE_TANK;

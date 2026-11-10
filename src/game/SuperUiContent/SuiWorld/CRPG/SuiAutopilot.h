@@ -20,6 +20,7 @@
 
 #include "Common.h"
 #include "ObjectGuid.h"
+#include <map>
 #include <string>
 
 class AiBotAI;
@@ -33,6 +34,8 @@ namespace SuiAutopilot
     void Disable(ObjectGuid leader);
     void DisableAll();
     void SetPaused(ObjectGuid leader, bool paused);
+    // Review stops (default on): pause after every boss fight and every wipe.
+    void SetReview(ObjectGuid leader, bool on);
     bool IsLeader(Player const* player);
     // The enabled, living, in-world leader of member's group (never member itself), or null.
     Player* LeaderFor(Player const* member);
@@ -40,6 +43,13 @@ namespace SuiAutopilot
     bool TickLeader(AiBotAI* ai);
     // True while the member's leader walks out to pull and back: the raid holds its camp.
     bool HoldForPull(Player const* member);
+    // A pull timed around a patrolling boss: where a member who is not a tank waits while the
+    // leader pulls (beside the camp, out of the cones the pack turns on the tanks there).
+    bool RearSpot(Player const* member, float& x, float& y, float& z);
+    // While the leader runs a pull timed around a patrolling boss (or a playbook lure) back to the
+    // camp, in combat or not: where the member stays instead of chasing (tanks at the camp, the rest
+    // at the rear spot). A Firewalker's aggro puts the whole zone in combat at once.
+    bool CampHold(Player const* member, float& x, float& y, float& z);
     // While the raid waits (rest, a patrol, a gather) and the leader stands still, members stack
     // within a few yards of it instead of spreading into a wide follow formation. 0 = does not
     // apply, 1 = in place (hold), 2 = move to (x, y, z).
@@ -53,6 +63,9 @@ namespace SuiAutopilot
     // cleared. If it respawns, save time and gm execute them").
     void NoteKill(Unit* killer, Unit* victim);
     std::string Status();
+    // Startup renumbering of instance ids (MapPersistentStateManager::PackInstances): cleared
+    // spawns follow their instance; those of instances that no longer exist are dropped.
+    void RemapInstances(std::map<uint32, uint32> const& oldToNew);
 }
 
 #endif

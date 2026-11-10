@@ -952,6 +952,10 @@ void Creature::Update(uint32 update_diff, uint32 diff)
                                         !m_motionMaster.GetCurrent()->IsReachable() &&
                                         !HasDistanceCasterMovement() && !GetCharmerOrOwnerGuid().IsPlayer() &&
                                         (!CanReachWithMeleeAutoAttack(GetVictim()) || !IsWithinLOSInMap(GetVictim())) &&
+                                        // [SUI] a victim within 5 yd is never "unreachable": Majordomo Executus teleports his own
+                                        // tank and evaded at 0.2 yd from it, re-summoning all eight adds beside the living ones
+                                        // (2026-11-09, attempt 71)
+                                        GetDistance(GetVictim()) > 5.0f &&
                                         !(GetVictim()->IsPlayer() && static_cast<Player*>(GetVictim())->GetCheatData()->IsInKnockBack());
                 }
             }

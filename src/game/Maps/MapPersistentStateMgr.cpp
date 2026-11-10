@@ -35,6 +35,7 @@
 #include "Group.h"
 #include "InstanceData.h"
 #include "ProgressBar.h"
+#include "SuiAutopilot.h"
 
 typedef MaNGOS::ClassLevelLockable<MapPersistentStateManager, std::mutex> MapPersistanceStateManagerLock;
 INSTANTIATE_SINGLETON_2(MapPersistentStateManager, MapPersistanceStateManagerLock);
@@ -830,9 +831,11 @@ void MapPersistentStateManager::PackInstances()
     bar.step();
 
     uint32 InstanceNumber = RESERVED_INSTANCES_LAST;
+    std::map<uint32, uint32> suiRemap;   // [AUTOPILOT] id before this startup -> id after
     // we do assume std::set is sorted properly on integer value
     for (const auto i : InstanceSet)
     {
+        suiRemap[i - RESERVED_INSTANCES_LAST] = InstanceNumber;
         if (i != InstanceNumber)
         {
             CharacterDatabase.BeginTransaction();
@@ -854,6 +857,9 @@ void MapPersistentStateManager::PackInstances()
 
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "");
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, ">> Instance numbers remapped, next instance id is %u", InstanceNumber);
+    // [AUTOPILOT] The autopilot's cleared spawns are keyed by instance id: follow the renumbering
+    // (2026-11-03: a fresh instance renumbered to 100 inherited September's instance-100 clears).
+    SuiAutopilot::RemapInstances(suiRemap);
 }
 
 void MapPersistentStateManager::ScheduleInstanceResets()

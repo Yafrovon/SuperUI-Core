@@ -106,6 +106,10 @@ struct IEngagementDoctrine
     // ever returns true; the default keeps Solo/Directed on the plain "no target" path.
     virtual bool HoldingForTeam() const { return false; }
 
+    // After MaintainTarget() returns nullptr in combat: true when that null means "stop hitting what
+    // you hit" (a kill order holds this bot off every add it could reach), not "keep your own victim".
+    virtual bool HoldsOffVictim() const { return false; }
+
     // Observability: echoed on STATE (`doctrine`), logged on every resolve swap.
     virtual char const* Name() const = 0;
 };

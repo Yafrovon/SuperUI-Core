@@ -2098,7 +2098,28 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
         // them and is topped from 95 % - and the rest heal the raid by plain percentage,
         // taking a tank only in an emergency (under 50 %). A target whose missing health is
         // already covered by heals other healers are casting is skipped.
-        bool const tankHealer = me->GetGUIDLow() % 5 < 2;
+        // While the raid itself is whole (fewer than three members off the tanks hurt) every healer is a
+        // tank healer: the raid healers topped up the few scratched damage dealers while the tanks died
+        // (2026-11-08, Majordomo: once his Healers were dead the Elites hit +48 % harder from Encouragement;
+        // three tanks died in 12 s with "healed 0 in last 8 s").
+        uint32 raidHurt = 0;
+        for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
+        {
+            Player* pMember = itr->getSource();
+            if (!pMember || pMember == me || !pMember->IsAlive() || pMember->GetMap() != me->GetMap() ||
+                pMember->GetHealthPercent() >= 80.0f || !me->IsWithinDistInMap(pMember, 40.0f))
+                continue;
+            bool held = false;
+            for (Unit* attacker : pMember->GetAttackers())
+                if (attacker && attacker->IsCreature() && attacker->GetVictim() == pMember)
+                {
+                    held = true;
+                    break;
+                }
+            if (!held)
+                ++raidHurt;
+        }
+        bool const tankHealer = me->GetGUIDLow() % 5 < 2 || raidHurt < 3;
         for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
         {
             Player* pMember = itr->getSource();

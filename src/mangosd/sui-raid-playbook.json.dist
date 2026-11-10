@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "_about": "Raid autopilot playbook (SuiRaidPlaybook.cpp): per-raid and per-boss DATA on top of the generic autopilot. Lives beside mangosd.conf as sui-raid-playbook.json (this .dist is the fallback). Re-read when it changes; no restart. A boss is never pulled while a boss before it in its raid's order is alive.",
+  "raids": {
+    "409": {
+      "name": "Molten Core",
+      "_order": "Magmadar before Garr: the Ancient Core Hounds around Garr's room respawn every 18 min until Magmadar is dead (mob_ancient_core_hound JustDied), and joined every Garr attempt on 2026-11-03.",
+      "order": [
+        {
+          "entry": 12118,
+          "name": "Lucifron"
+        },
+        {
+          "entry": 11982,
+          "name": "Magmadar"
+        },
+        {
+          "entry": 12259,
+          "name": "Gehennas"
+        },
+        {
+          "entry": 12057,
+          "name": "Garr"
+        },
+        {
+          "entry": 12056,
+          "name": "Baron Geddon"
+        },
+        {
+          "entry": 12264,
+          "name": "Shazzrah"
+        },
+        {
+          "entry": 11988,
+          "name": "Golemagg the Incinerator"
+        },
+        {
+          "entry": 12098,
+          "name": "Sulfuron Harbinger"
+        },
+        {
+          "entry": 12018,
+          "name": "Majordomo Executus"
+        },
+        {
+          "entry": 11502,
+          "name": "Ragnaros"
+        }
+      ]
+    }
+  },
+  "bosses": {
+    "_about": "Per boss entry: what its fight wants beyond the generic autopilot. lure = for a patrolling boss, the spot beside its walk where the leader waits for it to notice him (at); optional camp (used only when it is level with the lure, in its sight and walkable for the boss, else searched). killOrder = add entries in the order they die while this boss is in the fight (the first first); a sheeped add of an earlier kind than every awake one is woken and killed (the lowest guid first), the rest stay held. lure.clearance = how far every idle pack must stand from the lure (default 45 yd).",
+    "12056": {
+      "name": "Baron Geddon",
+      "lure": {
+        "at": [
+          680.0,
+          -806.0,
+          -209.0
+        ],
+        "why": "Geddon always runs (flags_extra 0x40): his 470 yd loop takes ~30 s and passes 4-30 yd from ten 3-4 elite packs; his clearest walk point is 32 yd from one. Timed pulls of the packs on his walk all failed (he is back in 10-20 s); this spot, where pack A stood (cleared), is 15-18 yd off his walk and 38 yd from the nearest live pack (Firewalker pack inside his north loop). 2026-11-04. The camp is searched around the lure (same level, in sight, a walk the boss can make).",
+        "clearance": 35.0,
+        "whyClearance": "2026-11-07: with 45 yd the Firewalker pack 39 yd from the lure always went first, timed; Geddon ran into four such pulls in an hour (39 dead each). 39 yd is far outside the 10 yd call for help and the packs' aggro reach."
+      }
+    },
+    "12018": {
+      "name": "Majordomo Executus",
+      "killOrder": [
+        11663,
+        11664
+      ],
+      "why": "Four Flamewaker Elites (immune to Polymorph) and four Flamewaker Healers (Shadow Bolt, Shadow Shock: an instant 20 yd burst; no heal) come together. The Healers are sheeped while the tanked Elites die; once half the adds are down the Healers turn immune to Polymorph (Immunity 21087, mechanic 17) and wake. 2026-11-06 (17 tries): Elites first killed all four twice (by 148 s), then the four awake Healers wiped the raid; Healers first (released one at a time) killed one Healer in 41-82 s while the released one ran loose - worse. 2026-11-07 evening, FIVE tanks (owner): Healers first again. Elites first now kills all four by 83 s with 39 alive, but the 4th add's death wakes the four Healers at once, immune to Polymorph, and their 20 yd Shadow Shocks killed 39 in 36 s. With five tanks every Elite is held, so the Healers die one at a time while the others sleep and the wake-up leaves tanked Elites. Same evening: Healers first lost three of three with five tanks (released Healers die at ~3k/s while four tanked Elites Blast Wave for 120 s, the healers run dry, the tanks die); back to Elites first, with the free tanks standing by the sleeping Healers before the last Elite dies. Then Elites first with tanks staged by the sleeping Healers: the sheeps lie within 20 yd of each other, so every staged tank took all four first Shadow Shocks (two dead in 2 s). Healers first again, now that the release, its reach and the healers mana potions work. Healers first with the fixed release: one attempt, the opening collapsed (the awake first Healer killed all eight melee in 12 s) - untested. Elites first stays the default: twice all four Elites dead by 78-90 s with 39 alive. 2026-11-08 (owner: Healers first, five tanks): Healers first, and a sheep is woken only when a tank is free (tanks > awake enemies), so the first Elite dies first, then the Healers one at a time on the freed tank; the fourth death then leaves one Polymorph-immune Healer and three tanked Elites. 2026-11-08 morning, 12 tries (15-26): with the free-tank gate, the tank waking the release itself and the death-order guard, Healers first killed up to five of the eight (E, H, E, H, H by 136 s); losses = tank deaths at 50-130 s (Elite melee and casts, tanks spread beyond heal reach) and slow kills (ranged cast ~40 %). Elites first with the same fixes: Elites by 165 s with 28 alive, then the wake-up wipe. Healers first stays the default."
+    }
+  }
+}

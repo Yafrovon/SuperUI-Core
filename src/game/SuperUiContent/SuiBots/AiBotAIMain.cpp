@@ -1417,6 +1417,21 @@ void AiBotAI::DoPartyFollow()
         return;
     }
 
+    // [AUTOPILOT] A pull timed around a patrolling boss: the raid waits beside the camp, the tanks at it.
+    {
+        float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+        if (SuiAutopilot::RearSpot(me, rx, ry, rz))
+        {
+            if (me->GetDistance(rx, ry, rz) > 2.5f)
+            {
+                if (!me->IsMoving() || me->GetMotionMaster()->GetCurrentMovementGeneratorType() == FOLLOW_MOTION_TYPE)
+                    me->GetMotionMaster()->MovePoint(0, rx, ry, rz, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            }
+            else
+                SuiStopFollowForHold();
+            return;
+        }
+    }
     // [AUTOPILOT] The raid holds its camp while the leader walks out to pull.
     if (SuiAutopilot::HoldForPull(me))
     {
@@ -1967,6 +1982,7 @@ void AiBotAI::UpdateAI(uint32 const diff)
         CB_HIT(me->GetGUIDLow(), "cpp-main: not in world or teleporting, tick skipped");
         return;
     }
+    UpdateOffTankDuty();
 
     // Finish walkability validation for a cross-continent PORT_HOME after PlayerBotAI above
     // completes the asynchronous worldport. The original far teleport uses a real hostile-spawn
@@ -2253,6 +2269,9 @@ void AiBotAI::UpdateAI(uint32 const diff)
     if (me->IsDead())
     {
         CB_HIT(me->GetGUIDLow(), "cpp-main: dead tick");
+        // [AUTOPILOT] A dead leader's fight is still recorded to its end (the raid fights on).
+        if (SuiAutopilot::IsLeader(me))
+            SuiAutopilot::TickLeader(this);
         if (!m_wasDead)
         {
             CB_HIT(me->GetGUIDLow(), "cpp-main: death detected, ghosting at corpse");
@@ -2512,6 +2531,17 @@ void AiBotAI::UpdateAI(uint32 const diff)
     if (MaintainRangedSpacing())
         return;
 
+    // [AUTOPILOT] A timed pull on its way back to the camp: a chase already running is turned into the
+    // wait at the camp (see ChaseInPlace).
+    if (me->IsInCombat() && !SuiAutopilot::IsLeader(me))
+    {
+        float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+        if (SuiAutopilot::CampHold(me, hx, hy, hz) &&
+            me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE &&
+            me->GetDistance(hx, hy, hz) > 3.0f)
+            me->GetMotionMaster()->MovePoint(0, hx, hy, hz, MOVE_PATHFINDING | MOVE_RUN_MODE);
+    }
+
     // [AUTOPILOT] The leader's drive (pick, walk out, pull, run back) runs ahead of the combat
     // handling below: a pull is in combat from the moment the pack notices the leader.
     if (SuiAutopilot::IsLeader(me) && SuiAutopilot::TickLeader(this))
@@ -2662,6 +2692,7 @@ void AiBotAI::UpdateAI(uint32 const diff)
 
     if (me->IsNonMeleeSpellCasted(false, false, true))
     {
+        TryLayOnHandsSave();
         CB_HIT(me->GetGUIDLow(), "cpp-main: casting, tick ends");
         return;
     }
@@ -3572,6 +3603,8 @@ void AiBotAI::UpdateAI(uint32 const diff)
             AttackStart(pFocus);
             return;
         }
+        if (m_doctrine->HoldsOffVictim())
+            return;   // held off by the kill order: no solo reselect of what it holds me off
 
         if (Unit* pNewVictim = SelectAttackTarget(pVictim))   // cb:fold decl-in-condition artifact, body probed
         {
@@ -3618,6 +3651,14 @@ void AiBotAI::UpdateAI(uint32 const diff)
                     me->GetName(), pVictim->GetName(), pFocus->GetName(), m_doctrine->Name());
                 return;
             }
+        }
+        // ...a null that means "hold off" stops the swing on the old victim too (see HoldsOffVictim)
+        else if (m_doctrine->HoldsOffVictim() && me->GetVictim())
+        {
+            me->AttackStop(false);
+            if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE)
+                StopMoving();
+            return;
         }
 
         if (MaintainTankFacing(pVictim))

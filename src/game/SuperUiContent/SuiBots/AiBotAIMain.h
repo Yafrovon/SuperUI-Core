@@ -757,6 +757,9 @@ public:
     Unit* ResolveRotationTarget(uint8 kind);    // 0=SELF 1=CURRENT_TARGET 2=LOWEST_HP_PARTY
     uint8 GetCombatSpecTab() const override;
     CombatBotRoles GetCombatActiveRole() const;
+    // a stopgap off-tank (counts only for what it holds); one tanking an ordered boss fight is a full tank
+    bool IsOffTankOnDuty() const { return m_offTank && !m_offTankBoss && me->IsInCombat(); }
+    bool IsBossOffTank() const { return m_offTank && m_offTankBoss && me->IsInCombat(); }
     bool HasUsableSpecCombat() const;
     bool HasFastCombatPolicy() const;
     bool UpdateSpecCombatAI();
@@ -794,9 +797,19 @@ public:
     // Creatures seen getting back up after falling (a pack that must die together).
     static void NoteRiser(uint32 entry);
     static bool IsKnownRiser(uint32 entry);
+    // A kind that multiplies (a summon whose summoner is its own kind - a Lava Spawn splitting):
+    // every one left alive becomes two, so it dies first, oldest first. Learned on sight, kept.
+    static void ObserveMultiplier(Unit const* mob);
+    static bool IsKnownMultiplier(uint32 entry);
     // Creatures seen healing themselves back to full after being brought low (not worth damage).
     static void ObserveRebound(Unit const* mob);
     static bool IsKnownRebounder(uint32 entry);
+    // The crowd-controlled add a boss's playbook kill order wants dead before every awake one (the
+    // lowest-guid of the earliest such kind): it may be woken and killed while the others stay held.
+    static Unit* PlaybookReleaseTarget(Player* me, bool* noFreeTank = nullptr);
+    static bool TankCanTaunt(Player* p);
+    static bool WasPlaybookReleased(Unit const* u);
+    static uint32 PlaybookReleaseAgeMs(Unit const* u);
     uint32 m_potionNextMs = 0;
     uint32 m_hazardNextMs = 0;
     uint32 m_hazardHoldUntil = 0;
@@ -809,12 +822,39 @@ public:
     // [TACTICS] The member holding the most dangerous enemies right now (a boss beats an elite
     // beats the rest; a tank role wins ties) - where the healers stand and look.
     Player* ActiveTank() const;
+    uint32 m_ccCastHoldLogMs = 0;
+    uint32 m_sleeperWatchLogMs = 0;
+    uint32 m_potionWhyLogMs = 0;
     uint32 m_rangedSpacingNextMs = 0;
+    ObjectGuid m_losRefusedGuid;       // the last target a cast of mine was refused for line of sight
+    uint32 m_losRefusedMs = 0;
+    uint32 m_sightLogMs = 0;
+    uint32 m_tankSheepLogMs = 0;
+    uint32 m_spacingHoldUntilMs = 0;   // a clear step that did not move me: hold and cast
+    float m_spacingFromX = 0.0f, m_spacingFromY = 0.0f;
+    uint8 m_spacingFutile = 0;
+    uint32 m_damageShieldLogMs = 0;
+    // [TACTICS] Off-tank on demand: a melee damage dealer with a taunt tanks while the fight is short of tanks.
+    void UpdateOffTankDuty();
+    bool m_offTank = false;
+    uint32 m_offTankShortSinceMs = 0;
+    uint32 m_offTankEnoughSinceMs = 0;
+    uint32 m_offTankLooseSinceMs = 0;
+    uint32 m_offTankFightMs = 0;   // when this fight began for the off-tank duty
+    bool m_offTankBoss = false;    // on duty for a whole boss fight whose adds die in an order
+    uint32 m_tankLostLogMs = 0;
+    uint32 m_spacingWhyLogMs = 0;
+    uint32 m_interruptLogMs = 0;
+    uint32 m_holdForTankLogMs = 0;
+    mutable ObjectGuid m_dealtTank;
+    mutable uint32 m_dealtUntilMs = 0;
     bool m_meleeSteppedOut = false;
     bool m_pulseSteppedOut = false;   // a ranged damage dealer healing up outside a burst circle
     uint32 m_tankFacingNextMs = 0;
     Unit* SelectSafeSpecAdd(Unit const* primary) const;
     bool TrySpecInterrupt(Unit* target, std::initializer_list<uint32> spellIds);
+    bool TrySpecInterruptNearby(std::initializer_list<uint32> spellIds, float range);
+    bool TryLayOnHandsSave();
     bool TrySpecTaunt(Unit* target);
     bool CommandSpecPet(Unit* target, bool mendHunterPet);
     bool UpdateSpecCombatWarrior(uint8 spec);

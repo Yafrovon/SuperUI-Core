@@ -788,6 +788,18 @@ bool AiBotAI::HandlePullRetreat()
 // both further out on a creature of long reach. Every melee chase goes through here.
 static void ChaseInPlace(Player* me, Unit* pVictim, CombatBotRoles role)
 {
+    // [AUTOPILOT] The leader is bringing a timed pull back to the camp: wait there for it, do not run
+    // out to it (2026-11-04: a Firewalker's aggro put the raid in combat and every tank charged to the
+    // pull spot 13 yd from Baron Geddon's walk - he came by at +18 s).
+    {
+        float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+        if (SuiAutopilot::CampHold(me, hx, hy, hz))
+        {
+            if (me->GetDistance(hx, hy, hz) > 3.0f)
+                me->GetMotionMaster()->MovePoint(0, hx, hy, hz, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            return;
+        }
+    }
     // Melee damage dealers go behind - unless the creature is a kind seen breathing a cone,
     // which sweeps its tail too: its flank then, behind the shoulder (2026-09-25, Onyxia:
     // Tail Sweep 106k).
@@ -810,6 +822,26 @@ static void ChaseInPlace(Player* me, Unit* pVictim, CombatBotRoles role)
     if (role == ROLE_TANK && pVictim->IsCreature() && pVictim->GetCombatReach() >= 8.0f)
         offset = std::min(pVictim->GetCombatReach() * 0.35f, 7.0f);
     me->GetMotionMaster()->MoveChase(pVictim, offset, angle);
+}
+
+// A caster's chase to 25 yd, held at the camp like the melee one (ChaseInPlace).
+static void RangedChaseInPlace(Player* me, Unit* pVictim)
+{
+    float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+    if (SuiAutopilot::CampHold(me, hx, hy, hz))
+    {
+        if (me->GetDistance(hx, hy, hz) > 3.0f)
+            me->GetMotionMaster()->MovePoint(0, hx, hy, hz, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return;
+    }
+    // Out of a known cone's reach (+5 yd), within spell range: a Flameguard's 20 yd Cone of Fire reaches
+    // 24 yd, and every turn of it moved the casters standing at 25 yd (2026-11-04: 418 cone steps, 44 %
+    // of the casters' time moving, 925 damage a second from seventeen of them - the pack never died).
+    float dist = 25.0f;
+    if (pVictim->IsCreature())
+        if (float const cone = SuiRaidTelemetry::EntryConeRadius(pVictim->GetEntry()))
+            dist = std::min(29.0f, std::max(dist, cone + pVictim->GetObjectBoundingRadius() + 5.0f));
+    me->GetMotionMaster()->MoveChase(pVictim, dist);
 }
 
 bool AiBotAI::AttackStart(Unit* pVictim)
@@ -1559,7 +1591,7 @@ void AiBotAI::UpdateInCombatAI_Hunter()
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
             && me->GetDistance(pVictim) > 30.0f)
         {   // cb:fold rotation rung, outcome probed at cast
-            me->GetMotionMaster()->MoveChase(pVictim, 25.0f);
+            RangedChaseInPlace(me, pVictim);
         }
 
         if (me->HasSpell(AB_SPELL_AUTO_SHOT) &&
@@ -1608,7 +1640,7 @@ void AiBotAI::UpdateInCombatAI_Hunter()
                 return;   // cb:fold rotation rung, outcome probed at cast
         }
 
-        if (m_spells.hunter.pMultiShot &&
+        if (m_spells.hunter.pMultiShot && CanUseSpecAoE(pVictim, 10.0f, 1) &&
             CanTryToCastSpell(pVictim, m_spells.hunter.pMultiShot))
         {   // cb:fold rotation rung, outcome probed at cast
             if (DoCastSpell(pVictim, m_spells.hunter.pMultiShot) == SPELL_CAST_OK)
@@ -1765,7 +1797,7 @@ void AiBotAI::UpdateInCombatAI_Mage()
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
             && me->GetDistance(pVictim) > 30.0f)
         {   // cb:fold rotation rung, outcome probed at cast
-            me->GetMotionMaster()->MoveChase(pVictim, 25.0f);
+            RangedChaseInPlace(me, pVictim);
         }
         else if (pVictim->CanReachWithMeleeAutoAttack(me) &&
                 (pVictim->GetVictim() == me) &&
@@ -2143,7 +2175,7 @@ void AiBotAI::UpdateInCombatAI_Priest()
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
             && me->GetDistance(pVictim) > 30.0f)
         {   // cb:fold rotation rung, outcome probed at cast
-            me->GetMotionMaster()->MoveChase(pVictim, 25.0f);
+            RangedChaseInPlace(me, pVictim);
         }
 
         if (me->GetShapeshiftForm() == FORM_NONE)
@@ -2331,7 +2363,7 @@ void AiBotAI::UpdateInCombatAI_Warlock()
         if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE
             && me->GetDistance(pVictim) > 30.0f)
         {   // cb:fold rotation rung, outcome probed at cast
-            me->GetMotionMaster()->MoveChase(pVictim, 25.0f);
+            RangedChaseInPlace(me, pVictim);
         }
 
         if (m_spells.warlock.pShadowBolt &&
@@ -2815,7 +2847,7 @@ void AiBotAI::UpdateInCombatAI_Rogue()
                 DoCastSpell(me, m_spells.rogue.pColdBlood);
             }
 
-            if (m_spells.rogue.pBladeFlurry &&
+            if (m_spells.rogue.pBladeFlurry && CanUseSpecAoE(pVictim, 8.0f, 1) &&
                 CanTryToCastSpell(me, m_spells.rogue.pBladeFlurry))
             {   // cb:fold rotation rung, outcome probed at cast
                 if (DoCastSpell(me, m_spells.rogue.pBladeFlurry) == SPELL_CAST_OK)
@@ -3288,7 +3320,7 @@ void AiBotAI::UpdateInCombatAI_Druid()
                 if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == IDLE_MOTION_TYPE &&
                     me->GetDistance(pVictim) > 30.0f)
                 {   // cb:fold rotation rung, outcome probed at cast
-                    me->GetMotionMaster()->MoveChase(pVictim, 25.0f);
+                    RangedChaseInPlace(me, pVictim);
                 }
                 else if (pVictim->CanReachWithMeleeAutoAttack(me) &&
                         (pVictim->GetVictim() == me) &&
@@ -3361,10 +3393,68 @@ void AiBotAI::UpdateInCombatAI_Druid()
 // A tank's step must keep sight of its mob and be walkable in a short path (2026-09-25: a facing
 // step pressed Sulfuron's priest's tank into rock - 1 yd apart without sight for 25 s, and the
 // priest evaded "target unreachable", resetting the whole encounter).
+namespace { bool NearIdleHostile(Player* me, float x, float y); bool Molten(Player* me, float x, float y, float z); }
+
+// Standing at (x, y, z), do I see `other`? Measured the way the game measures a cast: from my own eye
+// height there to its chest (+1 yd). `other->IsWithinLOS(x, y, z + 1.5f)` looked at a point 3.5 yd up
+// (the call adds 2 yd of its own) and passed spots below a ledge (2026-11-06, Majordomo: healers below
+// his platform step "closed in" to 20 yd of the tank again and again, still without sight; the leader
+// died twice with no heal in 8 s).
+static bool SeesFrom(Player const* me, float x, float y, float z, Unit const* other)
+{
+    return me->IsWithinLOSAtPosition(x, y, z, other->GetPositionX(), other->GetPositionY(), other->GetPositionZ(), true, 1.0f);
+}
+
 static bool TankStepOk(Player* me, Unit* mob, float x, float y, float z)
 {
-    if (!mob->IsWithinLOS(x, y, z + 1.5f))
+    if (!SeesFrom(me, x, y, z, mob))
         return false;
+    // ...and never into the reach of a pack not in the fight: the mob follows its tank (2026-11-05:
+    // a separation step took a Flameguard's tank 20 yd from the next pack's Lava Reaver - all 39 dead).
+    if (NearIdleHostile(me, x, y))
+        return false;
+    // ...and never out of every healer's sight: separation steps of 1-3 yd each walked a tank down
+    // Majordomo's terrace until no healer saw him, and he died with nothing healed in 8 s (2026-11-08).
+    if (Group* group = me->GetGroup())
+    {
+        bool anyHealer = false, seen = false;
+        for (GroupReference* itr = group->GetFirstMember(); itr && !seen; itr = itr->next())
+        {
+            Player* h = itr->getSource();
+            AiBotAI const* hai = h && h != me && h->IsAlive() && h->IsInMap(me) ? dynamic_cast<AiBotAI const*>(h->AI()) : nullptr;
+            if (!hai || hai->GetCombatActiveRole() != ROLE_HEALER || !h->IsWithinDist3d(x, y, z, 60.0f))
+                continue;
+            anyHealer = true;
+            seen = h->GetDistance(x, y, z) <= 38.0f && SeesFrom(me, x, y, z, h);
+        }
+        if (anyHealer && !seen)
+            return false;
+        // ...nor further than 35 yd from the healers' middle, unless the step brings it closer: separation
+        // steps spread five held mobs over 90 yd, and the healers dealt to a tank 60-70 yd out never reached
+        // it (2026-11-08, Majordomo: a paladin tank held an Elite 52-73 yd from eight of nine healers and
+        // died with one priest in range).
+        float hx = 0.0f, hy = 0.0f;
+        uint32 hn = 0;
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+        {
+            Player* h = itr->getSource();
+            AiBotAI const* hai = h && h != me && h->IsAlive() && h->IsInMap(me) ? dynamic_cast<AiBotAI const*>(h->AI()) : nullptr;
+            if (!hai || hai->GetCombatActiveRole() != ROLE_HEALER || !me->IsWithinDistInMap(h, 80.0f))
+                continue;
+            hx += h->GetPositionX();
+            hy += h->GetPositionY();
+            ++hn;
+        }
+        if (hn >= 2)
+        {
+            hx /= hn;
+            hy /= hn;
+            float const there = std::sqrt((x - hx) * (x - hx) + (y - hy) * (y - hy));
+            float const here = me->GetDistance2d(hx, hy);
+            if (there > 35.0f && there > here)   // (28 kept a Healer stacked on Majordomo, both tanks in its Shock)
+                return false;
+        }
+    }
     PathInfo path(me);
     path.calculate(x, y, z, false);
     if (path.getPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE))
@@ -3378,39 +3468,50 @@ static bool TankStepOk(Player* me, Unit* mob, float x, float y, float z)
 
 bool AiBotAI::MaintainTankFacing(Unit* victim)
 {
-    if (!victim || !victim->IsCreature() || GetCombatActiveRole() != ROLE_TANK ||
-        victim->GetVictim() != me || !victim->IsAlive())
+    if (!victim || !victim->IsCreature() || GetCombatActiveRole() != ROLE_TANK || !victim->IsAlive())
         return false;
     // After a facing step the tank stands on its point; if the mob drifts out of reach,
-    // resume the chase rather than standing there swinging at air.
+    // resume the chase rather than standing there swinging at air. Also when the mob has turned
+    // on someone else: a threat wipe sends it to a healer, and its tank must follow it to taunt
+    // (2026-11-08, Majordomo: his teleport resets his threat every 20-30 s; his tank stood 30 s
+    // on its facing point while he walked 47 yd and killed two priests).
     if (!me->IsMoving() && !me->CanReachWithMeleeAutoAttack(victim) &&
         me->GetMotionMaster()->GetCurrentMovementGeneratorType() != CHASE_MOTION_TYPE)
     {
+        if (victim->GetVictim() != me && WorldTimer::getMSTime() >= m_tankLostLogMs)
+        {
+            m_tankLostLogMs = WorldTimer::getMSTime() + 5000;
+            Unit* on = victim->GetVictim();
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: %s turned on %s - chases it again (%.0f yd, motion %u)",
+                me->GetName(), victim->GetName(), on ? on->GetName() : "nobody", me->GetDistance(victim),
+                uint32(me->GetMotionMaster()->GetCurrentMovementGeneratorType()));
+        }
         ChaseInPlace(me, victim, ROLE_TANK);
-        return true;
+        if (me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE || victim->GetVictim() == me)
+            return true;
     }
+    if (victim->GetVictim() != me)
+        return false;
     uint32 const now = WorldTimer::getMSTime();
     if (now < m_tankFacingNextMs || me->IsMoving() || me->IsNonMeleeSpellCasted(false))
         return false;
     Group* group = me->GetGroup();
     if (!group)
         return false;
-    // A kind that pulses around itself and has never breathed forward gains nothing from being
-    // turned, and every turn walks the fight away from healers kept outside its circle
-    // (2026-09-25: Baron Geddon's tank died with the healers 42-83 yd away).
-    if (SuiRaidTelemetry::EntryPulseRadius(victim->GetEntry()) > 0.0f &&
-        SuiRaidTelemetry::EntryConeRadius(victim->GetEntry()) <= 0.0f)
-        return false;
-
     // Two held mobs side by side double every point-blank area hit on the melee between them
     // (two Molten Giants' Smash). A tank whose mob stands within 12 yd of a mob another tank
-    // holds walks its own a few steps further away; the mob follows its victim.
+    // holds walks its own a few steps further away; the mob follows its victim. Two bursters are
+    // taken out of each other's circle (2026-11-07, Majordomo: four tanks held the four woken Healers
+    // within 10 yd of each other, each tank took all four Shadow Shocks and died in 9-14 s).
+    float const myPulse = SuiRaidTelemetry::EntryPulseRadius(victim->GetEntry());
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
     {
         Player* other = itr->getSource();
         Unit* otherMob = other && other != me && other->IsAlive() ? other->GetVictim() : nullptr;
-        if (!otherMob || otherMob == victim || otherMob->GetVictim() != other ||
-            !IsSpecAoETankHolder(other) || !otherMob->IsWithinDistInMap(victim, 12.0f))
+        if (!otherMob || otherMob == victim || otherMob->GetVictim() != other || !IsSpecAoETankHolder(other))
+            continue;
+        float const apart = std::max(12.0f, std::max(myPulse, SuiRaidTelemetry::EntryPulseRadius(otherMob->GetEntry())) + 4.0f);
+        if (!otherMob->IsWithinDistInMap(victim, apart))
             continue;
         float ox = victim->GetPositionX() - otherMob->GetPositionX(), oy = victim->GetPositionY() - otherMob->GetPositionY();
         float const olen = std::sqrt(ox * ox + oy * oy);
@@ -3424,18 +3525,99 @@ bool AiBotAI::MaintainTankFacing(Unit* victim)
             ox /= olen;
             oy /= olen;
         }
-        // Only the tank with the higher guid moves, so the two do not dance around each other.
-        if (other->GetGUIDLow() > me->GetGUIDLow())
+        // Only one of the two moves, so they do not dance around each other: the one whose mob has the
+        // smaller circle (a burster dragged along sweeps its circle over the melee and healers), the higher
+        // guid when they match (2026-11-08, Majordomo: the guid alone made the paladin tank walk every time).
+        float const otherPulse = SuiRaidTelemetry::EntryPulseRadius(otherMob->GetEntry());
+        if (myPulse > otherPulse + 0.5f || (std::fabs(myPulse - otherPulse) <= 0.5f && other->GetGUIDLow() > me->GetGUIDLow()))
             break;
-        float x = me->GetPositionX() + ox * 8.0f, y = me->GetPositionY() + oy * 8.0f, z = me->GetPositionZ();
-        ReGroundZ(x, y, z, "tank-separation");
-        if (std::fabs(z - me->GetPositionZ()) > 4.0f || !TankStepOk(me, victim, x, y, z))
-            break;
-        m_tankFacingNextMs = now + 2500;
-        CB_HIT(me->GetGUIDLow(), "cpp-combat: tank separating its mob from another tank's");
-        me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
-        return true;
+        for (float turn : { 0.0f, 0.785f, -0.785f, 1.571f, -1.571f })
+        {
+            float const c = std::cos(turn), sn = std::sin(turn);
+            float const ux = ox * c - oy * sn, uy = ox * sn + oy * c;
+            float x = me->GetPositionX() + ux * 8.0f, y = me->GetPositionY() + uy * 8.0f, z = me->GetPositionZ();
+            ReGroundZ(x, y, z, "tank-separation");
+            if (std::fabs(z - me->GetPositionZ()) > 4.0f || Molten(me, x, y, z) || !TankStepOk(me, victim, x, y, z))
+                continue;
+            m_tankFacingNextMs = now + 2500;
+            CB_HIT(me->GetGUIDLow(), "cpp-combat: tank separating its mob from another tank's");
+            if (myPulse > 0.0f)
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: takes %s out of %s's circle (%.0f yd apart, wants %.0f)",
+                    me->GetName(), victim->GetName(), otherMob->GetName(), victim->GetDistance(otherMob), apart);
+            me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            return true;
+        }
+        break;
     }
+    // The fight is taken away from sleeping bursters: everyone who stands by a held mob stands by the sheeps
+    // too, and at the wake-up nobody can get out of their circles in time (2026-11-09, Majordomo attempt 83:
+    // the four sheeped Healers lay among the casters by the last Elite; 11 s of clear steps from 0-10 yd, three
+    // dead at the wake-up and the Healers loose on the rest). A held mob within a sheep's circle + 8 yd walks
+    // 8 yd away from the sheeps' middle.
+    if (!(victim->IsCreature() && static_cast<Creature*>(victim)->IsWorldBoss()))
+    {
+        std::list<Unit*> around;
+        me->GetEnemyListInRadiusAround(victim, 40.0f, around);
+        float sx = 0.0f, sy = 0.0f;
+        uint32 near = 0;
+        float worst = 0.0f;
+        for (Unit* u : around)
+        {
+            if (!u || u == victim || !u->IsCreature() || !u->IsAlive() || !u->HasBreakableByDamageCrowdControlAura())
+                continue;
+            float const pr = SuiRaidTelemetry::EntryPulseRadius(u->GetEntry());
+            if (pr < 18.0f)
+                continue;
+            float const inside = pr + 8.0f - victim->GetDistance(u);
+            if (inside <= 0.0f)
+                continue;
+            sx += u->GetPositionX();
+            sy += u->GetPositionY();
+            ++near;
+            worst = std::max(worst, inside);
+        }
+        if (near)
+        {
+            sx /= near;
+            sy /= near;
+            float ox = victim->GetPositionX() - sx, oy = victim->GetPositionY() - sy;
+            float const olen = std::sqrt(ox * ox + oy * oy);
+            if (olen < 0.5f)
+            {
+                ox = std::cos(me->GetOrientation());
+                oy = std::sin(me->GetOrientation());
+            }
+            else
+            {
+                ox /= olen;
+                oy /= olen;
+            }
+            for (float turn : { 0.0f, 0.785f, -0.785f, 1.571f, -1.571f })
+            {
+                float const c = std::cos(turn), sn = std::sin(turn);
+                float const ux = ox * c - oy * sn, uy = ox * sn + oy * c;
+                float x = me->GetPositionX() + ux * 8.0f, y = me->GetPositionY() + uy * 8.0f, z = me->GetPositionZ();
+                ReGroundZ(x, y, z, "tank-sheep-clear");
+                if (std::fabs(z - me->GetPositionZ()) > 4.0f || Molten(me, x, y, z) || !TankStepOk(me, victim, x, y, z))
+                    continue;
+                m_tankFacingNextMs = now + 2500;
+                if (now >= m_tankSheepLogMs)
+                {
+                    m_tankSheepLogMs = now + 5000;
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: takes %s away from %u sleeping burster(s) (%.0f yd inside)",
+                        me->GetName(), victim->GetName(), near, worst);
+                }
+                me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                return true;
+            }
+        }
+    }
+    // A kind that pulses around itself and has never breathed forward gains nothing from being
+    // turned, and every turn walks the fight away from healers kept outside its circle
+    // (2026-09-25: Baron Geddon's tank died with the healers 42-83 yd away).
+    if (SuiRaidTelemetry::EntryPulseRadius(victim->GetEntry()) > 0.0f &&
+        SuiRaidTelemetry::EntryConeRadius(victim->GetEntry()) <= 0.0f)
+        return false;
 
     float cx = 0.0f, cy = 0.0f;
     uint32 count = 0;
@@ -3576,6 +3758,27 @@ namespace
         return 0.0f;
     }
 
+    // A trash creature's pulse that hits for under a quarter of my health is healed through, not run
+    // from (2026-11-05: a Flameguard's Fire Shield, 250 every 2 s, sent its tank "out of the fire"
+    // every 2 s; the Flameguard followed and swung its Cone of Fire through the healers). The hit is
+    // the biggest one seen from its kind, or the listed damage of the spell its aura fires. A world
+    // boss's pulse always counts: Baron Geddon's Inferno is scripted and ramps from small ticks.
+    bool LightPulse(Player const* me, Unit const* u)
+    {
+        if (!u->IsCreature() || static_cast<Creature const*>(u)->IsWorldBoss())
+            return false;
+        uint32 hit = SuiRaidTelemetry::EntryBurstMaxHit(u->GetEntry());
+        for (auto const& entry : u->GetSpellAuraHolderMap())
+            if (SpellAuraHolder const* holder = entry.second)
+                for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                    if (holder->GetSpellProto()->EffectApplyAuraName[i] == SPELL_AURA_PERIODIC_TRIGGER_SPELL)
+                        if (SpellEntry const* trig = sSpellMgr.GetSpellEntry(holder->GetSpellProto()->EffectTriggerSpell[i]))
+                            for (uint8 k = 0; k < MAX_EFFECT_INDEX; ++k)
+                                if (trig->Effect[k] == SPELL_EFFECT_SCHOOL_DAMAGE)
+                                    hit = std::max<uint32>(hit, uint32(std::max(0, trig->EffectBasePoints[k] + trig->EffectDieSides[k])));
+        return hit > 0 && hit * 4 < me->GetMaxHealth();
+    }
+
     // Hostile damaging areas on the ground near me, from the live objects and their spell data only
     // (a rain of fire, a burning patch, a trap): no spell, creature or encounter is named.
     void CollectGroundHazards(Player* me, std::vector<GroundHazard>& out)
@@ -3650,6 +3853,20 @@ namespace
                 continue;
             out.push_back({go->GetPositionX(), go->GetPositionY(), std::max(float(info->trap.radius), radius) + 1.5f});
         }
+        // A creature about to die that bursts as it does (a Firesworn's eruption, 4k fire in 15 yd
+        // against 2.7k-health rogues - 2026-11-03, nine dead to it on Garr): its circle is fire already
+        // below a fifth of its health. Everyone but the one holding it steps out; the ranged finish it.
+        {
+            std::list<Unit*> foes;
+            MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, range);
+            MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(foes, check);
+            Cell::VisitAllObjects(me, searcher, range);
+            for (Unit* u : foes)
+                if (u->IsCreature() && u->IsAlive() && u->IsInCombat() && u->GetHealthPercent() <= 20.0f &&
+                    u->GetVictim() != me)
+                    if (float const r = SuiRaidTelemetry::EntryDeathBurstRadius(u->GetEntry()))
+                        out.push_back({u->GetPositionX(), u->GetPositionY(), r + 2.0f});
+        }
         // Impacts forecast from a chain of fixed-spot spells (a breath across a room).
         {
             std::vector<std::tuple<float, float, float>> fc;
@@ -3672,10 +3889,13 @@ namespace
                 me->GetGroup()->IsMember(u->GetObjectGuid());
             if (!enemy && !member)
                 continue;
-            // An area around a unit reaches from its edge, not its centre: a big body (a boss) adds
-            // its own size (2026-09-25: bots stepped to 22 yd of Baron Geddon's centre and still
-            // burned in his 20 yd Inferno).
-            float const edge = enemy ? 1.5f : 2.0f;   // an area reaches from the centre (+ our size, + margin)
+            // An area around a unit reaches from its edge to mine: the server's area search adds both
+            // bodies' sizes to the radius (2026-09-25: bots stepped to 22 yd of Baron Geddon's centre
+            // and still burned in his 20 yd Inferno; 2026-11-06: a 1.5 yd margin with no sizes sent
+            // three healers "out of the fire" to 21-22 yd of him - dead to its last 5000 tick).
+            float const edge = enemy ? u->GetObjectBoundingRadius() + me->GetObjectBoundingRadius() + 1.5f : 2.0f;
+            if (enemy && LightPulse(me, u))
+                continue;
             if (float const r = PulsingAreaRadius(u, member))
                 out.push_back({u->GetPositionX(), u->GetPositionY(), r + edge});
             else if (enemy)
@@ -3696,21 +3916,58 @@ namespace
     // Core Hound pack beside Lucifron, and Lucifron joined).
     void CollectIdleHostiles(Player* me, float range, std::vector<GroundHazard>& out)
     {
+        // A patrolling boss's walk counts wherever on it he is now (2026-11-04: with Baron Geddon at the
+        // far end of his loop his walk beside the fight was "clear"; a healer dodging a cone stood on it
+        // and he came round 10 s later): bosses are searched out to 320 yd, everything else to `range`.
+        float const wide = std::max(range, 320.0f);
         std::list<Creature*> near;
-        MaNGOS::AnyUnitInObjectRangeCheck check(me, range);
+        MaNGOS::AnyUnitInObjectRangeCheck check(me, wide);
         MaNGOS::CreatureListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(near, check);
-        Cell::VisitGridObjects(me, searcher, range);
+        Cell::VisitGridObjects(me, searcher, wide);
         for (Creature* c : near)
             if (c->IsAlive() && !c->IsInCombat() && !c->IsTotem() && !c->IsCivilian() &&
-                c->GetCreatureType() != CREATURE_TYPE_CRITTER && c->IsHostileTo(me))
+                c->GetCreatureType() != CREATURE_TYPE_CRITTER && c->IsHostileTo(me) &&
+                (me->IsWithinDistInMap(c, range) ||
+                 (c->IsWorldBoss() && c->GetDefaultMovementType() == WAYPOINT_MOTION_TYPE)))
             {
-                out.push_back({c->GetPositionX(), c->GetPositionY(), 25.0f});
-                // A patrol's whole route is its reach (it walks back into the fight).
+                // an elite sees further than the 20 yd it is credited with once the raid spreads round it
+                out.push_back({c->GetPositionX(), c->GetPositionY(), c->IsElite() ? 28.0f : 25.0f});
+                // A wanderer's reach is its whole wander circle, not where it stands this second
+                // (2026-11-06: a mage's cone step kept 28 yd off Shazzrah; he wandered 20 yd toward
+                // him, aggroed at 18 yd and joined a Lava Reaver pack's fight - all 39 dead).
+                if (c->GetDefaultMovementType() == RANDOM_MOTION_TYPE && c->GetWanderDistance() > 0.0f)
+                {
+                    float hx, hy, hz;
+                    c->GetRespawnCoord(hx, hy, hz);
+                    out.push_back({hx, hy, (c->IsElite() ? 28.0f : 25.0f) + c->GetWanderDistance()});
+                }
+                // A patrol's whole route is its reach (it walks back into the fight): sampled every 5 yd,
+                // not only at its waypoints (2026-11-04: Baron Geddon runs his loop in ~30 s; healers
+                // stepping out of a cone stood 21 yd from his walk between two waypoints and he took them).
                 if (c->GetDefaultMovementType() == WAYPOINT_MOTION_TYPE && c->HasStaticDBSpawnData())
                     if (WaypointPath const* path = sWaypointMgr.GetDefaultPath(c->GetEntry(), c->GetDBTableGUIDLow()))
+                    {
+                        float const r = c->IsWorldBoss() ? 26.0f : 22.0f;
+                        WaypointNode const* prev = nullptr;
                         for (auto const& node : *path)
-                            if (me->GetDistance2d(node.second.x, node.second.y) < range)
-                                out.push_back({node.second.x, node.second.y, 22.0f});
+                        {
+                            WaypointNode const& n = node.second;
+                            if (prev)
+                            {
+                                float const dx = n.x - prev->x, dy = n.y - prev->y;
+                                float const len = std::sqrt(dx * dx + dy * dy);
+                                for (float s = 5.0f; s < len; s += 5.0f)
+                                {
+                                    float const x = prev->x + dx * s / len, y = prev->y + dy * s / len;
+                                    if (me->GetDistance2d(x, y) < range + r)
+                                        out.push_back({x, y, r});
+                                }
+                            }
+                            if (me->GetDistance2d(n.x, n.y) < range + r)
+                                out.push_back({n.x, n.y, r});
+                            prev = &n;
+                        }
+                    }
             }
     }
 
@@ -3730,6 +3987,15 @@ namespace
         for (size_t k = 1; k < pts.size(); ++k)
             len += (pts[k] - pts[k - 1]).length();
         return len <= me->GetDistance(x, y, z) * slack + 5.0f;
+    }
+
+    bool InHazard(std::vector<GroundHazard> const& hazards, float x, float y);
+
+    bool NearIdleHostile(Player* me, float x, float y)
+    {
+        std::vector<GroundHazard> idle;
+        CollectIdleHostiles(me, 60.0f, idle);
+        return InHazard(idle, x, y);
     }
 
     bool InHazard(std::vector<GroundHazard> const& hazards, float x, float y)
@@ -3829,6 +4095,7 @@ bool AiBotAI::AvoidGroundHazard()
         if (me->IsNonMeleeSpellCasted(false))
             me->InterruptNonMeleeSpells(false);
         m_repositionUntilMs = now + bombMs + 500;
+        SuiRaidTelemetry::OnReposition(me, "bomb");
         if (Player* anchor = FindEscortBoss())
         {
             m_hazardHoldUntil = now + bombMs + 1000;
@@ -3858,10 +4125,10 @@ bool AiBotAI::AvoidGroundHazard()
             if (foe->IsCreature() && foe->IsAlive())
                 if (float const pr = SuiRaidTelemetry::EntryPulseRadius(foe->GetEntry()))
                 {
-                    uint32 const age = SuiRaidTelemetry::PulseAge(foe);
+                    uint32 const age = LightPulse(me, foe) ? 0u : SuiRaidTelemetry::PulseAge(foe);
                     if (age >= 17500 && age <= 30000)
                         hazards.push_back({foe->GetPositionX(), foe->GetPositionY(),
-                            pr + 1.5f});
+                            pr + foe->GetObjectBoundingRadius() + me->GetObjectBoundingRadius() + 1.5f});
                 }
     bool const molten = Molten(me, me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
     if (!molten && (hazards.empty() || !InHazard(hazards, me->GetPositionX(), me->GetPositionY())))
@@ -4005,7 +4272,7 @@ bool AiBotAI::AvoidGroundHazard()
     }
     if (me->IsNonMeleeSpellCasted(false))
         me->InterruptNonMeleeSpells(false);
-    CB_HIT(me->GetGUIDLow(), "cpp-combat: stepping out of a ground hazard"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+    CB_HIT(me->GetGUIDLow(), "cpp-combat: stepping out of a ground hazard"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000; SuiRaidTelemetry::OnReposition(me, "hazard");
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: out of the %s -> (%.1f, %.1f)", me->GetName(),
         molten ? "lava" : "fire", bestX, bestY);
     me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
@@ -4060,6 +4327,7 @@ bool AiBotAI::AvoidFrontalCone()
                     me->InterruptNonMeleeSpells(false);
                 m_coneNextMs = now + 2000;
                 m_repositionUntilMs = now + 3000;
+                SuiRaidTelemetry::OnReposition(me, "breath");
                 sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: off the line of %s's breath -> (%.1f, %.1f)",
                     me->GetName(), u->GetName(), x, y);
                 me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
@@ -4085,7 +4353,11 @@ bool AiBotAI::AvoidFrontalCone()
         // cone may sweep its tail too (the same cone data, behind it), so its back is no place
         // either - the sides are (2026-09-25, Onyxia: Tail Sweep 96k on the melee behind her).
         bool const inFront = u->HasInArc(me, float(M_PI) * 7.0f / 9.0f);
-        bool const behind = !u->HasInArc(me, float(M_PI) * 11.0f / 9.0f);   // within 70 degrees of her back
+        // ...but only a dragon-sized body has a tail to sweep: a hound's back is the healers' place
+        // (2026-11-05, Magmadar: front and back both closed left a 40-degree wedge each side; every
+        // healer dodged "out of the front" every 3.5 s, cast 43 % of the fight, the tanks died).
+        bool const behind = u->GetCombatReach() >= 15.0f &&
+            !u->HasInArc(me, float(M_PI) * 11.0f / 9.0f);   // within 70 degrees of her back
         if (d > reach || !(inFront || behind))
             continue;
         // A heal or a shot already on its way is finished unless the breath is being cast.
@@ -4113,7 +4385,7 @@ bool AiBotAI::AvoidFrontalCone()
             float x = u->GetPositionX() + keep * std::cos(ang), y = u->GetPositionY() + keep * std::sin(ang);
             float z = u->GetPositionZ();
             me->UpdateAllowedPositionZ(x, y, z);
-            if (std::fabs(z - u->GetPositionZ()) > 6.0f || !u->IsWithinLOS(x, y, z + 1.5f) ||
+            if (std::fabs(z - u->GetPositionZ()) > 6.0f || !SeesFrom(me, x, y, z, u) ||
                 Molten(me, x, y, z) || InHazard(hazards, x, y) || InHazard(idle, x, y))
                 continue;
             float const score = me->GetDistance2d(x, y);
@@ -4129,6 +4401,7 @@ bool AiBotAI::AvoidFrontalCone()
             return false;
         m_coneNextMs = now + 1500;
         m_repositionUntilMs = now + 2500;
+        SuiRaidTelemetry::OnReposition(me, "cone");
         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: out of the front of %s -> (%.1f, %.1f)",
             me->GetName(), u->GetName(), bestX, bestY);
         me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
@@ -4136,6 +4409,39 @@ bool AiBotAI::AvoidFrontalCone()
     }
     return false;
 }
+
+// A sleeping burster is kept clear of only once it may wake: when at most one awake enemy is left beside
+// it and that one is nearly dead (a script can wake every sheep at that death). Before that, sheeped
+// circles round the tanks only take the raid's places (2026-11-07, Majordomo with five tanks: all four
+// Healers sheeped in the first 3 s, the ranged stepped "clear" 458 times, 737 dps, first Elite dead at 117 s).
+// (Tried 2026-11-09 and reverted: "any awake add under 20 %" - an Elite parked at the kill order's floor kept it
+// true, the free tanks stood by the sheeps for 30 s and nobody woke the released Healer; attempt 70 killed nothing.)
+// (an awake one of a sleeping kind does not count: one Healer broke its sheep early and was held 36 yd off, so the
+// rule never fired - no tank by the sheeps, nobody out of their circles, six dead at the wake-up - 2026-11-09,
+// Majordomo attempt 84)
+static bool SleepersMayWake(std::list<Unit*> const& around)
+{
+    std::set<uint32> sleeping;
+    for (Unit* u : around)
+        if (u && u->IsCreature() && u->IsAlive() && u->HasBreakableByDamageCrowdControlAura())
+            sleeping.insert(u->GetEntry());
+    uint32 awake = 0;
+    float hp = 100.0f;
+    for (Unit* u : around)
+        if (u && u->IsCreature() && u->IsAlive() && u->IsInCombat() && !u->HasBreakableByDamageCrowdControlAura() &&
+            !static_cast<Creature*>(u)->IsWorldBoss() && !sleeping.count(u->GetEntry()))
+        {
+            ++awake;
+            hp = u->GetHealthPercent();
+        }
+    // (50 %, was 35 %: the free tanks walk 60 yd to the sheeps and the last Elite fell from 35 % in 8 s -
+    // 2026-11-09, Majordomo attempt 86)
+    return awake == 0 || (awake == 1 && hp < 50.0f);
+}
+
+// sleeping burster -> (the tank standing by it, until ms): one tank to each
+static std::mutex gSleeperWatchLock;
+static std::map<ObjectGuid, std::pair<ObjectGuid, uint32>> gSleeperWatch;
 
 bool AiBotAI::MaintainRangedSpacing()
 {
@@ -4147,19 +4453,181 @@ bool AiBotAI::MaintainRangedSpacing()
     Unit* const meleeVictim = me->GetVictim();
     bool const pulseFoe = meleeVictim && meleeVictim->IsCreature() &&
         SuiRaidTelemetry::EntryPulseRadius(meleeVictim->GetEntry()) > 0.0f;
+    // (65 % / 90 % against a burster: four rogues died in the same second to one Blast Wave every 4 s, 735-772
+    // a hit, none healed in 8 s - 2026-11-09, Majordomo attempt 64)
     bool const woundedMelee = role == ROLE_MELEE_DPS && me->IsInCombat() &&
-        (me->GetHealthPercent() < (pulseFoe ? 50.0f : 40.0f) ||
-         (m_meleeSteppedOut && me->GetHealthPercent() < (pulseFoe ? 80.0f : 70.0f)));
+        (me->GetHealthPercent() < (pulseFoe ? 65.0f : 40.0f) ||
+         (m_meleeSteppedOut && me->GetHealthPercent() < (pulseFoe ? 90.0f : 70.0f)));
     m_meleeSteppedOut = woundedMelee;
-    if ((role != ROLE_RANGE_DPS && role != ROLE_HEALER && !woundedMelee) ||
-        !(me->IsInCombat() || HealerOnDuty()) || !me->GetGroup() || me->IsMoving() || m_possessed || m_suiManual)
+    // A melee damage dealer keeps out of a crowd-controlled burster's circle too, and holds outside it
+    // while its own target stands inside (2026-11-07, Majordomo: the 4th add died, the four sheeped
+    // Healers woke at once beside the last Elite and their first Shadow Shocks killed all eight melee in 2 s).
+    bool heldBurstMelee = false;
+    if (role == ROLE_MELEE_DPS && me->IsInCombat() && !woundedMelee)
+    {
+        Unit* const v = me->GetVictim();
+        std::list<Unit*> around;
+        me->GetEnemyListInRadiusAround(me, 45.0f, around);
+        bool const mayWake = SleepersMayWake(around);
+        // ...and out of a second AWAKE wide burster's circle while my target is one: inside two at once a
+        // melee takes both bursts (2026-11-09, Majordomo attempt 82: the four Healers woke immune, six rogues
+        // went in on one beside the others and died to ~1k Shadow Shocks within 13 s). One alone is still hit.
+        bool const wideVictim = v && v->IsCreature() && SuiRaidTelemetry::EntryPulseRadius(v->GetEntry()) >= 18.0f;
+        for (Unit* u : around)
+        {
+            if (!u || !u->IsCreature() || !u->IsAlive())
+                continue;
+            bool const asleep = u->HasBreakableByDamageCrowdControlAura();
+            if (asleep ? !mayWake : !(wideVictim && u != v && u->IsInCombat()))
+                continue;
+            float const pr = SuiRaidTelemetry::EntryPulseRadius(u->GetEntry());
+            if (pr <= 0.0f || (!asleep && pr < 18.0f))
+                continue;
+            if (me->GetDistance(u) < pr + 1.2f || (v && v->GetDistance(u) < pr + 1.2f + 4.0f))
+            {
+                heldBurstMelee = true;
+                break;
+            }
+        }
+    }
+    // [TACTICS] A free tank stands beside a sleeping burster that may wake - one tank to each - and takes
+    // it the moment it wakes (2026-11-07, Majordomo with five tanks: the 4th Elite died, the four Healers
+    // woke immune to Polymorph on the casters and killed 39 in 36 s with no tank on any of them).
+    if (role == ROLE_TANK && me->IsInCombat() && !m_possessed && !m_suiManual && me->GetGroup())
+    {
+        Unit* const v = me->GetVictim();
+        bool const holding = v && v->IsAlive() && v->GetVictim() == me;
+        bool const bossTank = v && v->IsCreature() && static_cast<Creature*>(v)->IsWorldBoss();
+        if (!holding && !bossTank)
+        {
+            // 80 yd: the tanks take their Elites away from the sheeps, and at 45 yd two free tanks 60 yd off never
+            // saw them - one tank stood by four sheeps (2026-11-09, Majordomo attempt 86).
+            std::list<Unit*> around;
+            me->GetEnemyListInRadiusAround(me, 80.0f, around);
+            Unit* sleeper = nullptr;
+            float bestD = 1e9f;
+            uint32 const nowMs = WorldTimer::getMSTime();
+            if (SleepersMayWake(around))
+            {
+                std::lock_guard<std::mutex> guard(gSleeperWatchLock);
+                for (Unit* u : around)
+                {
+                    if (!u || !u->IsCreature() || !u->IsAlive() || !u->HasBreakableByDamageCrowdControlAura() ||
+                        SuiRaidTelemetry::EntryPulseRadius(u->GetEntry()) <= 0.0f)
+                        continue;
+                    auto c = gSleeperWatch.find(u->GetObjectGuid());
+                    if (c != gSleeperWatch.end() && c->second.first != me->GetObjectGuid() && nowMs < c->second.second)
+                        continue;
+                    float const d = me->GetDistance(u);
+                    if (d < bestD)
+                    {
+                        bestD = d;
+                        sleeper = u;
+                    }
+                }
+                if (sleeper)
+                    gSleeperWatch[sleeper->GetObjectGuid()] = std::make_pair(me->GetObjectGuid(), nowMs + 3000);
+            }
+            if (sleeper)
+            {
+                if (nowMs >= m_sleeperWatchLogMs)
+                {
+                    m_sleeperWatchLogMs = nowMs + 5000;
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: stands by the sleeping %s (guid %u, %.0f yd) for its wake-up",
+                        me->GetName(), sleeper->GetName(), sleeper->GetGUIDLow(), bestD);
+                }
+                if (v)
+                    me->AttackStop();
+                if (bestD > 4.0f && nowMs >= m_rangedSpacingNextMs)
+                {
+                    float dx = me->GetPositionX() - sleeper->GetPositionX(), dy = me->GetPositionY() - sleeper->GetPositionY();
+                    float const len = std::max(0.5f, std::sqrt(dx * dx + dy * dy));
+                    float x = sleeper->GetPositionX() + dx / len * 2.5f, y = sleeper->GetPositionY() + dy / len * 2.5f;
+                    float z = sleeper->GetPositionZ();
+                    me->UpdateAllowedPositionZ(x, y, z);
+                    m_rangedSpacingNextMs = nowMs + 1500;
+                    m_repositionUntilMs = nowMs + 2000;
+                    SuiRaidTelemetry::OnReposition(me, "watch");
+                    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                }
+                return true;
+            }
+        }
+    }
+    // (a melee chasing its target is always moving: that chase is what the sleeping burster stops -
+    // 2026-11-07, the rule never ran while the eight melee chased the last Elite beside the sheeps)
+    // (...and so is a wounded one: the tanks drag the Healers apart, the rogues chase them, and three at 20-48 %
+    // never stepped out of Shadow Shock - 2026-11-09, Majordomo attempt 87)
+    bool const chasing = me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE;
+    if ((role != ROLE_RANGE_DPS && role != ROLE_HEALER && !woundedMelee && !heldBurstMelee) ||
+        !(me->IsInCombat() || HealerOnDuty()) || !me->GetGroup() ||
+        (me->IsMoving() && !((heldBurstMelee || woundedMelee) && chasing)) ||
+        m_possessed || m_suiManual)
         return false;
     uint32 const now = WorldTimer::getMSTime();
     if (now < m_rangedSpacingNextMs)
         return false;
+    // A crowd-control cast is finished before any step: the step cancels it, and the mob it was for
+    // keeps beating on me (2026-11-07, Majordomo: the same mage began Polymorph on one Flamewaker
+    // Healer three times in 2 s while it hit him; the Healers were loose for 50 s and killed the casters).
+    if (Spell const* cast = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+        if (SpellEntry const* info = cast->m_spellInfo)
+            if (info->Mechanic == MECHANIC_POLYMORPH || info->Mechanic == MECHANIC_BANISH ||
+                info->Mechanic == MECHANIC_SHACKLE || info->Mechanic == MECHANIC_SLEEP)
+            {
+                if (now >= m_ccCastHoldLogMs)
+                {
+                    m_ccCastHoldLogMs = now + 5000;
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: holds still to finish %s",
+                        me->GetName(), info->SpellName[0].c_str());
+                }
+                return false;
+            }
+    // A healer finishes a heal that lands within 1.2 s unless it is below half itself: the nine healers cast
+    // 63 % of the time and landed one heal per 7 s each, 2.2k healing a second for the raid, while the
+    // steps cut their casts (2026-11-09, Majordomo attempt 54).
+    if (role == ROLE_HEALER && me->GetHealthPercent() > 50.0f)
+        if (Spell const* cast = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+            if (cast->GetCastTime() > 0 && cast->GetCastedTime() <= 1200)
+                return false;
+    // ...and a wanted one is begun before any step while I am above half health: at the pull the mages
+    // stepped out of an Elite's 14 yd circle for 10 s and one Healer of four was sheeped; the three loose
+    // ones killed the paladin tank and the puller by 15 s (2026-11-08, Majordomo attempt 52).
+    if (role == ROLE_RANGE_DPS && me->IsInCombat() && me->GetHealthPercent() > 50.0f &&
+        ((me->GetClass() == CLASS_MAGE && TrySpecPolymorphSpareElite()) ||
+         (me->GetClass() == CLASS_WARLOCK && TrySpecBanishSpareElite())))
+        return true;
 
     std::list<Unit*> nearby;
     me->GetEnemyListInRadiusAround(me, 40.0f, nearby);
+    // A healer holds its ground while a tank in its reach is going down and nothing is hitting the healer:
+    // a burst circle is healed through, a dead tank is not (2026-11-08, Majordomo: four healers within 15 yd
+    // of the paladin tank, two idle at full mana, stepped out of a Healer's 21 yd circle while he died with
+    // 756 healed in 8 s).
+    if (role == ROLE_HEALER && me->GetHealthPercent() > 50.0f && me->GetGroup())
+    {
+        bool hitMe = false;
+        for (Unit* u : nearby)
+            if (u && u->IsAlive() && u->GetVictim() == me)
+                hitMe = true;
+        if (!hitMe)
+            for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+            {
+                Player* t = itr->getSource();
+                AiBotAI const* tai = t && t != me && t->IsAlive() && t->IsInMap(me) ? dynamic_cast<AiBotAI const*>(t->AI()) : nullptr;
+                if (tai && tai->GetCombatActiveRole() == ROLE_TANK && t->GetHealthPercent() < 50.0f &&
+                    me->IsWithinDistInMap(t, 36.0f) && me->IsWithinLOSInMap(t))
+                {
+                    if (now >= m_holdForTankLogMs)
+                    {
+                        m_holdForTankLogMs = now + 5000;
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: holds its ground - %s at %.0f%% in reach",
+                            me->GetName(), t->GetName(), t->GetHealthPercent());
+                    }
+                    return false;
+                }
+            }
+    }
     Unit* closest = nullptr;
     float closestDist = 1e9f;
     float keepDist = 14.0f;
@@ -4171,16 +4639,25 @@ bool AiBotAI::MaintainRangedSpacing()
     bool const pulseOut = role == ROLE_HEALER ||
         me->GetHealthPercent() < 40.0f || (m_pulseSteppedOut && me->GetHealthPercent() < 70.0f);
     m_pulseSteppedOut = role != ROLE_HEALER && pulseOut;
+    bool const sleepersWake = SleepersMayWake(nearby);
     for (Unit* u : nearby)
     {
-        if (!u || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat() ||
-            u->HasBreakableByDamageCrowdControlAura())
+        if (!u || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat())
             continue;
+        // A crowd-controlled kind that bursts is kept clear of all the same: it wakes where it
+        // stands, and a script can wake every sheep at once (2026-11-06, Majordomo: the 4th add
+        // died, the Healers turned immune to Polymorph, and the first Shadow Shock killed four
+        // casters standing beside the sheeps).
+        bool const held = u->HasBreakableByDamageCrowdControlAura();
+        if (held && (!sleepersWake || !SuiRaidTelemetry::EntryPulseRadius(u->GetEntry())))
+            continue;
+        if (heldBurstMelee && !held)
+            continue;   // that melee minds only the sleeping bursters; the awake ones are its fight
         float const d = me->GetDistance(u);
         // A kind seen pulsing fire around itself (an inferno): ranged and healers stay outside
         // that circle all fight long - from 1 yd inside it the first four ticks kill a caster
         // before it can walk out (2026-09-25, Baron Geddon).
-        float keep = 14.0f;
+        float keep = held ? 0.0f : 14.0f;
         bool pulse = false;
         uint32 const rhythm = SuiRaidTelemetry::EntryBurstInterval(u->GetEntry());
         // (Keeping every caster out of a rapid burster left the damage to hunters and melee:
@@ -4195,11 +4672,20 @@ bool AiBotAI::MaintainRangedSpacing()
         // a burst that hits for under a quarter of my health is healed through, not danced around
         uint32 const burstHit = SuiRaidTelemetry::EntryBurstMaxHit(u->GetEntry());
         bool const light = burstHit > 0 && burstHit * 4 * std::max<uint32>(kin, 1u) < me->GetMaxHealth();
-        if (!woundedMelee && !light && (pulseOut || rapid))
+        // A circle narrower than a spell's reach costs a caster nothing to stand outside: only one as
+        // wide as Shazzrah's 30 yd is stood in (2026-11-07: rooted in his Inferno, Baron Geddon's 20 yd
+        // circle killed ranged who kept only 14 yd - "Inferno 2000" deaths at 81-100 s).
+        float const reachable = SuiRaidTelemetry::EntryPulseRadius(u->GetEntry());
+        bool const narrow = reachable > 0.0f && reachable + 1.2f <= 28.0f;
+        // (a wounded melee leaves the whole circle too: it kept 14 yd inside a 20 yd Shadow Shock and three rogues
+        // took two more at 20-48 % - 2026-11-09, Majordomo attempt 87)
+        if (!light && (woundedMelee || pulseOut || rapid || held || narrow))
             if (float const pr = SuiRaidTelemetry::EntryPulseRadius(u->GetEntry()))
-                if (pr + 1.2f - u->GetObjectBoundingRadius() - me->GetObjectBoundingRadius() > keep)
+                // `d` is edge to edge already, and the burst reaches pr past both edges: subtracting
+                // the sizes again stood healers inside it (same law as CollectGroundHazards)
+                if (pr + 1.2f > keep)
                 {
-                    keep = pr + 1.2f - u->GetObjectBoundingRadius() - me->GetObjectBoundingRadius();
+                    keep = pr + 1.2f;
                     pulse = true;
                 }
         if (d >= keep)
@@ -4215,17 +4701,22 @@ bool AiBotAI::MaintainRangedSpacing()
     }
     if (!closest)
     {
-        // A stepped-out melee holds here (no re-engage) until it has been healed.
-        if (woundedMelee)
+        // A stepped-out melee holds here (no re-engage) until it has been healed, or until the sleeping
+        // burster beside its target is awake or dead.
+        if (woundedMelee || heldBurstMelee)
             return true;
         // A ranged damage dealer whose target is out of sight closes in along the path until it
         // can see it (2026-09-24: most Frostbolts and every hunter shot failed LINE_OF_SIGHT from
         // the raid's camp around a corner - mages did less than one rogue).
+        // (a cast just refused for sight is enough, wherever the anchor stands: Majordomo's Healers are tanked
+        // 50+ yd from the leader on the boss, and six casters were refused 59-271 times a fight without one
+        // step - 2026-11-09, attempt 78; the walk still stops at the first spot in sight 30 yd from the target)
         if (role == ROLE_RANGE_DPS && !me->IsNonMeleeSpellCasted(false))
             if (Unit* target = me->GetVictim())
                 if (target->IsAlive() && !me->IsWithinLOSInMap(target) && target->GetVictim() &&
                     me->GetGroup()->IsMember(target->GetVictim()->GetCharmerOrOwnerOrOwnGuid()) &&
-                    (!FindEscortBoss() || FindEscortBoss()->IsWithinDistInMap(target, 45.0f)))
+                    (!FindEscortBoss() || FindEscortBoss()->IsWithinDistInMap(target, 45.0f) ||
+                     (m_losRefusedGuid == target->GetObjectGuid() && now - m_losRefusedMs < 4000 && me->IsWithinDistInMap(target, 70.0f))))
                 {
                     // Only the group's own fight next to the tank: never walk off toward a
                     // stale target (2026-09-24: a hunter wandered 77 yd and pulled a Firelord).
@@ -4254,12 +4745,64 @@ bool AiBotAI::MaintainRangedSpacing()
                             float const d = target->GetDistance2d(q.x, q.y);
                             if (InHazard(idleNear, q.x, q.y) || d < keepOut || d > 30.0f)
                                 continue;
-                            if (!target->IsWithinLOS(q.x, q.y, q.z + 1.5f))
+                            if (!SeesFrom(me, q.x, q.y, q.z, target))
                                 continue;
-                            CB_HIT(me->GetGUIDLow(), "cpp-combat: ranged closing for line of sight"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+                            CB_HIT(me->GetGUIDLow(), "cpp-combat: ranged closing for line of sight"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000; SuiRaidTelemetry::OnReposition(me, "sight");
                             me->GetMotionMaster()->MovePoint(0, q.x, q.y, q.z, MOVE_PATHFINDING | MOVE_RUN_MODE);
                             return true;
                         }
+                    }
+                    // Nothing on the straight path: the nearest spot round the target, outside its burst and every
+                    // other burster's, in reach and in sight (2026-11-09, Majordomo attempt 79: the path from the camp
+                    // to a Healer tanked round a rock had no point 19-30 yd out with sight - 883 refused casts).
+                    {
+                        std::list<Unit*> foes;
+                        MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck foeCheck(me, me, 70.0f);
+                        MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> foeSearcher(foes, foeCheck);
+                        Cell::VisitAllObjects(me, foeSearcher, 70.0f);
+                        std::vector<std::pair<float, Vector3>> spots;
+                        float const inner = std::max(keepOut + 2.0f, 10.0f);
+                        for (float r : { inner, (inner + 29.0f) * 0.5f, 29.0f })
+                        {
+                            if (r < inner || r > 29.0f)
+                                continue;
+                            for (int a = 0; a < 16; ++a)
+                            {
+                                float const ang = a * float(M_PI) / 8.0f;
+                                float x = target->GetPositionX() + std::cos(ang) * r, y = target->GetPositionY() + std::sin(ang) * r;
+                                float z = target->GetPositionZ();
+                                ReGroundZ(x, y, z, "ranged-sight");
+                                if (std::fabs(z - target->GetPositionZ()) > 6.0f || InHazard(idleNear, x, y) || Molten(me, x, y, z) ||
+                                    !SeesFrom(me, x, y, z, target))
+                                    continue;
+                                bool burnt = false;
+                                for (Unit* f : foes)
+                                    if (f != target && f->IsAlive() && f->IsInCombat() && f->IsCreature() &&
+                                        !f->HasBreakableByDamageCrowdControlAura())
+                                        if (float const fr = SuiRaidTelemetry::EntryPulseRadius(f->GetEntry()))
+                                            if (f->GetDistance2d(x, y) < fr + 1.2f)
+                                                burnt = true;
+                                if (!burnt)
+                                    spots.push_back({ me->GetDistance(x, y, z), Vector3(x, y, z) });
+                            }
+                        }
+                        std::sort(spots.begin(), spots.end(), [](auto const& l, auto const& r) { return l.first < r.first; });
+                        for (size_t k = 0; k < spots.size() && k < 4; ++k)
+                        {
+                            Vector3 const& q = spots[k].second;
+                            if (spots[k].first > 45.0f || !Walkable(me, q.x, q.y, q.z))
+                                continue;
+                            m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+                            SuiRaidTelemetry::OnReposition(me, "sight");
+                            me->GetMotionMaster()->MovePoint(0, q.x, q.y, q.z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                            return true;
+                        }
+                    }
+                    if (now - m_sightLogMs > 10000)
+                    {
+                        m_sightLogMs = now;
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-SIGHT] %s: no spot in sight of %s on a %u-point path (%.0f yd, keep-out %.0f)",
+                            me->GetName(), target->GetName(), uint32(points.size()), me->GetDistance(target), keepOut);
                     }
                     return false;
                 }
@@ -4318,10 +4861,10 @@ bool AiBotAI::MaintainRangedSpacing()
                             (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER | LIQUID_MAP_WATER_WALK))
                             continue;
                         if (anchor && anchor != me && (anchor->GetDistance(x, y, z) > (role == ROLE_HEALER ? 28.0f : 35.0f) ||
-                            !anchor->IsWithinLOS(x, y, z + 1.5f)))
+                            !SeesFrom(me, x, y, z, anchor)))
                             continue;
                         if (victim && role == ROLE_RANGE_DPS && (victim->GetDistance(x, y, z) > 33.0f ||
-                            !victim->IsWithinLOS(x, y, z + 1.5f)))
+                            !SeesFrom(me, x, y, z, victim)))
                             continue;
                         if (InHazard(idleNear, x, y) || InHazard(burning, x, y))
                             continue;
@@ -4337,7 +4880,7 @@ bool AiBotAI::MaintainRangedSpacing()
                 if (bestX != 0 || bestY != 0)
                 {
                     m_rangedSpacingNextMs = now + 3000;
-                    CB_HIT(me->GetGUIDLow(), "cpp-combat: spreading out"); m_repositionUntilMs = WorldTimer::getMSTime() + 2000;
+                    CB_HIT(me->GetGUIDLow(), "cpp-combat: spreading out"); m_repositionUntilMs = WorldTimer::getMSTime() + 2000; SuiRaidTelemetry::OnReposition(me, "spread");
                     me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
                     return true;
                 }
@@ -4346,7 +4889,53 @@ bool AiBotAI::MaintainRangedSpacing()
         // Nothing too close: a healer that lost reach or sight of the tank closes back in - the
         // tank actually holding the fight, not the raid's leader (2026-09-25: Baron Geddon's tank
         // died with all ten healers 51-59 yd away beside the leader).
-        Player* tank = ActiveTank();
+        Player* tank = nullptr;
+        // ...and a wounded tank no healer sees (a second tank holding one add round a corner, or a
+        // tank Majordomo ported away) brings its nearest healer into sight (2026-11-06: an add tank
+        // died with 0 healing in 8 s and 9 of 10 healers out of sight, all of them on the main tank).
+        // Out of heal range counts as unseen (2026-11-08, Majordomo: two add tanks 50-60 yd from all nine
+        // healers, in plain sight, died in the same second with nothing healed in 8 s).
+        if (role == ROLE_HEALER && me->GetGroup())
+        {
+            float lowest = 75.0f;
+            for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+            {
+                Player* t = itr->getSource();
+                if (!t || t == me || !t->IsAlive() || !t->IsInWorld() || t->GetMap() != me->GetMap() ||
+                    !t->IsInCombat() || t->GetAttackers().empty() || t->GetHealthPercent() >= lowest ||
+                    !me->IsWithinDistInMap(t, 80.0f) || (me->IsWithinDistInMap(t, 40.0f) && me->IsWithinLOSInMap(t)))
+                    continue;
+                AiBotAI* tai = dynamic_cast<AiBotAI*>(t->AI());
+                if (!tai || tai->GetCombatActiveRole() != ROLE_TANK)
+                    continue;
+                bool seen = false;
+                Player* nearest = nullptr;
+                float nearestD = 1e9f;
+                for (GroupReference* jtr = me->GetGroup()->GetFirstMember(); jtr && !seen; jtr = jtr->next())
+                {
+                    Player* h = jtr->getSource();
+                    if (!h || !h->IsAlive() || h->GetMap() != me->GetMap() || h == t)
+                        continue;
+                    AiBotAI* hai = dynamic_cast<AiBotAI*>(h->AI());
+                    if (!hai || hai->GetCombatActiveRole() != ROLE_HEALER)
+                        continue;
+                    if (h->IsWithinDistInMap(t, 40.0f) && h->IsWithinLOSInMap(t))
+                        seen = true;
+                    else if (h->GetDistance(t) < nearestD)
+                    {
+                        nearestD = h->GetDistance(t);
+                        nearest = h;
+                    }
+                }
+                if (!seen && nearest == me)
+                {
+                    lowest = t->GetHealthPercent();
+                    tank = t;
+                }
+            }
+        }
+        if (!tank)
+            tank = ActiveTank();
         if (!tank)
             tank = FindEscortBoss();
         if (role != ROLE_HEALER || !tank || tank == me || !tank->IsAlive())
@@ -4357,10 +4946,11 @@ bool AiBotAI::MaintainRangedSpacing()
         Unit* tankFoe = nullptr;
         for (Unit* a : tank->GetAttackers())
             if (a && a->IsAlive() && a->IsCreature())
+                // measured from its edge (GetDistance2d of a point drops its size), plus mine
                 if (float const pr = SuiRaidTelemetry::EntryPulseRadius(a->GetEntry()))
-                    if (pr + 1.2f - a->GetObjectBoundingRadius() > pulseKeepOut)
+                    if (pr + me->GetObjectBoundingRadius() + 1.5f > pulseKeepOut)
                     {
-                        pulseKeepOut = pr + 1.2f - a->GetObjectBoundingRadius();
+                        pulseKeepOut = pr + me->GetObjectBoundingRadius() + 1.5f;
                         tankFoe = a;
                     }
         bool const inReach = me->IsWithinDistInMap(tank, pulseKeepOut > 0.0f ? 38.0f : 28.0f) &&
@@ -4418,7 +5008,7 @@ bool AiBotAI::MaintainRangedSpacing()
                             }
                 if (arc)
                     continue;
-                if (!tank->IsWithinLOS(x, y, z + 1.5f))
+                if (!SeesFrom(me, x, y, z, tank))
                     continue;
                 cands.push_back({x, y, z, me->GetDistance(x, y, z)});
             }
@@ -4442,10 +5032,29 @@ bool AiBotAI::MaintainRangedSpacing()
                 walk += (pts[k] - pts[k - 1]).length();
             if (walk > c.score * 2.0f + 10.0f)
                 continue;   // a detour round a ridge, not a step into sight
+            // ...and the walk there stays out of the fire too, not only its end: the way to a tank
+            // on the far side of a boss runs through his circle (2026-11-06: two paladins "closing on"
+            // Baron Geddon's tank walked through his Inferno and died to its last tick).
+            bool const startBurning = InHazard(burning, me->GetPositionX(), me->GetPositionY()) ||
+                (tankFoe && tankFoe->GetDistance2d(me->GetPositionX(), me->GetPositionY()) < pulseKeepOut);
+            bool through = false;
+            for (size_t k = 1; k < pts.size() && !through && !startBurning; ++k)
+            {
+                Vector3 const d = pts[k] - pts[k - 1];
+                int const n = std::max(1, int(d.length() / 2.0f));
+                for (int j = 1; j <= n && !through; ++j)
+                {
+                    Vector3 const p = pts[k - 1] + d * (float(j) / n);
+                    through = InHazard(burning, p.x, p.y) ||
+                        (tankFoe && tankFoe->GetDistance2d(p.x, p.y) < pulseKeepOut);
+                }
+            }
+            if (through)
+                continue;
             sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: closing on %s (%.0f yd%s) -> %.0f yd from it",
                 me->GetName(), tank->GetName(), me->GetDistance(tank), me->IsWithinLOSInMap(tank) ? "" : ", no sight",
                 tank->GetDistance(c.x, c.y, c.z));
-            CB_HIT(me->GetGUIDLow(), "cpp-combat: healer closing to heal range of the tank"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+            CB_HIT(me->GetGUIDLow(), "cpp-combat: healer closing to heal range of the tank"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000; SuiRaidTelemetry::OnReposition(me, "healrange");
             me->GetMotionMaster()->MovePoint(0, c.x, c.y, c.z, MOVE_PATHFINDING | MOVE_RUN_MODE);
             return true;
         }
@@ -4457,6 +5066,11 @@ bool AiBotAI::MaintainRangedSpacing()
     // A cast in progress is kept unless the hostile is close enough for point-blank area
     // damage to reach (2026-09-24: healers chain-casting beside a Molten Giant never moved
     // and died to its 10 yd Smash).
+    // A clear step that twice in a row did not move me (the spot is never reached) is given up for a while:
+    // each try dropped the cast (2026-11-08, Majordomo: a mage picked the same spot 13 times in 26 s while the
+    // released Healer stood untouched - the ranged cast 13 % of the fight).
+    if (now < m_spacingHoldUntilMs && closestDist > 11.0f)
+        return false;
     if (me->IsNonMeleeSpellCasted(false))
     {
         // Inside the circle of a kind that bursts every few seconds the cast is dropped too:
@@ -4479,15 +5093,62 @@ bool AiBotAI::MaintainRangedSpacing()
     }
     dx /= len;
     dy /= len;
+    // An elite beating on me is brought to a tank, not run away from: a few yards past the nearest
+    // tank, where it can take it off me (2026-11-06, Majordomo: after each of his threat resets he
+    // went for a healer, who stepped away from the tanks; seven healers died 2-4 s after his swap).
+    if (closest->GetVictim() == me && closest->IsCreature() && static_cast<Creature*>(closest)->IsElite() && me->GetGroup())
+    {
+        Player* tankTo = nullptr;
+        float bestT = 40.0f;
+        for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+            if (Player* m = itr->getSource())
+                if (m != me && m->IsAlive() && m->IsInWorld() && m->GetMap() == me->GetMap())
+                    if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
+                        if (ai->GetCombatActiveRole() == ROLE_TANK && me->GetDistance(m) < bestT)
+                        {
+                            bestT = me->GetDistance(m);
+                            tankTo = m;
+                        }
+        if (tankTo && bestT > 6.0f)
+        {
+            float vx = tankTo->GetPositionX() - me->GetPositionX(), vy = tankTo->GetPositionY() - me->GetPositionY();
+            float const vl = std::max(0.5f, std::sqrt(vx * vx + vy * vy));
+            float x = tankTo->GetPositionX() + vx / vl * 3.0f, y = tankTo->GetPositionY() + vy / vl * 3.0f;
+            float z = tankTo->GetPositionZ();
+            me->UpdateAllowedPositionZ(x, y, z);
+            std::vector<GroundHazard> burningTo;
+            CollectGroundHazards(me, burningTo);
+            if (std::fabs(z - tankTo->GetPositionZ()) < 4.0f && !Molten(me, x, y, z) && !InHazard(burningTo, x, y) &&
+                Walkable(me, x, y, z))
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: %s is on me - to %s (%.0f yd)",
+                    me->GetName(), closest->GetName(), tankTo->GetName(), bestT);
+                m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
+                SuiRaidTelemetry::OnReposition(me, "totank");
+                me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                return true;
+            }
+        }
+    }
     Player* anchor = role == ROLE_HEALER ? ActiveTank() : nullptr;
     if (!anchor)
         anchor = FindEscortBoss();
-    float const step = std::max(22.0f, keepDist + 1.0f) - closestDist;
+    // (out of a burst circle by 5 yd, not onto its rim: its tank walks it a yard and the ring steps again -
+    // 2026-11-08, Majordomo: 186 of 357 sampled clear steps ran from the one Healer being killed)
+    float const step = std::max(22.0f, keepDist + (pulseKeep ? 5.0f : 1.0f)) - closestDist;
     std::vector<GroundHazard> idleNear;
     CollectIdleHostiles(me, 50.0f, idleNear);
-    // Try straight away, then 45 degrees either side, keeping near the anchor.
-    for (float turn : { 0.0f, 0.785f, -0.785f })
+    // Try straight away, then 45 and 90 degrees either side, keeping near the anchor - first only spots
+    // that still see what I cast on (my target; a healer's tank), then the old way: a step behind a pillar
+    // costs every cast after it (2026-11-08, Majordomo: ranged casts refused for line of sight 3,286 times
+    // against 375 that went off; the clear step never looked).
+    Unit* const sightOf = role == ROLE_HEALER ? static_cast<Unit*>(anchor) :
+        role == ROLE_RANGE_DPS ? me->GetVictim() : nullptr;
+    for (int pass = sightOf && sightOf != me && sightOf->IsAlive() ? 0 : 1; pass < 2; ++pass)
+    for (float turn : { 0.0f, 0.785f, -0.785f, 1.571f, -1.571f })
     {
+        if (pass == 1 && std::fabs(turn) > 1.0f)
+            continue;   // (the old way tried three directions)
         float const c = std::cos(turn), s = std::sin(turn);
         float const ux = dx * c - dy * s, uy = dx * s + dy * c;
         float x = me->GetPositionX() + ux * step, y = me->GetPositionY() + uy * step;
@@ -4498,10 +5159,39 @@ bool AiBotAI::MaintainRangedSpacing()
         // Healers keep the tank inside heal range; ranged may use the full shooting range.
         if (anchor && anchor != me && anchor->GetDistance(x, y, z) > (role == ROLE_HEALER ? (pulseKeep ? 38.0f : 28.0f) : 38.0f))
             continue;
+        if (pass == 0 && (!SeesFrom(me, x, y, z, sightOf) ||
+            (role == ROLE_RANGE_DPS && sightOf->GetDistance(x, y, z) > 33.0f)))
+            continue;
         if (InHazard(idleNear, x, y) || !Walkable(me, x, y, z))
             continue;
-        CB_HIT(me->GetGUIDLow(), "cpp-combat: ranged stepping clear of a close hostile"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000;
-        if (woundedMelee)
+        if (me->GetDistance2d(m_spacingFromX, m_spacingFromY) < 1.5f)
+        {
+            if (++m_spacingFutile >= 2)
+            {
+                m_spacingFutile = 0;
+                m_spacingHoldUntilMs = now + 8000;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-SPACING] %s: two clear steps from %s went nowhere - holds and casts 8 s",
+                    me->GetName(), closest->GetName());
+                return false;
+            }
+        }
+        else
+            m_spacingFutile = 0;
+        m_spacingFromX = me->GetPositionX();
+        m_spacingFromY = me->GetPositionY();
+        CB_HIT(me->GetGUIDLow(), "cpp-combat: ranged stepping clear of a close hostile"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000; SuiRaidTelemetry::OnReposition(me, "clear");
+        // (diagnostic 2026-11-08: which enemy each clear step runs from - Majordomo's ranged spent 28 % of
+        // the fight moving, 299 clear steps)
+        if (now >= m_spacingWhyLogMs)
+        {
+            m_spacingWhyLogMs = now + 4000;
+            Unit* on = closest->GetVictim();
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CLEAR] %s (%s): from %s entry %u%s on %s, %.1f of %.1f yd%s",
+                me->GetName(), role == ROLE_HEALER ? "healer" : role == ROLE_RANGE_DPS ? "ranged" : "melee",
+                closest->GetName(), closest->GetEntry(), closest->HasBreakableByDamageCrowdControlAura() ? " asleep" : "",
+                on ? (on == me ? "me" : on->GetName()) : "nobody", closestDist, keepDist, pulseKeep ? " circle" : "");
+        }
+        if (woundedMelee || heldBurstMelee)
             me->AttackStop();
         me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
         return true;
@@ -4517,6 +5207,56 @@ Player* AiBotAI::ActiveTank() const
     Group* group = me->GetGroup();
     if (!group)
         return nullptr;
+    // A healer stays with its own tank when several hold the fight: the healers are dealt out over the
+    // tanks in guid order (2026-11-08, Majordomo: all nine healers stood by the tank with the most attackers
+    // while two add tanks 50-74 yd away died in the same second, nothing healed in 8 s).
+    if (GetCombatActiveRole() == ROLE_HEALER)
+    {
+        std::vector<Player*> tanks, healers;
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+        {
+            Player* m = itr->getSource();
+            if (!m || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != me->GetMap() || !me->IsWithinDistInMap(m, 80.0f))
+                continue;
+            AiBotAI const* ai = dynamic_cast<AiBotAI const*>(m->AI());
+            if (!ai)
+                continue;
+            if (ai->GetCombatActiveRole() == ROLE_HEALER)
+                healers.push_back(m);
+            else if (ai->GetCombatActiveRole() == ROLE_TANK && m->IsInCombat())
+            {
+                bool held = false;
+                for (Unit* a : m->GetAttackers())
+                    if (a && a->IsAlive() && a->GetVictim() == m && a->IsCreature() &&
+                        (static_cast<Creature*>(a)->IsElite() || static_cast<Creature*>(a)->IsWorldBoss()))
+                        held = true;
+                if (held)
+                    tanks.push_back(m);
+            }
+        }
+        // (the deal holds 15 s while that tank lives and fights: re-dealt every time one tank held nothing for
+        // a moment, the healers crossed the fight between tanks every few seconds - 2026-11-08, Majordomo)
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (!m_dealtTank.IsEmpty() && nowMs < m_dealtUntilMs)
+            if (Player* kept = me->GetMap()->GetPlayer(m_dealtTank))
+                if (kept->IsAlive() && kept->IsInCombat() && group->IsMember(kept->GetObjectGuid()) &&
+                    me->IsWithinDistInMap(kept, 80.0f) && tanks.size() >= 2)
+                    return kept;
+        if (tanks.size() >= 2)
+        {
+            auto byGuid = [](Player* a, Player* b) { return a->GetGUIDLow() < b->GetGUIDLow(); };
+            std::sort(tanks.begin(), tanks.end(), byGuid);
+            std::sort(healers.begin(), healers.end(), byGuid);
+            auto it = std::find(healers.begin(), healers.end(), me);
+            if (it != healers.end())
+            {
+                Player* dealt = tanks[size_t(it - healers.begin()) % tanks.size()];
+                m_dealtTank = dealt->GetObjectGuid();
+                m_dealtUntilMs = nowMs + 15000;
+                return dealt;
+            }
+        }
+    }
     Player* best = nullptr;
     float bestScore = 0.0f;
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())

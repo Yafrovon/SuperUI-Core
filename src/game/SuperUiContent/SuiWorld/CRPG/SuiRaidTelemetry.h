@@ -31,6 +31,8 @@ namespace SuiRaidTelemetry
     float EntryPulseRadius(uint32 entry);
     // The reach of a frontal cone a creature of this kind has hit the raid with (0 = never seen).
     float EntryConeRadius(uint32 entry);
+    // Radius of the blast a creature kind sets off as it dies (learned from the raid being hit by it), else 0.
+    float EntryDeathBurstRadius(uint32 entry);
     // The burst radius of a spell this kind casts at a unit that bursts around it (0 = none seen).
     float EntrySplashRadius(uint32 entry);
     // Milliseconds since this creature's last pulsing burst began (0 = never seen bursting).
@@ -45,11 +47,17 @@ namespace SuiRaidTelemetry
     void ForecastHazards(Unit const* around, float range, std::vector<std::tuple<float, float, float>>& out);
     void OnHeal(Unit* healer, Unit* target, uint32 amount, SpellEntry const* spell);
     void OnKill(Unit* killer, Unit* victim);
-    void FlushFight(Player const* leader, uint32 fightNumber, uint32 seconds);
+    // Once a second while the autopilot's group fights: member activity, hostiles' health and victims.
+    void Sample(Player const* leader);
+    // Ends the fight: [TELEMETRY] lines plus one JSON record in sui-autopilot-fights.jsonl. FIGHT_* flags.
+    enum : uint32 { FIGHT_BOSS = 1, FIGHT_WIPE = 2, FIGHT_BOSS_KILLED = 4 };
+    uint32 FlushFight(Player const* leader, uint32 fightNumber, uint32 seconds, uint32 targetEntry = 0, bool leaderDied = false);
     // outcome: -2 null spell, -1 refused by the bot's own gate, else the SpellCastResult.
     void OnCastAttempt(Unit* caster, uint32 spellId, int32 outcome);
-    // why: 0 ran, 1 not in combat, 2 casting, 3 pull hold, 4 stalemate/flee hold, 5 other gate.
+    // why: 0 ran, 1 not in combat, 2 casting, 3 pull hold, 4 stalemate/flee hold, 5 other gate, 6 repositioning.
     void OnRotationTick(Unit* caster, uint8 why);
+    // A tactical move started (why: a short name - "cone", "healrange"...), counted per member in the fight record.
+    void OnReposition(Unit* who, char const* why);
 }
 
 #endif
