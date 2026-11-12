@@ -404,6 +404,14 @@ void AiBotAI::BridgeSendState()
         // brain holds Idle; movement comes only from CMSG_SUI_ORDER commands.
         pparty = 1u;
     }
+    else if (me->GetGroup() && me->GetGroup()->isRaidGroup())
+    {
+        CB_HIT(me->GetGUIDLow(), "cpp-bridge: raid group member, pparty hold");
+        // A raid group belongs to the raid (the autopilot or the Commander); the brain never forms one. With no
+        // human online in it, the brain's living-world tasks hearthed the whole MC raid out of the instance
+        // ("stranded escape") the morning the world was started (2026-11-10).
+        pparty = 1u;
+    }
 
     // --- Active quest status from server (authoritative) ---
     uint32 questStatus = 0;  // 0 = no tracked quest
@@ -4154,6 +4162,53 @@ void AiBotAI::BridgeHandleResurrect(const char* json)
             "[AIBOT-BRIDGE] %s: RESURRECT but bot is not dead, ignoring", me->GetName());
         BridgeSendEvent("RESPAWN", "");  // tell C# we're alive anyway
         return;
+    }
+
+    // A raid member stays dead while its raid fights in a dungeon: no rez at the corpse, no ghost port (2026-11-10: the web
+    // app's living-world brain rezzed every dead raid bot at its corpse 15-25 s after death, mid-fight - Majordomo run B1
+    // had 118 deaths and 118 rezzes, so the day's "kills" were not normal-rules kills). The raid's own recovery revives
+    // between fights, and UpdateAI recovers in place once the group is out of combat.
+    if (me->GetMap()->IsDungeon() && me->GetGroup() && me->GetGroup()->isRaidGroup())
+        for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+        {
+            Player* m = itr->getSource();
+            if (!m || m == me || !m->IsAlive() || !m->IsInMap(me) || !m->IsInCombat())
+                continue;
+            CB_HIT(me->GetGUIDLow(), "cpp-rez: held, raid fighting");
+            static std::map<uint32, uint32> sLastNote;   // bot guid -> last log (ms); the brain asks again every few s
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32& last = sLastNote[me->GetGUIDLow()];
+            if (!last || nowMs - last > 30000)
+            {
+                last = nowMs;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
+                    "[AIBOT] %s: RESURRECT held - the raid is fighting (%s in combat)", me->GetName(), m->GetName());
+            }
+            return;
+        }
+    // ...nor beside a living hostile raid boss once the raid is out of combat: it pulls the whole zone, and a bot rezzed at
+    // its corpse dies again at once (2026-11-10, Ragnaros: six "fights" of rezzed bots after the wipe, 40 dead each).
+    if (me->GetMap()->IsDungeon() && me->GetGroup() && me->GetGroup()->isRaidGroup())
+    {
+        std::list<Creature*> near;
+        MaNGOS::AnyUnitInObjectRangeCheck check(me, 100.0f);
+        MaNGOS::CreatureListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(near, check);
+        Cell::VisitGridObjects(me, searcher, 100.0f);
+        for (Creature* c : near)
+            if (c->IsAlive() && c->IsWorldBoss() && c->IsHostileTo(me))
+            {
+                CB_HIT(me->GetGUIDLow(), "cpp-rez: held, raid boss near");
+                static std::map<uint32, uint32> sLastBossNote;
+                uint32 const nowMs = WorldTimer::getMSTime();
+                uint32& last = sLastBossNote[me->GetGUIDLow()];
+                if (!last || nowMs - last > 30000)
+                {
+                    last = nowMs;
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT] %s: RESURRECT held - %s is %.0f yd from the corpse",
+                        me->GetName(), c->GetName(), me->GetDistance(c));
+                }
+                return;
+            }
     }
 
     int atGraveyard = 0;

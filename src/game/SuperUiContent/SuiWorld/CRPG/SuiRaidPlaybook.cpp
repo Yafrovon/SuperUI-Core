@@ -5,6 +5,7 @@
 #include "SuiRaidPlaybook.h"
 #include "Creature.h"
 #include "Map.h"
+#include "InstanceData.h"
 #include "MapPersistentStateMgr.h"
 #include "ObjectMgr.h"
 #include "Log.h"
@@ -16,6 +17,8 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <array>
+#include <set>
 
 namespace
 {
@@ -28,6 +31,13 @@ namespace
         struct LureSpot { float l[3]; bool hasCamp; float c[3]; float clearance; };
         std::map<uint32, LureSpot> lures;              // boss entry -> lure spot (+ camp)
         std::map<uint32, std::vector<uint32>> killOrder;   // boss entry -> add entries, first dies first
+        std::map<uint32, std::array<float, 3>> summonAt;   // boss entry -> where a script summons it (no spawn row)
+        std::map<uint32, uint32> doneData;                 // boss entry -> instance data index that reads DONE once it is beaten
+        std::map<uint32, float> spread;                    // boss entry -> yards its ranged and healers keep apart
+        std::set<uint32> standInPulse;                     // boss entries whose learned pulse circle is not kept clear
+        std::map<uint32, std::vector<uint32>> prePotions;  // boss entry -> potion item entries drunk before it
+        std::map<uint32, std::vector<uint32>> paladinAura; // boss entry -> aura spell ids, highest rank first
+        std::map<uint32, SuiRaidPlaybook::Gossip> summonGossip;   // boss entry -> the gossip that summons it
     };
 
     std::mutex gLock;
@@ -110,6 +120,37 @@ namespace
                                 spot.c[k] = lure.at("camp").at(k).get<float>();
                         book.lures[entry] = spot;
                     }
+                    if (boss.count("summonAt") && boss.at("summonAt").is_array() && boss.at("summonAt").size() == 3)
+                        for (int k = 0; k < 3; ++k)
+                            book.summonAt[entry][k] = boss.at("summonAt").at(k).get<float>();
+                    if (boss.count("paladinAura") && boss.at("paladinAura").is_array())
+                        for (Json const& aura : boss.at("paladinAura"))
+                            if (aura.is_number_unsigned())
+                                book.paladinAura[entry].push_back(aura.get<uint32>());
+                    if (boss.count("prePotions") && boss.at("prePotions").is_array())
+                        for (Json const& item : boss.at("prePotions"))
+                            if (item.is_number_unsigned())
+                                book.prePotions[entry].push_back(item.get<uint32>());
+                    if (boss.count("standInPulse") && boss.at("standInPulse").is_boolean() && boss.at("standInPulse").get<bool>())
+                        book.standInPulse.insert(entry);
+                    if (boss.count("spread") && boss.at("spread").is_number())
+                        book.spread[entry] = boss.at("spread").get<float>();
+                    if (boss.count("doneData") && boss.at("doneData").is_number_unsigned())
+                        book.doneData[entry] = boss.at("doneData").get<uint32>();
+                    if (boss.count("summonGossip") && boss.at("summonGossip").is_object())
+                    {
+                        Json const& g = boss.at("summonGossip");
+                        SuiRaidPlaybook::Gossip gossip{};
+                        gossip.npc = g.at("npc").get<uint32>();
+                        for (int k = 0; k < 3; ++k)
+                            gossip.at[k] = g.at("at").at(k).get<float>();
+                        gossip.selects = g.count("selects") ? g.at("selects").get<uint32>() : 1;
+                        gossip.hasStand = g.count("standAt") && g.at("standAt").is_array() && g.at("standAt").size() == 3;
+                        if (gossip.hasStand)
+                            for (int k = 0; k < 3; ++k)
+                                gossip.stand[k] = g.at("standAt").at(k).get<float>();
+                        book.summonGossip[entry] = gossip;
+                    }
                     if (boss.count("killOrder") && boss.at("killOrder").is_array())
                         for (Json const& add : boss.at("killOrder"))
                             if (add.is_number_unsigned())
@@ -175,6 +216,15 @@ bool SuiRaidPlaybook::BossDead(Map const* map, uint32 bossEntry)
 {
     if (!map)
         return false;
+    // A boss that yields or is summoned by a script is judged by its encounter (2026-11-10: Majordomo never dies and
+    // has no spawn row; with summonAt alone the raid walked back to his empty terrace after he was DONE).
+    {
+        std::lock_guard<std::mutex> guard(gLock);
+        Refresh();
+        auto done = gBook.doneData.find(bossEntry);
+        if (done != gBook.doneData.end())
+            return map->GetInstanceData() && const_cast<Map*>(map)->GetInstanceData()->GetData(done->second) == 3;   // DONE (EncounterState, scripts)
+    }
     auto spawns = Spawns(map->GetId(), bossEntry);
     if (spawns.empty())
         return false;   // summoned by a script (Ragnaros): not ours to judge from spawn rows
@@ -254,9 +304,64 @@ bool SuiRaidPlaybook::BossSpawn(uint32 mapId, uint32 bossEntry, float& x, float&
 {
     auto spawns = Spawns(mapId, bossEntry);
     if (spawns.empty())
-        return false;
+    {
+        // A boss a script summons has no spawn row: the playbook says where it appears, so the raid walks to its room
+        // once the way there is clear (2026-11-10: Majordomo was summoned by the last rune and never visited - his
+        // adds only spawn with a player near, and exploration knew only spawn rows).
+        std::lock_guard<std::mutex> guard(gLock);
+        Refresh();
+        auto at = gBook.summonAt.find(bossEntry);
+        if (at == gBook.summonAt.end())
+            return false;
+        x = at->second[0];
+        y = at->second[1];
+        z = at->second[2];
+        return true;
+    }
     x = spawns.front().second->position.x;
     y = spawns.front().second->position.y;
     z = spawns.front().second->position.z;
     return true;
+}
+
+bool SuiRaidPlaybook::SummonGossip(uint32 bossEntry, Gossip& out)
+{
+    std::lock_guard<std::mutex> guard(gLock);
+    Refresh();
+    auto it = gBook.summonGossip.find(bossEntry);
+    if (it == gBook.summonGossip.end())
+        return false;
+    out = it->second;
+    return true;
+}
+
+float SuiRaidPlaybook::SpreadYards(uint32 bossEntry)
+{
+    std::lock_guard<std::mutex> guard(gLock);
+    Refresh();
+    auto it = gBook.spread.find(bossEntry);
+    return it == gBook.spread.end() ? 0.0f : it->second;
+}
+
+bool SuiRaidPlaybook::StandInPulse(uint32 bossEntry)
+{
+    std::lock_guard<std::mutex> guard(gLock);
+    Refresh();
+    return gBook.standInPulse.count(bossEntry) != 0;
+}
+
+std::vector<uint32> SuiRaidPlaybook::PrePotions(uint32 bossEntry)
+{
+    std::lock_guard<std::mutex> guard(gLock);
+    Refresh();
+    auto it = gBook.prePotions.find(bossEntry);
+    return it == gBook.prePotions.end() ? std::vector<uint32>() : it->second;
+}
+
+std::vector<uint32> SuiRaidPlaybook::PaladinAura(uint32 bossEntry)
+{
+    std::lock_guard<std::mutex> guard(gLock);
+    Refresh();
+    auto it = gBook.paladinAura.find(bossEntry);
+    return it == gBook.paladinAura.end() ? std::vector<uint32>() : it->second;
 }

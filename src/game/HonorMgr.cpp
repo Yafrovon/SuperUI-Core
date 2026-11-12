@@ -152,7 +152,10 @@ void HonorMaintenancer::DistributeRankPoints(Team team)
         auto& weeklyScore = itrWS->second;
 
         // Calculate rank points earning
-        weeklyScore.earning = CalculateRpEarning(weeklyScore.cp, scores);
+        // SuperUI: Rate.Honor.RankPoints. Earning is percentile-based (standing vs. the
+        // week's field), so scaling CP alone never speeds up ranking; this does.
+        weeklyScore.earning = CalculateRpEarning(weeklyScore.cp, scores) *
+            sWorld.getConfig(CONFIG_FLOAT_RATE_HONOR_RANK_POINTS);
 
         // Calculate rank points with decay
         weeklyScore.newRp = CalculateRpDecay(weeklyScore.earning, weeklyScore.oldRp);
@@ -784,10 +787,26 @@ void HonorMgr::Load(std::unique_ptr<QueryResult> result)
     }
 }
 
+float HonorMgr::ApplyRate(float cp, uint8 type)
+{
+    switch (type)
+    {
+        case HONORABLE:    return cp * sWorld.getConfig(CONFIG_FLOAT_RATE_HONOR_KILL);
+        case DISHONORABLE: return cp * sWorld.getConfig(CONFIG_FLOAT_RATE_HONOR_DISHONOR);
+        case BONUS:        return cp * sWorld.getConfig(CONFIG_FLOAT_RATE_HONOR_BONUS);
+        case QUEST:        return cp * sWorld.getConfig(CONFIG_FLOAT_RATE_HONOR_QUEST);
+        default:           return cp;
+    }
+}
+
 bool HonorMgr::Add(float cp, uint8 type, Unit const* source)
 {
     // Prevent give fake records to db with 0 honor
     if (!cp || !m_owner)
+        return false;
+
+    cp = ApplyRate(cp, type);
+    if (!cp)
         return false;
 
     // If not source, then give yourself

@@ -830,6 +830,7 @@ public:
     uint32 m_losRefusedMs = 0;
     uint32 m_sightLogMs = 0;
     uint32 m_tankSheepLogMs = 0;
+    uint32 m_tauntWhyLogMs = 0;     // [AIBOT-TAUNT] diagnostic throttle
     uint32 m_spacingHoldUntilMs = 0;   // a clear step that did not move me: hold and cast
     float m_spacingFromX = 0.0f, m_spacingFromY = 0.0f;
     uint8 m_spacingFutile = 0;
@@ -855,6 +856,7 @@ public:
     bool TrySpecInterrupt(Unit* target, std::initializer_list<uint32> spellIds);
     bool TrySpecInterruptNearby(std::initializer_list<uint32> spellIds, float range);
     bool TryLayOnHandsSave();
+    bool StopNearlyFullHeal();
     bool TrySpecTaunt(Unit* target);
     bool CommandSpecPet(Unit* target, bool mendHunterPet);
     bool UpdateSpecCombatWarrior(uint8 spec);

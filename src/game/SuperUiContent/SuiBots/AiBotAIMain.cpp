@@ -1476,7 +1476,7 @@ void AiBotAI::DoPartyFollow()
         m_hazardHoldUntil = 0;
     }
 
-    if (pBoss->GetMap() != me->GetMap())
+    if (!pBoss->IsInMap(me))
     {
         // A map/instance boundary must not become a delayed automatic summon.
         m_bossOffMapMs = 0;
@@ -1892,6 +1892,8 @@ void AiBotAI::UpdateAI(uint32 const diff)
     if (m_rotationSubTick.Passed())
     {   // cb:fold hot 4 Hz sub-tick cadence, cast decisions probed inside
         m_rotationSubTick.Reset(AIBOT_ROTATION_SUBTICK_MS);
+        if (!m_possessed && !m_suiManual && me && me->IsInWorld() && me->IsAlive() && me->IsInCombat())
+            StopNearlyFullHeal();
         // [SUI] Manual primary: the commander swings and casts from the sky, so the body must keep
         // facing its victim on its own (a driven client turns its own character; this one has no
         // driver). 4 Hz, planted only - a chasing body already faces where it runs.

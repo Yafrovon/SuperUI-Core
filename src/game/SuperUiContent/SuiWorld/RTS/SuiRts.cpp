@@ -125,6 +125,13 @@ int64 GetKVInt(std::string const& key, int64 def)
     return itr != s_kv.end() ? int64(strtoll(itr->second.c_str(), nullptr, 10)) : def;
 }
 
+void ReapplyRateOverrides()
+{
+    if (!s_loaded || !SuiWorldState::RtsWorldState())
+        return;
+    ApplyRates();
+}
+
 void LoadRuleset()
 {
     if (s_loaded)

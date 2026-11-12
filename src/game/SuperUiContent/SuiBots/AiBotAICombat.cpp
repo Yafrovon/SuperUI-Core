@@ -48,6 +48,7 @@
 #include "MoveMap.h"
 #include "DynamicObject.h"
 #include "SuiRaidTelemetry.h"
+#include "SuiRaidPlaybook.h"
 #include "SuiAutopilot.h"
 #include "Movement/WaypointManager.h"
 
@@ -3624,7 +3625,7 @@ bool AiBotAI::MaintainTankFacing(Unit* victim)
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
     {
         Player* m = itr->getSource();
-        if (!m || m == me || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != me->GetMap() ||
+        if (!m || m == me || !m->IsAlive() || !m->IsInWorld() || !m->IsInMap(me) ||
             IsSpecAoETankHolder(m) || !m->IsWithinDistInMap(victim, 40.0f))
             continue;
         cx += m->GetPositionX();
@@ -3971,6 +3972,29 @@ namespace
             }
     }
 
+    // Idle world bosses' reach alone (a wanderer's whole circle): never an escape spot - standing in the fire costs one
+    // member, pulling a boss costs the raid (2026-11-11, week 1, Baron Geddon at 35 %: a healer's two "out of the fire"
+    // steps ended 3 yd inside Shazzrah's wander circle, the idle penalty being only a score; he joined, all 40 died).
+    void CollectIdleBosses(Player* me, std::vector<GroundHazard>& out)
+    {
+        std::list<Creature*> near;
+        MaNGOS::AnyUnitInObjectRangeCheck check(me, 120.0f);
+        MaNGOS::CreatureListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(near, check);
+        Cell::VisitGridObjects(me, searcher, 120.0f);
+        for (Creature* c : near)
+            if (c->IsAlive() && c->IsWorldBoss() && !c->IsInCombat() && c->IsHostileTo(me))
+            {
+                out.push_back({c->GetPositionX(), c->GetPositionY(), 30.0f});
+                // round its home as far as it has wandered or may wander (same day: Shazzrah 23 yd from home walked up
+                // to an off-tank's fire step 33 yd from where he had stood)
+                float hx, hy, hz;
+                c->GetRespawnCoord(hx, hy, hz);
+                float const roamed = std::max(c->GetWanderDistance(), c->GetDistance2d(hx, hy));
+                if (roamed > 0.0f)
+                    out.push_back({hx, hy, 35.0f + roamed});
+            }
+    }
+
     // A spot the navmesh walks to from here in a short path - not a rock top or a pocket that looks
     // near and is not connected (2026-09-25: escapes onto a plateau beside Baron Geddon left healers
     // with no path back and no sight of the tank - and Geddon reset, unable to reach them).
@@ -4052,7 +4076,7 @@ bool AiBotAI::AvoidGroundHazard()
             float best = 1e9f;
             for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
                 if (Player* m = itr->getSource())
-                    if (m != me && m->IsAlive() && m->GetMap() == me->GetMap())
+                    if (m != me && m->IsAlive() && m->IsInMap(me))
                         best = std::min(best, m->GetDistance2d(x, y));
             return best;
         };
@@ -4154,6 +4178,8 @@ bool AiBotAI::AvoidGroundHazard()
     bool const melee = target && (role == ROLE_TANK || role == ROLE_MELEE_DPS);
     std::vector<GroundHazard> idle;
     CollectIdleHostiles(me, 60.0f, idle);
+    std::vector<GroundHazard> idleBosses;
+    CollectIdleBosses(me, idleBosses);
     // Out toward the raid, not away from it: a boss follows its tank out of every inferno, and
     // escapes that pick any side walk the fight across the room into the next pack (2026-09-25:
     // Baron Geddon drifted 100 yd in four Infernos and a Firewalker pack joined).
@@ -4162,7 +4188,7 @@ bool AiBotAI::AvoidGroundHazard()
     if (Group* group = me->GetGroup())
         for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
             if (Player* m = itr->getSource())
-                if (m != me && m->IsAlive() && m->IsInWorld() && m->GetMap() == me->GetMap() &&
+                if (m != me && m->IsAlive() && m->IsInWorld() && m->IsInMap(me) &&
                     me->IsWithinDistInMap(m, 60.0f))
                 {
                     ax += m->GetPositionX();
@@ -4195,7 +4221,8 @@ bool AiBotAI::AvoidGroundHazard()
             if (InHazard(hazards, x, y) || CrossesNewHazard(hazards, me->GetPositionX(), me->GetPositionY(), x, y))
                 continue;
             me->UpdateAllowedPositionZ(x, y, z);
-            if (std::fabs(z - me->GetPositionZ()) > 6.0f || !me->IsWithinLOS(x, y, z + 1.5f) || Molten(me, x, y, z))
+            if (std::fabs(z - me->GetPositionZ()) > 6.0f || !me->IsWithinLOS(x, y, z + 1.5f) || Molten(me, x, y, z) ||
+                InHazard(idleBosses, x, y))
                 continue;
             float score = dist;
             if (melee)
@@ -4419,7 +4446,7 @@ bool AiBotAI::AvoidFrontalCone()
 // (an awake one of a sleeping kind does not count: one Healer broke its sheep early and was held 36 yd off, so the
 // rule never fired - no tank by the sheeps, nobody out of their circles, six dead at the wake-up - 2026-11-09,
 // Majordomo attempt 84)
-static bool SleepersMayWake(std::list<Unit*> const& around)
+static bool SleepersMayWake(std::list<Unit*> const& around, bool anyHealth = false)
 {
     std::set<uint32> sleeping;
     for (Unit* u : around)
@@ -4436,7 +4463,7 @@ static bool SleepersMayWake(std::list<Unit*> const& around)
         }
     // (50 %, was 35 %: the free tanks walk 60 yd to the sheeps and the last Elite fell from 35 % in 8 s -
     // 2026-11-09, Majordomo attempt 86)
-    return awake == 0 || (awake == 1 && hp < 50.0f);
+    return awake == 0 || (awake == 1 && (anyHealth || hp < 50.0f));
 }
 
 // sleeping burster -> (the tank standing by it, until ms): one tank to each
@@ -4507,7 +4534,10 @@ bool AiBotAI::MaintainRangedSpacing()
             Unit* sleeper = nullptr;
             float bestD = 1e9f;
             uint32 const nowMs = WorldTimer::getMSTime();
-            if (SleepersMayWake(around))
+            // A free tank goes as soon as one add is left awake, whatever its health (no playbook release
+            // waiting for a tank): the last Elite died 14 s after the third and only one tank reached a sheep in
+            // time; three woke loose into the casters (2026-11-10, Majordomo verification V10).
+            if (SleepersMayWake(around, !AiBotAI::PlaybookReleaseTarget(me)))
             {
                 std::lock_guard<std::mutex> guard(gSleeperWatchLock);
                 for (Unit* u : around)
@@ -4679,7 +4709,9 @@ bool AiBotAI::MaintainRangedSpacing()
         bool const narrow = reachable > 0.0f && reachable + 1.2f <= 28.0f;
         // (a wounded melee leaves the whole circle too: it kept 14 yd inside a 20 yd Shadow Shock and three rogues
         // took two more at 20-48 % - 2026-11-09, Majordomo attempt 87)
-        if (!light && (woundedMelee || pulseOut || rapid || held || narrow))
+        // (playbook standInPulse: a boss whose circle the raid stands in - Ragnaros' Wrath, 1000 + knockback every ~26 s:
+        // kept out of it, ranged cast 54 % of the fight and the raid did 3.1k/s; standing in it, 70 % and 4.6k/s - 2026-11-10)
+        if (!light && !SuiRaidPlaybook::StandInPulse(u->GetEntry()) && (woundedMelee || pulseOut || rapid || held || narrow))
             if (float const pr = SuiRaidTelemetry::EntryPulseRadius(u->GetEntry()))
                 // `d` is edge to edge already, and the burst reaches pr past both edges: subtracting
                 // the sizes again stood healers inside it (same law as CollectGroundHazards)
@@ -4819,7 +4851,7 @@ bool AiBotAI::MaintainRangedSpacing()
                 for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
                 {
                     Player* o = itr->getSource();
-                    if (o && o != me && o->IsAlive() && o->IsInWorld() && o->GetMap() == me->GetMap() &&
+                    if (o && o != me && o->IsAlive() && o->IsInWorld() && o->IsInMap(me) &&
                         o->GetDistance2d(x, y) < r)
                         ++n;
                 }
@@ -4832,7 +4864,8 @@ bool AiBotAI::MaintainRangedSpacing()
                 me->GetEnemyListInRadiusAround(me, 100.0f, foes);
                 for (Unit* f : foes)
                     if (f && f->IsCreature() && f->IsAlive() && f->IsInCombat())
-                        splash = std::max(splash, SuiRaidTelemetry::EntrySplashRadius(f->GetEntry()));
+                        splash = std::max({splash, SuiRaidTelemetry::EntrySplashRadius(f->GetEntry()),
+                            SuiRaidPlaybook::SpreadYards(f->GetEntry())});
             }
             float const apart = splash > 0.0f ? std::max(5.0f, splash + 1.0f) : 5.0f;
             if (crowd(me->GetPositionX(), me->GetPositionY(), apart) >= (splash > 0.0f ? 1u : 2u))
@@ -4901,7 +4934,7 @@ bool AiBotAI::MaintainRangedSpacing()
             for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
             {
                 Player* t = itr->getSource();
-                if (!t || t == me || !t->IsAlive() || !t->IsInWorld() || t->GetMap() != me->GetMap() ||
+                if (!t || t == me || !t->IsAlive() || !t->IsInWorld() || !t->IsInMap(me) ||
                     !t->IsInCombat() || t->GetAttackers().empty() || t->GetHealthPercent() >= lowest ||
                     !me->IsWithinDistInMap(t, 80.0f) || (me->IsWithinDistInMap(t, 40.0f) && me->IsWithinLOSInMap(t)))
                     continue;
@@ -4914,7 +4947,7 @@ bool AiBotAI::MaintainRangedSpacing()
                 for (GroupReference* jtr = me->GetGroup()->GetFirstMember(); jtr && !seen; jtr = jtr->next())
                 {
                     Player* h = jtr->getSource();
-                    if (!h || !h->IsAlive() || h->GetMap() != me->GetMap() || h == t)
+                    if (!h || !h->IsAlive() || !h->IsInMap(me) || h == t)
                         continue;
                     AiBotAI* hai = dynamic_cast<AiBotAI*>(h->AI());
                     if (!hai || hai->GetCombatActiveRole() != ROLE_HEALER)
@@ -5102,7 +5135,7 @@ bool AiBotAI::MaintainRangedSpacing()
         float bestT = 40.0f;
         for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
             if (Player* m = itr->getSource())
-                if (m != me && m->IsAlive() && m->IsInWorld() && m->GetMap() == me->GetMap())
+                if (m != me && m->IsAlive() && m->IsInWorld() && m->IsInMap(me))
                     if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
                         if (ai->GetCombatActiveRole() == ROLE_TANK && me->GetDistance(m) < bestT)
                         {
@@ -5216,7 +5249,7 @@ Player* AiBotAI::ActiveTank() const
         for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
         {
             Player* m = itr->getSource();
-            if (!m || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != me->GetMap() || !me->IsWithinDistInMap(m, 80.0f))
+            if (!m || !m->IsAlive() || !m->IsInWorld() || !m->IsInMap(me) || !me->IsWithinDistInMap(m, 80.0f))
                 continue;
             AiBotAI const* ai = dynamic_cast<AiBotAI const*>(m->AI());
             if (!ai)
@@ -5262,7 +5295,7 @@ Player* AiBotAI::ActiveTank() const
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
     {
         Player* m = itr->getSource();
-        if (!m || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != me->GetMap() || !m->IsInCombat() ||
+        if (!m || !m->IsAlive() || !m->IsInWorld() || !m->IsInMap(me) || !m->IsInCombat() ||
             !me->IsWithinDistInMap(m, 80.0f))
             continue;
         float score = 0.0f;
@@ -5299,7 +5332,7 @@ bool AiBotAI::HealerOnDuty() const
     for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
     {
         Player* m = itr->getSource();
-        if (m && m != me && m->IsAlive() && m->IsInWorld() && m->GetMap() == me->GetMap() &&
+        if (m && m != me && m->IsAlive() && m->IsInWorld() && m->IsInMap(me) &&
             m->IsInCombat() && !m->GetAttackers().empty() &&
             me->IsWithinDistInMap(m, GetCombatActiveRole() == ROLE_HEALER ? 80.0f : 40.0f))
             return true;

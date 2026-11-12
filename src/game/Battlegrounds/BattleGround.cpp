@@ -1263,7 +1263,7 @@ void BattleGround::UpdatePlayerScore(Player* source, uint32 type, uint32 value)
         case SCORE_BONUS_HONOR:                             // Honor bonus
             // reward honor instantly
             if (source->GetHonorMgr().Add(value, BONUS))
-                itr->second->bonusHonor += value;
+                itr->second->bonusHonor += uint32(HonorMgr::ApplyRate(float(value), BONUS));
             break;
         default:
             sLog.Out(LOG_BASIC, LOG_LVL_ERROR, "BattleGround: Unknown player score type %u", type);

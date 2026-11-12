@@ -22,7 +22,8 @@ namespace SuiRaidPlaybook
     // Boss entries of a raid map in kill order (empty when the playbook has no order for it).
     std::vector<uint32> Order(uint32 mapId);
 
-    // Is this boss entry dead in `map` (the instance's respawn store, or a loaded corpse)?
+    // Is this boss entry dead in `map` (bosses.<entry>.doneData: that instance data reads DONE; else the
+    // instance's respawn store, or a loaded corpse)?
     bool BossDead(Map const* map, uint32 bossEntry);
 
     // The first boss before `bossEntry` in its map's order that is still alive in `map`, else 0.
@@ -49,6 +50,28 @@ namespace SuiRaidPlaybook
     // Where an add entry stands in its boss's kill order (bosses.<entry>.killOrder, add entries, the
     // first dies first): 0, 1, ...; -1 when the boss has no list or the add is not in it.
     int KillOrder(uint32 bossEntry, uint32 addEntry);
+
+    // A boss a friendly NPC summons through its gossip (bosses.<entry>.summonGossip): the NPC entry, where
+    // it stands, and how many times the first option is chosen (menu after menu) to start the summon.
+    // standAt (hasStand): where the raid waits for the summoned boss and pulls it from, else beside the NPC.
+    struct Gossip { uint32 npc; float at[3]; uint32 selects; bool hasStand; float stand[3]; };
+    bool SummonGossip(uint32 bossEntry, Gossip& out);
+
+    // How far apart the ranged and healers stand while this boss is in the fight (bosses.<entry>.spread), else 0: for a
+    // burst the boss does not cast itself, so the learned splash never sees it (Ragnaros: Might of Ragnaros summons a
+    // trigger on a random mana user that bursts 20 yd).
+    float SpreadYards(uint32 bossEntry);
+
+    // bosses.<entry>.standInPulse: the raid does not keep clear of this boss's learned pulse circle (a light, slow burst
+    // whose circle is as wide as the casters' reach).
+    bool StandInPulse(uint32 bossEntry);
+
+    // bosses.<entry>.prePotions: item entries every member drinks (if it carries one and does not wear its aura) while
+    // the raid waits for this boss (Ragnaros: Greater Fire Protection Potion, from the quartermaster's supply).
+    std::vector<uint32> PrePotions(uint32 bossEntry);
+
+    // bosses.<entry>.paladinAura: aura spell ids, highest rank first, every paladin of the raid holds for this boss.
+    std::vector<uint32> PaladinAura(uint32 bossEntry);
 }
 
 #endif

@@ -50,7 +50,7 @@
     }
   },
   "bosses": {
-    "_about": "Per boss entry: what its fight wants beyond the generic autopilot. lure = for a patrolling boss, the spot beside its walk where the leader waits for it to notice him (at); optional camp (used only when it is level with the lure, in its sight and walkable for the boss, else searched). killOrder = add entries in the order they die while this boss is in the fight (the first first); a sheeped add of an earlier kind than every awake one is woken and killed (the lowest guid first), the rest stay held. lure.clearance = how far every idle pack must stand from the lure (default 45 yd).",
+    "_about": "Per boss entry: what its fight wants beyond the generic autopilot. lure = for a patrolling boss, the spot beside its walk where the leader waits for it to notice him (at); optional camp (used only when it is level with the lure, in its sight and walkable for the boss, else searched). killOrder = add entries in the order they die while this boss is in the fight (the first first); a sheeped add of an earlier kind than every awake one is woken and killed (the lowest guid first), the rest stay held. lure.clearance = how far every idle pack must stand from the lure (default 45 yd). doneData = the instance data index that reads DONE (3) once the boss is beaten: judges a boss that yields or is summoned by a script (no spawn row). summonGossip = a boss a friendly NPC summons through its gossip: npc entry, where it stands (at), how many times the first option is chosen (selects). spread = yards the ranged and healers keep apart while this boss is in the fight (a burst the boss does not cast itself). standInPulse = true: the raid does not keep clear of this boss's learned pulse circle. prePotions = item entries every member drinks while the raid waits for this boss (a shield worn into the fight). paladinAura = aura spell ids (highest rank first) every paladin holds for this boss.",
     "12056": {
       "name": "Baron Geddon",
       "lure": {
@@ -67,10 +67,57 @@
     "12018": {
       "name": "Majordomo Executus",
       "killOrder": [
-        11663,
-        11664
+        11664,
+        11663
       ],
-      "why": "Four Flamewaker Elites (immune to Polymorph) and four Flamewaker Healers (Shadow Bolt, Shadow Shock: an instant 20 yd burst; no heal) come together. The Healers are sheeped while the tanked Elites die; once half the adds are down the Healers turn immune to Polymorph (Immunity 21087, mechanic 17) and wake. 2026-11-06 (17 tries): Elites first killed all four twice (by 148 s), then the four awake Healers wiped the raid; Healers first (released one at a time) killed one Healer in 41-82 s while the released one ran loose - worse. 2026-11-07 evening, FIVE tanks (owner): Healers first again. Elites first now kills all four by 83 s with 39 alive, but the 4th add's death wakes the four Healers at once, immune to Polymorph, and their 20 yd Shadow Shocks killed 39 in 36 s. With five tanks every Elite is held, so the Healers die one at a time while the others sleep and the wake-up leaves tanked Elites. Same evening: Healers first lost three of three with five tanks (released Healers die at ~3k/s while four tanked Elites Blast Wave for 120 s, the healers run dry, the tanks die); back to Elites first, with the free tanks standing by the sleeping Healers before the last Elite dies. Then Elites first with tanks staged by the sleeping Healers: the sheeps lie within 20 yd of each other, so every staged tank took all four first Shadow Shocks (two dead in 2 s). Healers first again, now that the release, its reach and the healers mana potions work. Healers first with the fixed release: one attempt, the opening collapsed (the awake first Healer killed all eight melee in 12 s) - untested. Elites first stays the default: twice all four Elites dead by 78-90 s with 39 alive. 2026-11-08 (owner: Healers first, five tanks): Healers first, and a sheep is woken only when a tank is free (tanks > awake enemies), so the first Elite dies first, then the Healers one at a time on the freed tank; the fourth death then leaves one Polymorph-immune Healer and three tanked Elites. 2026-11-08 morning, 12 tries (15-26): with the free-tank gate, the tank waking the release itself and the death-order guard, Healers first killed up to five of the eight (E, H, E, H, H by 136 s); losses = tank deaths at 50-130 s (Elite melee and casts, tanks spread beyond heal reach) and slow kills (ranged cast ~40 %). Elites first with the same fixes: Elites by 165 s with 28 alive, then the wake-up wipe. Healers first stays the default."
+      "why": "Four Flamewaker Elites (immune to Polymorph) and four Flamewaker Healers (Shadow Bolt, Shadow Shock: an instant 20 yd burst; no heal) come together. The Healers are sheeped while the tanked Elites die; once half the adds are down the Healers turn immune to Polymorph (Immunity 21087, mechanic 17) and wake. 2026-11-06 (17 tries): Elites first killed all four twice (by 148 s), then the four awake Healers wiped the raid; Healers first (released one at a time) killed one Healer in 41-82 s while the released one ran loose - worse. 2026-11-07 evening, FIVE tanks (owner): Healers first again. Elites first now kills all four by 83 s with 39 alive, but the 4th add's death wakes the four Healers at once, immune to Polymorph, and their 20 yd Shadow Shocks killed 39 in 36 s. With five tanks every Elite is held, so the Healers die one at a time while the others sleep and the wake-up leaves tanked Elites. Same evening: Healers first lost three of three with five tanks (released Healers die at ~3k/s while four tanked Elites Blast Wave for 120 s, the healers run dry, the tanks die); back to Elites first, with the free tanks standing by the sleeping Healers before the last Elite dies. Then Elites first with tanks staged by the sleeping Healers: the sheeps lie within 20 yd of each other, so every staged tank took all four first Shadow Shocks (two dead in 2 s). Healers first again, now that the release, its reach and the healers mana potions work. Healers first with the fixed release: one attempt, the opening collapsed (the awake first Healer killed all eight melee in 12 s) - untested. Elites first stays the default: twice all four Elites dead by 78-90 s with 39 alive. 2026-11-08 (owner: Healers first, five tanks): Healers first, and a sheep is woken only when a tank is free (tanks > awake enemies), so the first Elite dies first, then the Healers one at a time on the freed tank; the fourth death then leaves one Polymorph-immune Healer and three tanked Elites. 2026-11-08 morning, 12 tries (15-26): with the free-tank gate, the tank waking the release itself and the death-order guard, Healers first killed up to five of the eight (E, H, E, H, H by 136 s); losses = tank deaths at 50-130 s (Elite melee and casts, tanks spread beyond heal reach) and slow kills (ranged cast ~40 %). Elites first with the same fixes: Elites by 165 s with 28 alive, then the wake-up wipe. Healers first stays the default. 2026-11-09 (six tanks: new warrior Stormdoom as the off-tank, on Majordomo the whole fight): Healers first now kills three Healers by 120-130 s with no Elite dead, but the healers (3.3-3.9k health, one mana potion) are dry by ~100-130 s and the raid wipes. Elites first again: Elites can be meleed (no 20 yd burst), and the wake-up now meets five free tanks for four Healers.",
+      "summonAt": [
+        758.089,
+        -1176.71,
+        -118.64
+      ],
+      "summonAtWhy": "Summoned by instance_molten_core when the last rune is doused (no spawn row); the raid walks here once nothing else is on the way (2026-11-10).",
+      "doneData": 8,
+      "doneDataWhy": "TYPE_MAJORDOMO (molten_core.h): he yields, never dies, and has no spawn row - without it he counted as alive forever and the raid walked back to his empty terrace (2026-11-10)."
+    },
+    "11502": {
+      "name": "Ragnaros",
+      "doneData": 9,
+      "summonAt": [
+        838.3,
+        -831.5,
+        -232.2
+      ],
+      "summonGossip": {
+        "npc": 12018,
+        "at": [
+          847.103,
+          -816.153,
+          -229.775
+        ],
+        "selects": 3,
+        "standAt": [
+          815.0,
+          -838.0,
+          -229.0
+        ],
+        "standAtWhy": "West platform, where attempt 1 (2026-11-10) fought from: tanks at ~(824,-835), healers and ranged 15-30 yd west; Ragnaros 100 -> 34 %. Gathered by Majordomo on the east side instead (attempt 4): 79 %."
+      },
+      "why": "Summoned by the yielded Majordomo's gossip in his chamber (instance_molten_core summons the friendly one there after a restart with TYPE_MAJORDOMO DONE): menus 4093 -> 4109 -> 4108, option 0 each, then gossip_scripts 4108 starts the event; Ragnaros rises ~28 s later, kills Majordomo at ~+76 s and is attackable ~10 s after (SetInCombatWithZone). Rooted; Magma Blast when nobody is in melee range; Wrath of Ragnaros knocks melee back; submerges at 3 min with eight Sons of Flame for 90 s. After a wipe he resets in place (no new gossip). 2026-11-10.",
+      "spread": 15,
+      "spreadWhy": "Might of Ragnaros (every 9-14 s) summons a Flame of Ragnaros on a random mana user that casts Intense Heat: 2000 fire + knockback to everyone within 20 yd (spell 21155, radius index 9). 2026-11-10 attempt 1: Ragnaros 100 -> 36 % in 120 s, then one burst killed ten stacked ranged (1.7-2.3k health) in the same second. Attempts 5-6 with 20: no or few Intense Heat deaths in 5, but the ranged spent 15-25 % of the fight on spread/clear steps (cast 40-54 %); 6 (standing in Wrath, nearer him) lost 16 to Intense Heat anyway. 10 = an Intense Heat hits a few, not ten. Attempts 7-9 with 10: Intense Heat still killed 10-16 a fight (several casters per burst); 15 tried next.",
+      "standInPulse": true,
+      "standInPulseWhy": "Wrath of Ragnaros (20566): ~1000 + knockback within 25 yd every ~26 s, learned as a 25 yd pulse. Kept clear of it (attempt 5, 2026-11-10) the ranged spent their time on 'clear' steps between 26 yd and their reach: cast 54 %, raid 3.1k/s, Ragnaros 63 % left; before it was learned (attempt 1) they stood and cast 70 %, 4.6k/s, 34 % left, and Wrath killed nobody.",
+      "prePotions": [
+        13457
+      ],
+      "prePotionsWhy": "Greater Fire Protection Potion (quartermaster supply, 10 each): absorbs ~1950-3250 fire for 1 h - about one Intense Heat or two Lava Bursts per caster. Drunk only mid-fight before (below 85 %, never by healers); attempts 1-10 lost 13-26 casters a fight to fire.",
+      "paladinAura": [
+        19900,
+        19899,
+        19891
+      ],
+      "paladinAuraWhy": "Fire Resistance Aura (60/45/30 fire resistance to the paladin's party): Ragnaros' damage is all fire. The bots pick a random aura of seven otherwise."
     }
   }
 }

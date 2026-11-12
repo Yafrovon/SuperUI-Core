@@ -71,6 +71,7 @@
 #include "PlayerBotMgr.h"
 #include "SuiWorldState.h"
 #include "SuiRts.h"
+#include "SuiRates.h"
 #include "SuiKarting.h"
 #include "ZoneScriptMgr.h"
 #include "CharacterDatabaseCache.h"
@@ -510,9 +511,13 @@ void World::LoadConfigSettings(bool reload)
     setConfig(CONFIG_FLOAT_RATE_XP_EXPLORE,              "Rate.XP.Explore", 1.0f);
     setConfigMin(CONFIG_FLOAT_RATE_XP_PERSONAL_MIN,      "Rate.XP.Personal.Min", 1.0f, 0.0f);
     setConfigMin(CONFIG_FLOAT_RATE_XP_PERSONAL_MAX,      "Rate.XP.Personal.Max", 1.0f, 0.0f);
+    SuiRates::LoadLevelCurve(sConfig.GetStringDefault("Rate.XP.LevelCurve", ""));
     setConfig(CONFIG_FLOAT_RATE_REPUTATION_GAIN,           "Rate.Reputation.Gain", 1.0f);
     setConfig(CONFIG_FLOAT_RATE_REPUTATION_LOWLEVEL_KILL,  "Rate.Reputation.LowLevel.Kill", 1.0f);
     setConfig(CONFIG_FLOAT_RATE_REPUTATION_LOWLEVEL_QUEST, "Rate.Reputation.LowLevel.Quest", 1.0f);
+    setConfigPos(CONFIG_FLOAT_RATE_REPUTATION_KILL,        "Rate.Reputation.Kill", 1.0f);
+    setConfigPos(CONFIG_FLOAT_RATE_REPUTATION_QUEST,       "Rate.Reputation.Quest", 1.0f);
+    setConfigPos(CONFIG_FLOAT_RATE_REPUTATION_SPELL,       "Rate.Reputation.Spell", 1.0f);
     setConfigPos(CONFIG_FLOAT_RATE_CREATURE_NORMAL_DAMAGE,               "Rate.Creature.Normal.Damage", 1.0f);
     setConfigPos(CONFIG_FLOAT_RATE_CREATURE_ELITE_ELITE_DAMAGE,          "Rate.Creature.Elite.Elite.Damage", 1.0f);
     setConfigPos(CONFIG_FLOAT_RATE_CREATURE_ELITE_RAREELITE_DAMAGE,      "Rate.Creature.Elite.RAREELITE.Damage", 1.0f);
@@ -549,6 +554,10 @@ void World::LoadConfigSettings(bool reload)
     setConfig(CONFIG_UINT32_RESPEC_MULTIPLICATIVE_COST, "Rate.RespecMultiplicativeCost", 5);
     setConfig(CONFIG_UINT32_RESPEC_MIN_MULTIPLIER,      "Rate.RespecMinMultiplier", 2);
     setConfig(CONFIG_UINT32_RESPEC_MAX_MULTIPLIER,      "Rate.RespecMaxMultiplier", 10);
+
+    // A runtime .reload config must not silently drop an RTS world's boot rate overrides.
+    if (reload)
+        SuiRts::ReapplyRateOverrides();
 
     setConfigMinMax(CONFIG_FLOAT_RATE_TARGET_POS_RECALCULATION_RANGE, "TargetPosRecalculateRange", 1.5f, CONTACT_DISTANCE, ATTACK_DISTANCE);
 
@@ -651,6 +660,11 @@ void World::LoadConfigSettings(bool reload)
     }
 
     setConfigMinMax(CONFIG_FLOAT_RP_DECAY, "RpDecay", 0.2f, 0.0f, 1.0f);
+    setConfigPos(CONFIG_FLOAT_RATE_HONOR_KILL,        "Rate.Honor.Kill", 1.0f);
+    setConfigPos(CONFIG_FLOAT_RATE_HONOR_BONUS,       "Rate.Honor.Bonus", 1.0f);
+    setConfigPos(CONFIG_FLOAT_RATE_HONOR_QUEST,       "Rate.Honor.Quest", 1.0f);
+    setConfigPos(CONFIG_FLOAT_RATE_HONOR_DISHONOR,    "Rate.Honor.Dishonor", 1.0f);
+    setConfigPos(CONFIG_FLOAT_RATE_HONOR_RANK_POINTS, "Rate.Honor.RankPoints", 1.0f);
     setConfigMinMax(CONFIG_UINT32_MAINTENANCE_DAY, "MaintenanceDay", 4, 0, 6);
     setConfig(CONFIG_BOOL_AUTO_HONOR_RESTART, "AutoHonorRestart", true);
     setConfig(CONFIG_BOOL_ALL_TAXI_PATHS, "AllFlightPaths", false);

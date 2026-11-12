@@ -41,6 +41,18 @@
 #include <cstdio>
 #include <list>
 
+// The unit a cast in progress is aimed at, looked up by its guid on `me`'s map; null once it has left the map. Never
+// the cast's raw target pointer: a TEMPSUMMON_DEAD_DESPAWN add is deleted the moment it dies, and a member still
+// casting or auto-shooting at it keeps that pointer until its spell updates (2026-11-10: mangosd SIGSEGV in
+// HasBreakableByDamageCrowdControlAura as Majordomo's last add died, twice - 14:46 and 16:21).
+static Unit* CastTarget(Player const* me, Spell const* cast)
+{
+    ObjectGuid const guid = cast->m_targets.getUnitTargetGuid();
+    if (guid.IsEmpty() || !me->IsInWorld())
+        return nullptr;
+    return const_cast<Player*>(me)->GetMap()->GetUnit(guid);
+}
+
 namespace
 {
 enum SpecSpell : uint32
@@ -432,7 +444,7 @@ void AiBotAI::UpdateOffTankDuty()
             if (Spell* s = m->GetCurrentSpell(CURRENT_GENERIC_SPELL))
                 if (s->m_spellInfo && (s->m_spellInfo->Mechanic == MECHANIC_POLYMORPH || s->m_spellInfo->Mechanic == MECHANIC_BANISH ||
                     s->m_spellInfo->Mechanic == MECHANIC_SHACKLE || s->m_spellInfo->EffectMechanic[0] == MECHANIC_POLYMORPH))
-                    if (Unit* t = s->m_targets.getUnitTarget())
+                    if (Unit* t = CastTarget(me, s))
                         beingControlled.insert(t);
     std::list<Unit*> nearby;
     MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, 60.0f);
@@ -969,12 +981,12 @@ namespace
         for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
         {
             Player* m = itr->getSource();
-            if (!m || !m->IsAlive() || m->GetMap() != me->GetMap())
+            if (!m || !m->IsAlive() || !m->IsInMap(me))
                 continue;
             Spell* cast = m->GetCurrentSpell(CURRENT_GENERIC_SPELL);
             if (!cast || !cast->m_spellInfo || !(cast->m_spellInfo->GetSpellMechanicMask(7) & ccMask))
                 continue;
-            Unit* t = cast->m_targets.getUnitTarget();
+            Unit* t = CastTarget(me, cast);
             if (t && t->IsAlive() && t->GetDistance2d(x, y) < radius + t->GetObjectBoundingRadius())
                 return true;
         }
@@ -1055,7 +1067,7 @@ namespace
         for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
         {
             Player* m = itr->getSource();
-            if (!m || !m->IsAlive() || m->GetMap() != me->GetMap())
+            if (!m || !m->IsAlive() || !m->IsInMap(me))
                 continue;
             Spell* channel = m->GetCurrentSpell(CURRENT_CHANNELED_SPELL);
             if (!channel || !channel->m_spellInfo || !(channel->m_targets.m_targetMask & TARGET_FLAG_DEST_LOCATION))
@@ -1231,6 +1243,20 @@ bool AiBotAI::TrySpecTaunt(Unit* target)
     for (SpellEntry const* taunt : m_spellListTaunt)
         if (TrySpecSpell(target, taunt))
             return true;   // cb:fold rotation rung, outcome probed at cast
+    // (diagnostic 2026-11-10: Majordomo verification V5 - Taunt "gate" 104 times, never cast, while woken Healers turned on
+    // the casters; which check refuses it)
+    uint32 const nowMs = WorldTimer::getMSTime();
+    if (!m_spellListTaunt.empty() && nowMs >= m_tauntWhyLogMs && target->IsCreature())
+    {
+        m_tauntWhyLogMs = nowMs + 5000;
+        SpellEntry const* t = m_spellListTaunt.front();
+        Unit* holder = target->GetVictim();
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
+            "[AIBOT-TAUNT] %s: %s on %s (on %s) not cast: ready %d gcd %d form %d immune %d reach %d dist %.1f",
+            me->GetName(), t->SpellName[0].c_str(), target->GetName(), holder ? holder->GetName() : "nobody",
+            me->IsSpellReady(t->Id), me->HasGCD(t), uint32(t->GetErrorAtShapeshiftedCast(me->GetShapeshiftForm())),
+            target->IsImmuneToSpell(t, false), me->CanReachWithMeleeSpellAttack(target), me->GetDistance(target));
+    }
     return false;
 }
 
@@ -1349,6 +1375,38 @@ bool AiBotAI::TryCombatPotion()
     return false;
 }
 
+// Called on every 4 Hz combat sub-tick, mid-cast included (the spec rotation itself is not).
+bool AiBotAI::StopNearlyFullHeal()
+{
+    // A direct heal about to land on someone who no longer needs most of it is stopped in its last half second - mana is
+    // spent only when a cast completes, so the stop costs a moment, not the spell (2026-11-10, Ragnaros: overheal 40-50 %
+    // per healer while the healers spent up to 65 s of a 146 s fight out of mana). The melee about to land on the target
+    // counts as missing already, so a tank's heal before the next blow goes through.
+    Spell* cast = me->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+    if (cast)
+        if (cast->m_spellInfo && cast->getState() == SPELL_STATE_PREPARING && cast->GetCastedTime() > 0 &&
+            cast->GetCastedTime() <= 500)
+            if (Unit* to = CastTarget(me, cast))
+                if (to->IsAlive() && !to->IsHostileTo(me))
+                {
+                    int32 heal = 0;
+                    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                        if (cast->m_spellInfo->Effect[i] == SPELL_EFFECT_HEAL)
+                            heal += cast->m_spellInfo->EffectBasePoints[i] + 1;
+                    int32 const missing = int32(to->GetMaxHealth() - to->GetHealth()) + GetIncomingdamage(to) -
+                        IncomingGroupHeals(to);
+                    if (heal > 0 && missing * 2 < heal)
+                    {
+                        CB_HIT(me->GetGUIDLow(), "cpp-spec: heal stopped, target nearly full");
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEALSTOP] %s: %s on %s stopped - missing %d of %d",
+                            me->GetName(), cast->m_spellInfo->SpellName[0].c_str(), to->GetName(), missing, heal);
+                        me->InterruptSpell(CURRENT_GENERIC_SPELL);
+                        return true;
+                    }
+                }
+    return false;
+}
+
 bool AiBotAI::UpdateSpecCombatAI()
 {
     uint8 const spec = GetCombatSpecTab();
@@ -1362,7 +1420,7 @@ bool AiBotAI::UpdateSpecCombatAI()
     // seconds after a mage re-sheeped it).
     for (CurrentSpellTypes type : { CURRENT_AUTOREPEAT_SPELL, CURRENT_GENERIC_SPELL, CURRENT_CHANNELED_SPELL })
         if (Spell* cast = me->GetCurrentSpell(type))
-            if (Unit* at = cast->m_targets.getUnitTarget())
+            if (Unit* at = CastTarget(me, cast))
                 if (at != me && at->IsAlive() && at->HasBreakableByDamageCrowdControlAura() &&
                     at != PlaybookReleaseTarget(me) && cast->m_spellInfo && DamagingSpell(cast->m_spellInfo))
                     me->InterruptSpell(type);
@@ -2734,7 +2792,7 @@ Player* AiBotAI::SelectValuedDispelTarget(SpellEntry const* spell, float minValu
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
     {
         Player* m = itr->getSource();
-        if (!m || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != me->GetMap() || m->IsGameMaster())
+        if (!m || !m->IsAlive() || !m->IsInWorld() || !m->IsInMap(me) || m->IsGameMaster())
             continue;
         // a member a creature has charmed is hostile for now, and the dispel is what frees it
         bool const charmed = !m->GetCharmerGuid().IsEmpty() && !m->GetCharmerGuid().IsPlayer();
@@ -2945,14 +3003,14 @@ bool AiBotAI::TrySpecPolymorphSpareElite()
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
     {
         Player* m = itr->getSource();
-        if (!m || !m->IsAlive() || m->GetMap() != me->GetMap())
+        if (!m || !m->IsAlive() || !m->IsInMap(me))
             continue;
         if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
             if (ai->GetCombatActiveRole() == ROLE_TANK)
                 ++tanks;
         if (Spell* s = m->GetCurrentSpell(CURRENT_GENERIC_SPELL))
             if (s->m_spellInfo && s->m_spellInfo->SpellIconID == poly->SpellIconID)
-                if (Unit* u = s->m_targets.getUnitTarget())
+                if (Unit* u = CastTarget(me, s))
                     castTargets.insert(u);
     }
     std::list<Unit*> nearby;
@@ -3107,14 +3165,14 @@ bool AiBotAI::TrySpecBanishSpareElite()
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
     {
         Player* m = itr->getSource();
-        if (!m || !m->IsAlive() || m->GetMap() != me->GetMap())
+        if (!m || !m->IsAlive() || !m->IsInMap(me))
             continue;
         if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
             if (ai->GetCombatActiveRole() == ROLE_TANK)
                 ++tanks;
         if (Spell* s = m->GetCurrentSpell(CURRENT_GENERIC_SPELL))
             if (s->m_spellInfo && s->m_spellInfo->SpellIconID == banish->SpellIconID)
-                if (Unit* u = s->m_targets.getUnitTarget())
+                if (Unit* u = CastTarget(me, s))
                     castTargets.insert(u);
     }
     std::list<Unit*> nearby;

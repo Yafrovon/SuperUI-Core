@@ -31,6 +31,7 @@
 #include "SuiPossess.h"
 #include "SuiTacticalFreeze.h"
 #include "SuiRts.h"
+#include "SuiRates.h"
 #include "Database/DatabaseEnv.h"
 #include "Log.h"
 #include "Opcodes.h"
@@ -3101,6 +3102,11 @@ void Player::GiveXP(uint32 xp, Unit const* victim)
 
     if (GetPersonalXpRate() >= 0.0f)
         xp *= GetPersonalXpRate();
+
+    // SuperUI: per-level XP curve (Rate.XP.LevelCurve), applied to every XP source.
+    float const levelCurveRate = SuiRates::LevelCurveRate(GetLevel());
+    if (levelCurveRate != 1.0f)
+        xp = uint32(xp * levelCurveRate + 0.5f);
 
     if (xp < 1)
         return;
@@ -6512,6 +6518,21 @@ int32 Player::CalculateReputationGain(ReputationSource source, int32 rep, int32 
 
     if (rate != 1.0f && creatureOrQuestLevel <= MaNGOS::XP::GetGrayLevel(GetLevel()))
         percent *= rate;
+
+    // SuperUI: global per-source rate (Rate.Reputation.Kill/Quest/Spell), on top of
+    // the low-level penalty above and the per-faction table below.
+    switch (source)
+    {
+        case REPUTATION_SOURCE_KILL:
+            percent *= sWorld.getConfig(CONFIG_FLOAT_RATE_REPUTATION_KILL);
+            break;
+        case REPUTATION_SOURCE_QUEST:
+            percent *= sWorld.getConfig(CONFIG_FLOAT_RATE_REPUTATION_QUEST);
+            break;
+        case REPUTATION_SOURCE_SPELL:
+            percent *= sWorld.getConfig(CONFIG_FLOAT_RATE_REPUTATION_SPELL);
+            break;
+    }
 
     if (percent <= 0.0f)
         return 0;

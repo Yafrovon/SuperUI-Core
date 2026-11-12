@@ -11,7 +11,9 @@
 #include "Chat.h"
 #include "Creature.h"
 #include "GameObject.h"
+#include "Bag.h"
 #include "LootMgr.h"
+#include "InstanceData.h"
 #include "Group.h"
 #include "Map.h"
 #include "MotionMaster.h"
@@ -19,6 +21,7 @@
 #include "ObjectMgr.h"
 #include "PathFinder.h"
 #include "Player.h"
+#include "GossipDef.h"
 #include "Spell.h"
 #include "Pet.h"
 #include "Log.h"
@@ -115,6 +118,9 @@ namespace
         std::map<uint32, uint32> exploreSkip;   // spawn guid -> retry after
         std::map<uint32, uint32> usedObjects;   // scripted object spawn guid -> retry after (ms clock)
         uint32 useStep = 0;                      // 0 = walk to it, 1 = beside it: use
+        uint32 gossipGatherUntilMs = 0;          // summon gossip: beside the NPC, the raid gathers until then
+        uint32 gossipHoldUntilMs = 0;            // summon gossip done: the boss is on its way until then
+        bool gossipTalked = false;               // the hold above follows a gossip (not a missing NPC)
         uint32 exploreStallMs = 0;
         std::map<uint32, uint32> wipesByEntry;
         std::map<uint32, uint32> deferEntry;     // entry -> retry after (ms clock): it keeps winning
@@ -226,7 +232,7 @@ namespace
         for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
         {
             Player* m = itr->getSource();
-            if (!m || !m->IsInWorld() || m->GetMap() != leader->GetMap())
+            if (!m || !m->IsInWorld() || !m->IsInMap(leader))
                 continue;
             ++r.members;
             if (!m->IsAlive())
@@ -289,6 +295,30 @@ namespace
                 return WorldTimer::getMSTime() < z.until && std::fabs(c->GetPositionZ() - z.z) < 25.0f &&
                     c->GetDistance2d(z.x, z.y) < z.r;
             });
+    }
+
+    // Which Pullable check refuses c (diagnostic 2026-11-10: Majordomo's eight adds stood 75 yd from the leader and
+    // "0 pullable" for minutes)
+    char const* PullableWhy(Player* me, Creature* c, Pilot const& pilot)
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (!c->IsAlive() || !c->IsInWorld()) return "dead/out of world";
+        if (c->IsInCombat()) return "in combat";
+        if (c->IsTotem() || c->IsCivilian() || c->GetCreatureType() == CREATURE_TYPE_CRITTER) return "totem/civilian/critter";
+        if (!c->IsHostileTo(me)) return "not hostile";
+        if (!me->IsValidAttackTarget(c)) return "not a valid attack target";
+        if (c->GetUInt32Value(UNIT_NPC_FLAGS)) return "npc flags";
+        if (c->IsGuard()) return "guard";
+        if (c->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NOT_SELECTABLE)) return "not selectable";
+        if (c->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NON_ATTACKABLE_2)) return "non-attackable";
+        if (c->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PLAYER)) return "immune to players";
+        if (pilot.skip.count(c->GetObjectGuid()) && nowMs < pilot.skip.at(c->GetObjectGuid())) return "skipped (no path)";
+        if (IsCleared(c)) return "cleared spawn";
+        if (pilot.deferEntry.count(c->GetEntry()) && nowMs < pilot.deferEntry.at(c->GetEntry())) return "entry deferred";
+        for (Pilot::Zone const& z : pilot.deferZones)
+            if (nowMs < z.until && std::fabs(c->GetPositionZ() - z.z) < 25.0f && c->GetDistance2d(z.x, z.y) < z.r)
+                return "in a deferred zone";
+        return "pullable";
     }
 
     bool SamePack(Creature* target, Creature* c);
@@ -470,6 +500,15 @@ namespace
             sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
                 "[AUTOPILOT] %s: pick found nothing - %u idle hostiles in %.0f yd, %u pullable, %u behind a deferred area, %u without a path",
                 me->GetName(), inRange, radius, uint32(byLine.size()), crossing, pathless);
+            Creature* nearest = nullptr;
+            for (Creature* c : nearby)
+                if (c->IsAlive() && c->IsHostileTo(me) && !c->IsInCombat() && me->IsWithinDistInMap(c, 100.0f) &&
+                    (!nearest || me->GetDistance(c) < me->GetDistance(nearest)))
+                    nearest = c;
+            if (nearest)
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: nearest idle hostile %s (entry %u, %.0f yd): %s%s",
+                    me->GetName(), nearest->GetName(), nearest->GetEntry(), me->GetDistance(nearest),
+                    PullableWhy(me, nearest, pilot), WaitsForEarlierBoss(me, pilot, nearest) ? ", waits for an earlier boss" : "");
         }
         return best;
     }
@@ -894,6 +933,10 @@ namespace
             auto used = pilot.usedObjects.find(pair.first);
             if (used != pilot.usedObjects.end() && nowMs < used->second)
                 return false;
+            // a loaded object already used (a doused rune) is done
+            if (GameObject const* live = me->GetMap()->GetGameObject(ObjectGuid(HIGHGUID_GAMEOBJECT, data.id, pair.first)))
+                if (live->GetGoState() != GO_STATE_READY)
+                    return false;
             // An encounter's rune waits for its boss: it is doused only once he is dead, and walking to
             // it pulls him (2026-11-03: "nothing left to fight - going to use" the Rune of Mohn, Garr
             // pulled with the raid strung out behind the leader).
@@ -921,6 +964,12 @@ namespace
     {
         if (!me->GetMap()->IsDungeon() || me->IsInCombat())
             return false;
+        // Once the next boss is summoned by an NPC's gossip, the encounter's objects are done (2026-11-10: with Ragnaros
+        // next, the leader teleported round all seven doused runes of Molten Core, the raid in tow).
+        SuiRaidPlaybook::Gossip gossip;
+        if (uint32 const first = SuiRaidPlaybook::FirstAliveBoss(me->GetMap()))
+            if (SuiRaidPlaybook::SummonGossip(first, gossip))
+                return false;
         uint32 guid = 0, entry = 0;
         float x = 0, y = 0, z = 0;
         if (!NextScriptedObject(me, pilot, guid, entry, x, y, z))
@@ -944,6 +993,202 @@ namespace
         Note(pilot, me, "using %s", go->GetName());
         go->Use(me);
         Regroup(me);   // the raid comes along (setup move)
+        return true;
+    }
+
+    // A boss a friendly NPC summons through its gossip (playbook summonGossip; Ragnaros, by the yielded Majordomo in
+    // his chamber): once every boss before it is beaten and nothing is left to fight, the leader walks to the NPC, the
+    // raid gathers there, and the leader chooses the first option menu after menu. While the summon plays (Ragnaros:
+    // ~90 s, not selectable) the raid holds; true while this step owns the leader.
+    // A living creature of `entry` within `radius` of a point, wherever the leader stands (loaded grids only).
+    struct EntryNearPoint
+    {
+        uint32 entry; float x, y, radius;
+        bool operator()(Creature* c) const
+        {
+            return c->GetEntry() == entry && c->IsAlive() && c->GetDistance2d(x, y) <= radius;
+        }
+    };
+    Creature* FindNearPoint(Player* me, uint32 entry, float x, float y, float radius)
+    {
+        std::list<Creature*> found;
+        EntryNearPoint check{entry, x, y, radius};
+        MaNGOS::CreatureListSearcher<EntryNearPoint> searcher(found, check);
+        TypeContainerVisitor<MaNGOS::CreatureListSearcher<EntryNearPoint>, GridTypeMapContainer> visitor(searcher);
+        CellPair const pair = MaNGOS::ComputeCellPair(x, y);
+        Cell cell(pair);
+        cell.SetNoCreate();
+        cell.Visit(pair, visitor, *me->GetMap(), x, y, radius);
+        return found.empty() ? nullptr : found.front();
+    }
+
+    // While a gossip-summoned boss rises: the leader on the playbook's stand spot (setup move), the raid gathered on it
+    // (2026-11-10, Ragnaros: from the west platform attempt 1 took him to 34 %; gathered beside Majordomo on the east
+    // side, on three Lava Burst spots and inside his knockback, attempt 4 took him to 79 %).
+    // The first item of `entry` a player carries (backpack, then bags), else null.
+    Item* CarriedItem(Player* p, uint32 entry)
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < INVENTORY_SLOT_ITEM_END; ++slot)
+            if (Item* it = p->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
+                if (it->GetEntry() == entry)
+                    return it;
+        for (uint8 bag = INVENTORY_SLOT_BAG_START; bag < INVENTORY_SLOT_BAG_END; ++bag)
+            if (Bag* b = dynamic_cast<Bag*>(p->GetItemByPos(INVENTORY_SLOT_BAG_0, bag)))
+                if (Item* it = b->GetItemByEntry(entry))
+                    return it;
+        return nullptr;
+    }
+
+    // While the raid waits for a boss, everyone drinks the playbook's potions for it that last (a school shield worn
+    // into the fight) - 2026-11-10, Ragnaros: Intense Heat (2000 fire) and Lava Burst (~1000 fire) killed 13-26 casters
+    // a fight at 1.7-2.3k health; the quartermaster's Greater Fire Protection Potions were drunk only mid-fight, below
+    // 85 % health, never by a healer.
+    void DrinkPrePotions(Player* leader, uint32 boss)
+    {
+        std::vector<uint32> const potions = SuiRaidPlaybook::PrePotions(boss);
+        Group* group = leader->GetGroup();
+        if (potions.empty() || !group)
+            return;
+        uint32 drunk = 0, busy = 0, none = 0, worn = 0, cooling = 0;
+        std::map<uint32, uint32> refused;   // cast result -> members
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+        {
+            Player* m = itr->getSource();
+            if (!m || !m->IsAlive() || !m->IsInWorld() || m->IsInCombat() || !m->IsInMap(leader) || m->IsNonMeleeSpellCasted(false))
+            {
+                ++busy;
+                continue;
+            }
+            for (uint32 entry : potions)
+            {
+                Item* item = CarriedItem(m, entry);
+                if (!item)
+                {
+                    ++none;
+                    continue;
+                }
+                for (auto const& use : item->GetProto()->Spells)
+                {
+                    SpellEntry const* spell = use.SpellId && use.SpellTrigger == ITEM_SPELLTRIGGER_ON_USE ?
+                        sSpellMgr.GetSpellEntry(use.SpellId) : nullptr;
+                    if (!spell)
+                        continue;
+                    if (m->HasAura(spell->Id))
+                        ++worn;
+                    else if (!m->IsSpellReady(*spell, item->GetProto()))
+                        ++cooling;
+                    else
+                    {
+                        SpellCastResult const res = m->CastSpell(m, spell, false, item);
+                        if (res == SPELL_CAST_OK)
+                            ++drunk;
+                        else
+                            ++refused[uint32(res)];
+                    }
+                    break;
+                }
+            }
+        }
+        std::string why;
+        for (auto const& r : refused)
+            why += " cast" + std::to_string(r.first) + "x" + std::to_string(r.second);
+        if (drunk || !refused.empty() || cooling)
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %u potion(s) drunk before %s (worn %u, cooldown %u, none %u, busy %u%s)",
+                leader->GetName(), drunk, SuiRaidPlaybook::Name(boss).c_str(), worn, cooling, none, busy, why.c_str());
+    }
+
+    void WaitForSummon(Player* me, SuiRaidPlaybook::Gossip const& g, uint32 boss)
+    {
+        if (g.hasStand && me->GetDistance(g.stand[0], g.stand[1], g.stand[2]) > 6.0f)
+            me->NearTeleportTo(g.stand[0], g.stand[1], g.stand[2] + 0.5f, me->GetOrientation());
+        Regroup(me);
+        DrinkPrePotions(me, boss);
+        // Every paladin holds the playbook's aura for this boss (their own pick is random among seven - 2026-11-10,
+        // Ragnaros: Fire Resistance Aura against a fight of fire). The bot keeps whatever pAura says up by itself.
+        std::vector<uint32> const auras = SuiRaidPlaybook::PaladinAura(boss);
+        if (!auras.empty() && me->GetGroup())
+            for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+                if (Player* m = itr->getSource())
+                    if (m->GetClass() == CLASS_PALADIN)
+                        if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
+                            for (uint32 id : auras)
+                                if (m->HasSpell(id))
+                                {
+                                    if (SpellEntry const* aura = sSpellMgr.GetSpellEntry(id))
+                                        if (ai->m_spells.paladin.pAura != aura)
+                                        {
+                                            ai->m_spells.paladin.pAura = aura;
+                                            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s holds %s for %s",
+                                                me->GetName(), m->GetName(), aura->SpellName[0].c_str(), SuiRaidPlaybook::Name(boss).c_str());
+                                        }
+                                    break;
+                                }
+    }
+
+    bool UseSummonGossip(Player* me, Pilot& pilot)
+    {
+        if (!me->GetMap()->IsDungeon() || me->IsInCombat())
+            return false;
+        uint32 const boss = SuiRaidPlaybook::FirstAliveBoss(me->GetMap());
+        SuiRaidPlaybook::Gossip g;
+        if (!boss || !SuiRaidPlaybook::SummonGossip(boss, g))
+            return false;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        if (Creature* up = me->FindNearestCreature(boss, 150.0f, true))
+        {
+            // Summoned: the raid waits gathered by the NPC until the boss joins the fight itself (Ragnaros rises immune to
+            // players and pulls the whole zone ~105 s after the gossip; 2026-11-10: released at his first selectable tick,
+            // the leader wandered off to the runes and found no path back to him).
+            if (!up->IsInCombat() && int32(pilot.gossipHoldUntilMs - nowMs) > 0)
+            {
+                WaitForSummon(me, g, boss);
+                return true;
+            }
+            return false;
+        }
+        if (int32(pilot.gossipHoldUntilMs - nowMs) > 0)
+        {
+            if (pilot.gossipTalked)
+                WaitForSummon(me, g, boss);   // talked: the summon is on its way
+            return true;
+        }
+        // Already summoned and standing (a wipe leaves it in place): the normal pull takes it from outside its room - never
+        // a setup move beside it (2026-11-10, Ragnaros attempt 2: the raid was gathered 17 yd from him, he took it at once).
+        if (FindNearPoint(me, boss, g.at[0], g.at[1], 80.0f))
+            return false;
+        if (me->GetDistance(g.at[0], g.at[1], g.at[2]) > 12.0f)
+        {
+            Note(pilot, me, "nothing left before %s - going to %s to summon it", SuiRaidPlaybook::Name(boss).c_str(),
+                SuiRaidPlaybook::Name(g.npc).c_str());
+            me->NearTeleportTo(g.at[0] + 4.0f, g.at[1] + 4.0f, g.at[2] + 0.5f, me->GetOrientation());   // setup move
+            pilot.gossipGatherUntilMs = nowMs + 20000;
+            return true;
+        }
+        if (!pilot.gossipGatherUntilMs)
+            pilot.gossipGatherUntilMs = nowMs + 20000;   // already beside it: the raid still gathers first
+        if (int32(pilot.gossipGatherUntilMs - nowMs) > 0)
+        {
+            Regroup(me);   // the raid comes along (setup move)
+            return true;
+        }
+        Creature* npc = me->FindNearestCreature(g.npc, 20.0f, true);
+        if (!npc || !npc->HasFlag(UNIT_NPC_FLAGS, UNIT_NPC_FLAG_GOSSIP))
+        {
+            Note(pilot, me, "%s is not here to talk to (%s) - waiting", SuiRaidPlaybook::Name(g.npc).c_str(),
+                npc ? "no gossip" : "missing");
+            pilot.gossipHoldUntilMs = nowMs + 30000;
+            pilot.gossipTalked = false;
+            return true;
+        }
+        me->PrepareGossipMenu(npc, npc->GetDefaultGossipMenuId());
+        for (uint32 i = 0; i < g.selects; ++i)
+            me->OnGossipSelect(npc, 0);
+        me->PlayerTalkClass->CloseGossip();
+        Note(pilot, me, "talked to %s (%u options) - %s is being summoned", npc->GetName(), g.selects,
+            SuiRaidPlaybook::Name(boss).c_str());
+        pilot.gossipHoldUntilMs = nowMs + 3 * 60 * 1000;
+        pilot.gossipGatherUntilMs = 0;
+        pilot.gossipTalked = true;
         return true;
     }
 
@@ -1217,7 +1462,7 @@ namespace
         for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
         {
             Player* m = itr->getSource();
-            if (!m || !m->IsInWorld() || !m->IsAlive() || m->GetMap() != leader->GetMap())
+            if (!m || !m->IsInWorld() || !m->IsAlive() || !m->IsInMap(leader))
                 continue;
             members.push_back(m);
             priests += m->GetClass() == CLASS_PRIEST;
@@ -1327,7 +1572,7 @@ namespace
             if (!m || m == leader || !m->IsInWorld() || m->IsInCombat() || m->IsBeingTeleported())
                 continue;
             float x = leader->GetPositionX(), y = leader->GetPositionY(), z = leader->GetPositionZ();
-            if (m->GetMap() != leader->GetMap())
+            if (!m->IsInMap(leader))
             {
                 // Left outside (revived at the portal after a restart): brought back in.
                 if (!m->IsAlive())
@@ -1509,6 +1754,46 @@ namespace
     // behind it, both scored by their distance to every OTHER idle pack and by how close the
     // raid's walk to the camp passes other packs and the target. Ordinary raid-leading: pull
     // the edge pack toward open ground, never into the next one.
+    // An idle, pullable trash patrol (not a boss, not the target's own group) whose waypoint walk passes within 25 yd of
+    // `target`, else null.
+    Creature* TrashPatrolPast(Player* me, Creature* target, Pilot& pilot)
+    {
+        std::list<Creature*> near;
+        MaNGOS::AnyUnitInObjectRangeCheck check(target, 120.0f);
+        MaNGOS::CreatureListSearcher<MaNGOS::AnyUnitInObjectRangeCheck> searcher(near, check);
+        Cell::VisitGridObjects(target, searcher, 120.0f);
+        for (Creature* c : near)
+        {
+            if (c == target || !c->IsAlive() || c->IsInCombat() || c->IsWorldBoss() || BossOf(c) || !Patrols(c) ||
+                !c->IsHostileTo(me) || (c->GetCreatureGroup() && c->GetCreatureGroup() == target->GetCreatureGroup()))
+                continue;
+            WaypointPath const* path = sWaypointMgr.GetDefaultPath(c->GetEntry(), c->GetDBTableGUIDLow());
+            if (!path)
+                continue;
+            bool past = false;
+            WaypointNode const* prev = nullptr;
+            for (auto const& node : *path)
+            {
+                WaypointNode const& n = node.second;
+                if (prev)
+                {
+                    float const dx = n.x - prev->x, dy = n.y - prev->y;
+                    float const len = std::max(0.1f, std::sqrt(dx * dx + dy * dy));
+                    for (float t = 0.0f; t <= len && !past; t += 5.0f)
+                        if (target->GetDistance2d(prev->x + dx * t / len, prev->y + dy * t / len) < 25.0f)
+                            past = true;
+                }
+                prev = &n;
+                if (past)
+                    break;
+            }
+            if (past && Pullable(me, c, pilot) &&
+                PathLength(me, c->GetPositionX(), c->GetPositionY(), c->GetPositionZ()) >= 0.0f)
+                return c;
+        }
+        return nullptr;
+    }
+
     bool PlanPull(Player* me, Creature* target, Pilot& pilot, Vector3 const* at = nullptr)
     {
         std::vector<Spot> foreign;
@@ -2275,6 +2560,24 @@ namespace
                 pilot.planHoldMs -= step;
             else
                 pilot.planHoldMs = 0;
+            // A trash patrol whose walk passes a standing pack goes first, planned pull or not (2026-11-11, week 1 and week 2,
+            // fight 16 both times, the imp room: "no plan for Flame Imp", the leader walked up unplanned, a Lava Surger's
+            // walk brought it past and its call for help woke all 16 imps - 40 dead; the patrol-first rule below ran only
+            // for a crowded PLAN).
+            if (!pilot.planned && pilot.planHoldMs == 0 && dist <= 180.0f && !Patrols(target) && pilot.crowdHops < 3)
+                if (Creature* walker = TrashPatrolPast(me, target, pilot))
+                {
+                    ++pilot.crowdHops;
+                    Note(pilot, me, "%s (entry %u) patrols past %s - it goes first", walker->GetName(), walker->GetEntry(),
+                        target->GetName());
+                    pilot.target = walker->GetObjectGuid();
+                    pilot.targetEntry = walker->GetEntry();
+                    pilot.planned = false;
+                    pilot.crowdWaitMs = 0;
+                    pilot.stuckMs = 0;
+                    pilot.bestDist = me->GetDistance(walker);
+                    return true;
+                }
             if (!pilot.planned && pilot.planHoldMs == 0 && dist <= 180.0f && PlanPull(me, target, pilot) &&
                 (pilot.planDc < 35.0f || pilot.planDp < 22.0f || pilot.planRoute < 15.0f))
             {
@@ -2731,7 +3034,7 @@ namespace
                 if (Group* group = me->GetGroup())
                     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
                         if (Player* m = itr->getSource())
-                            if (m != me && m->IsAlive() && m->IsInWorld() && m->GetMap() == me->GetMap() &&
+                            if (m != me && m->IsAlive() && m->IsInWorld() && m->IsInMap(me) &&
                                 m->GetDistance(pilot.campX, pilot.campY, pilot.campZ) > kGatheredYards &&
                                 !(pilot.hasRear && (!pilot.timedBy.IsEmpty() || pilot.lured) &&
                                   m->GetDistance(pilot.rearX, pilot.rearY, pilot.rearZ) <= 8.0f))
@@ -3180,7 +3483,7 @@ bool SuiAutopilot::FightAnchor(Player const* member, float& x, float& y, float& 
         x = pair.second.campX;
         y = pair.second.campY;
         z = pair.second.campZ;
-        return member->GetMap() == leader->GetMap() && member->GetDistance(x, y, z) < 120.0f;
+        return member->IsInMap(leader) && member->GetDistance(x, y, z) < 120.0f;
     }
     return false;
 }
@@ -3344,7 +3647,7 @@ bool SuiAutopilot::TickLeader(AiBotAI* ai)
             if (Group* group = me->GetGroup())
                 for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
                     if (Player* m = itr->getSource())
-                        if (m->IsInWorld() && m->IsAlive() && m->GetMap() == me->GetMap() && m->IsInCombat() &&
+                        if (m->IsInWorld() && m->IsAlive() && m->IsInMap(me) && m->IsInCombat() &&
                             (m->GetVictim() || !m->GetAttackers().empty()))
                         {
                             Note(pilot, me, "the raid is fighting - pull of %s on hold",
@@ -3470,6 +3773,11 @@ bool SuiAutopilot::TickLeader(AiBotAI* ai)
         uint32 exploreEntry = 0, exploreGuid = 0;
         if (next)
             pilot.exploreStallMs = 0;
+        if (!next && UseSummonGossip(me, pilot))
+        {
+            pilot.searchBackoffMs = 1500;
+            return false;
+        }
         if (!next && UseScriptedObjects(me, pilot))
         {
             pilot.searchBackoffMs = 1500;
@@ -3846,6 +4154,83 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s gives %u to %s (%s)", leader->GetName(), itemId, to->GetName(),
             worn ? "equipped" : "kept in bags");
         PSendSysMessage("%s gives %u to %s (%s)", leader->GetName(), itemId, to->GetName(), worn ? "equipped" : "kept in bags");
+        return true;
+    }
+    // Setup (owner 2026-11-11, "a clean week 0 to week 3 rerun", MC loot removed): every copy of each item id goes from a
+    // member - equipped, bags and bank. Pair with "equip" to put a pre-raid piece in an emptied slot.
+    if (action == "take")
+    {
+        uint32 itemId = 0, total = 0;
+        std::string ids;
+        while (ExtractUInt32(&args, itemId))
+        {
+            uint32 const n = leader->GetItemCount(itemId, true);
+            if (!n)
+                continue;
+            leader->DestroyItemCount(itemId, n, true, false, true);
+            total += n;
+            ids += " " + std::to_string(itemId) + "x" + std::to_string(n);
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %u item(s) taken (setup):%s", leader->GetName(), total, ids.c_str());
+        PSendSysMessage("%s: %u item(s) taken:%s", leader->GetName(), total, ids.c_str());
+        return true;
+    }
+    // Setup (same rerun): a spell learned from raid loot is unlearned (MC's Tome of Tranquilizing Shot, 19801).
+    if (action == "unlearn")
+    {
+        uint32 spellId = 0, removed = 0;
+        while (ExtractUInt32(&args, spellId))
+            if (leader->HasSpell(spellId))
+            {
+                leader->RemoveSpell(spellId, false, false);
+                ++removed;
+            }
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %u spell(s) unlearned (setup)", leader->GetName(), removed);
+        PSendSysMessage("%s: %u spell(s) unlearned", leader->GetName(), removed);
+        return true;
+    }
+    // QA: the unit an instance script keeps by id (GetData64; MC 14 = Majordomo) - is it there, where, and in what state
+    // (2026-11-10: a summoned Majordomo was never found at his spot)
+    if (action == "unit")
+    {
+        uint32 id = 0;
+        InstanceData* data = leader->GetMap()->GetInstanceData();
+        if (!data || !ExtractUInt32(&args, id))
+        {
+            SendSysMessage("usage: .autopilot unit <leader> <data64 id>");
+            SetSentErrorMessage(true);
+            return false;
+        }
+        uint64 const raw = data->GetData64(id);
+        Creature* c = raw ? leader->GetMap()->GetCreature(ObjectGuid(raw)) : nullptr;
+        if (!c)
+            PSendSysMessage("data64 %u = %llu: no such creature in the map", id, (unsigned long long)raw);
+        else
+            PSendSysMessage("data64 %u = %s alive %d inWorld %d combat %d at (%.1f, %.1f, %.1f) %.0f yd faction %u flags 0x%X hostile %d",
+                id, c->GetName(), c->IsAlive(), c->IsInWorld(), c->IsInCombat(), c->GetPositionX(), c->GetPositionY(),
+                c->GetPositionZ(), leader->GetDistance(c), c->GetFactionTemplateId(), c->GetUInt32Value(UNIT_FIELD_FLAGS),
+                c->IsHostileTo(leader));
+        return true;
+    }
+    // QA (owner request 2026-11-09: "rerun majordomo 10 times (pre kill)"): set one encounter of the leader's instance
+    // and save it, so a killed boss can be fought again after the next restart (MC: type 8 = Majordomo, 0 = not started;
+    // the next rune use summons him hostile). Kills made this way verify a build; they are not progression.
+    if (action == "encounter")
+    {
+        uint32 type = 0, value = 0;
+        InstanceData* data = leader->GetMap()->GetInstanceData();
+        if (!data || !ExtractUInt32(&args, type) || !ExtractUInt32(&args, value))
+        {
+            SendSysMessage("usage: .autopilot encounter <leader> <type> <value> (leader inside an instance with a script)");
+            SetSentErrorMessage(true);
+            return false;
+        }
+        uint32 const before = data->GetData(type);
+        data->SetData(type, value);
+        data->SaveToDB();
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: instance %u encounter %u %u -> %u (QA reset, saved)",
+            leader->GetName(), leader->GetInstanceId(), type, before, data->GetData(type));
+        PSendSysMessage("instance %u encounter %u: %u -> %u (saved)", leader->GetInstanceId(), type, before, data->GetData(type));
         return true;
     }
     // Setup: a new member joins the leader's group, an OFFLINE member making room when it is full

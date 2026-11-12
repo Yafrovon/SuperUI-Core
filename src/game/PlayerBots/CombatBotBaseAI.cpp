@@ -2106,7 +2106,7 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
         for (GroupReference* itr = pGroup->GetFirstMember(); itr != nullptr; itr = itr->next())
         {
             Player* pMember = itr->getSource();
-            if (!pMember || pMember == me || !pMember->IsAlive() || pMember->GetMap() != me->GetMap() ||
+            if (!pMember || pMember == me || !pMember->IsAlive() || !pMember->IsInMap(me) ||
                 pMember->GetHealthPercent() >= 80.0f || !me->IsWithinDistInMap(pMember, 40.0f))
                 continue;
             bool held = false;

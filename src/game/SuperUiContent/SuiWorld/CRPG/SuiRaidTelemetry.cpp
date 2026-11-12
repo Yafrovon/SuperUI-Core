@@ -854,7 +854,7 @@ void SuiRaidTelemetry::Sample(Player const* leader)
     for (GroupReference* itr = const_cast<Group*>(leader->GetGroup())->GetFirstMember(); itr; itr = itr->next())
     {
         Player const* m = itr->getSource();
-        if (!m || !m->IsInWorld() || m->GetMap() != leader->GetMap() || !m->IsAlive())
+        if (!m || !m->IsInWorld() || !m->IsInMap(leader) || !m->IsAlive())
             continue;
         ++alive;
         Fight::Activity& a = gFight.activity[MemberLabel(m)];
@@ -972,7 +972,7 @@ uint32 SuiRaidTelemetry::FlushFight(Player const* leader, uint32 fightNumber, ui
     if (leader && leader->GetGroup())
         for (GroupReference* itr = const_cast<Group*>(leader->GetGroup())->GetFirstMember(); itr; itr = itr->next())
             if (Player const* m = itr->getSource())
-                if (m->IsInWorld() && m->GetMap() == leader->GetMap())
+                if (m->IsInWorld() && m->IsInMap(leader))
                 {
                     ++members;
                     alive += m->IsAlive();

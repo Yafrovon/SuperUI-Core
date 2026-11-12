@@ -891,6 +891,20 @@ PerformanceLog.SlowPacketBroadcast      = 0
 #        If set to 0 there will be no decay
 #        Default: 0.2 (20%)
 #
+#    Rate.Honor.Kill
+#    Rate.Honor.Bonus
+#    Rate.Honor.Quest
+#    Rate.Honor.Dishonor
+#        SuperUI: honor (CP) rate per award type: honorable kills and racial leaders,
+#        battleground bonus honor, honor from spells/quests (e.g. mark turn-ins), and the
+#        dishonorable-kill penalty. GM grants are never scaled.
+#        Default: 1
+#
+#    Rate.Honor.RankPoints
+#        SuperUI: multiplier on weekly rank-point earning. RP is awarded by standing, so
+#        the CP rates above do not speed up ranking; this does (still capped by level).
+#        Default: 1
+#
 #    MaintenanceDay
 #        The day of the week on which server maintenance is performed ( currently used for Honor distribution )
 #        range (0..6): 0 is the first day of the week (normally sunday), 6 is the latest
@@ -1133,6 +1147,11 @@ StartPlayerLevel = 1
 StartPlayerMoney = 0
 MinHonorKills = 0
 RpDecay = 0.2
+Rate.Honor.Kill = 1
+Rate.Honor.Bonus = 1
+Rate.Honor.Quest = 1
+Rate.Honor.Dishonor = 1
+Rate.Honor.RankPoints = 1
 MaintenanceDay = 3
 InstantLogout = 1
 ForceLogoutDelay = 0
@@ -2457,6 +2476,12 @@ Visibility.ForceActiveObjects      = 1
 #        XP rates
 #        Default: 1
 #
+#    Rate.XP.LevelCurve
+#        SuperUI: extra XP multiplier by player level, applied to every XP source after the
+#        rates above. Bands are LO-HI:RATE or LVL:RATE separated by spaces; later bands win.
+#        Example: "1-19:3 20-39:2 40-59:1.5"
+#        Default: "" (no curve)
+#
 #    Rate.Rest.InGame
 #    Rate.Rest.Offline.InTavernOrCity
 #    Rate.Rest.Offline.InWilderness
@@ -2514,6 +2539,13 @@ Visibility.ForceActiveObjects      = 1
 #    Rate.Reputation.LowLevel.Quest
 #         Reputation Gain rate
 #         Default: 1
+#
+#    Rate.Reputation.Kill
+#    Rate.Reputation.Quest
+#    Rate.Reputation.Spell
+#        SuperUI: reputation rate per source (creature kills, quest rewards, spell/item
+#        turn-ins), multiplied with Rate.Reputation.Gain and reputation_reward_rate.
+#        Default: 1
 #
 #    Rate.InstanceResetTime
 #        Multiplier for the number of days in between global raid resets.
@@ -2618,6 +2650,7 @@ Rate.XP.Quest   = 1
 Rate.XP.Explore = 1
 Rate.XP.Personal.Min = 1
 Rate.XP.Personal.Max = 1
+Rate.XP.LevelCurve = ""
 Rate.Rest.InGame = 1
 Rate.Rest.Offline.InTavernOrCity = 1
 Rate.Rest.Offline.InWilderness = 1
@@ -2637,6 +2670,9 @@ Rate.RespecMinMultiplier = 2
 Rate.Reputation.Gain = 1
 Rate.Reputation.LowLevel.Kill    = 0.2
 Rate.Reputation.LowLevel.Quest   = 1
+Rate.Reputation.Kill = 1
+Rate.Reputation.Quest = 1
+Rate.Reputation.Spell = 1
 Rate.InstanceResetTime = 1
 SkillGain.Crafting = 1
 SkillGain.Defense = 1

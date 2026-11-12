@@ -174,6 +174,8 @@ class HonorMgr
         
         static float DishonorableKillPoints(uint8 level);
         static float HonorableKillPoints(Player* killer, Player* victim, uint32 groupsize);
+        // Rate.Honor.* multiplier for one award; OTHER (GM grants) is never scaled.
+        static float ApplyRate(float cp, uint8 type);
 
         HonorRankInfo GetRank() const { return m_rank; }
         uint8 GetCurrentHonorRank() const { return m_rank.rank; }

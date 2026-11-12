@@ -16,6 +16,9 @@ namespace SuiRts
     // Called once during boot. The web world-profile owns schema creation and
     // migration; the core only reads pre-created RTS tables.
     void LoadRuleset();
+    // Re-applies the RTS world's rate.* overrides after .reload config re-read
+    // mangosd.conf. No-op outside an RTS boot.
+    void ReapplyRateOverrides();
     void Tick(uint32 diff);
     void Shutdown();
 

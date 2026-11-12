@@ -283,6 +283,7 @@ class ChatHandler
         bool HandleSuiReleaseCommand(char* args);
         bool HandleSuiWorldStateCommand(char* args);
         bool HandleSuiRtsCommand(char* args);
+        bool HandleSuiRatesCommand(char* args);
         bool PartyBotAddRequirementCheck(Player const* pPlayer, Player const* pTarget);
         bool HandlePartyBotAddCommand(char * args);
         bool HandlePartyBotCloneCommand(char * args);
