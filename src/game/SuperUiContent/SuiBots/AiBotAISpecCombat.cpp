@@ -2104,6 +2104,25 @@ bool AiBotAI::UpdateSpecCombatWarrior(uint8 spec)
     if (!victim)
         return false;   // cb:fold rotation rung, outcome probed at cast
 
+    // A tank keeps sundering a target that already carries the full stack: each cast still makes its threat (261 at
+    // rank 5, a tank's best threat for its rage) and refreshes the stack. The stacking rung refuses a full stack, so the
+    // rotation was left with Revenge, Shield Slam and Heroic Strike (2026-11-14, Onyxia dev attempt 16: her tank held
+    // her at ~90 threat a second - 14k at +152 s - and every damage dealer, held under it, did ~70 a second).
+    auto sunderForThreat = [this, victim]() -> bool
+    {
+        SpellEntry const* sunder = GetHighestKnownRank(7386);
+        if (!sunder || !victim->HasAura(sunder->Id) || !me->IsSpellReady(sunder->Id) || me->HasGCD(sunder))
+            return false;
+        if (me->GetPower(POWER_RAGE) < Spell::CalculatePowerCost(sunder, me) || victim->IsImmuneToSpell(sunder, false) ||
+            sunder->GetErrorAtShapeshiftedCast(me->GetShapeshiftForm()) != SPELL_CAST_OK ||
+            !me->CanReachWithMeleeSpellAttack(victim))
+            return false;
+        if (DoCastSpell(victim, sunder) != SPELL_CAST_OK)
+            return false;
+        CB_HITV(me->GetGUIDLow(), "cpp-spec: tank sunder for threat at full stack", sunder->Id);
+        return true;
+    };
+
     // Arms and Fury are approved as alternate tank roles.  Tank ownership is
     // evaluated before the Arms weapon-lock/degraded-DPS branch so persisted
     // activeRole remains authoritative and these profiles actually defend the
@@ -2130,6 +2149,7 @@ bool AiBotAI::UpdateSpecCombatWarrior(uint8 spec)
 
         if (TrySpecSpell(victim, SP_REVENGE)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecStackingAura(victim, 7386)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (sunderForThreat()) return true;   // cb:fold rotation rung, outcome probed at cast
         if (!HasAuraFromSpellChain(victim, 1160) && CanUseSpecAoE(me, 10.0f, 1) &&
             TrySpecSpell(victim, 1160)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (me->GetPower(POWER_RAGE) > 500 && CanUseSpecAoE(victim, 8.0f, 2) &&
@@ -2183,6 +2203,7 @@ bool AiBotAI::UpdateSpecCombatWarrior(uint8 spec)
         if (TrySpecSpell(victim, SP_REVENGE)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecSpell(victim, SP_SHIELD_SLAM)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (TrySpecStackingAura(victim, 7386)) return true;   // cb:fold rotation rung, outcome probed at cast
+        if (sunderForThreat()) return true;   // cb:fold rotation rung, outcome probed at cast
         if (!HasAuraFromSpellChain(victim, 1160) && CanUseSpecAoE(me, 10.0f, 1) &&
             TrySpecSpell(victim, 1160)) return true;   // cb:fold rotation rung, outcome probed at cast
         if (CanUseSpecAoE(victim, 8.0f, 2) && TrySpecSpell(victim, 845)) return true;   // cb:fold rotation rung, outcome probed at cast
@@ -2873,22 +2894,68 @@ bool AiBotAI::TrySpecPurgeEnemy(SpellEntry const* spell)
 
 // [TACTICS] A priest who has Fear Ward keeps it on a tank that lacks it (a feared tank drops
 // the boss on the healers). Ordinary raid practice; no encounter is named.
+Player* AiBotBackupTankFor(Creature* boss);   // AiBotAIMain.cpp
+
 bool AiBotAI::TrySpecFearWardTank()
 {
     uint32 const kFearWard = 6346;
     if (!me->HasSpell(kFearWard) || !me->IsSpellReady(kFearWard) || !me->GetGroup())
         return false;
+    // The tank holding a world boss is warded first, again the moment its ward is spent: a feared boss tank hands the
+    // boss to whoever stands next in threat, and it turns its breath with it (2026-11-14, Onyxia phase 3: Bellowing
+    // Roar every 15-30 s; after a fear swap to an off-tank on the whelps one Flame Breath killed nine). With several
+    // priests one is always ready; a priest whose ward is not needed there wards the other tanks as before.
+    Player* bossTank = nullptr;
+    Creature* boss = nullptr;
+    std::vector<Player*> tanks;
     for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
     {
         Player* m = itr->getSource();
-        if (!m || !m->IsAlive() || m->HasAura(kFearWard) || !m->IsWithinDistInMap(me, 30.0f))
+        if (!m || !m->IsAlive() || !m->IsInMap(me))
             continue;
         AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
         if (!ai || ai->GetCombatActiveRole() != ROLE_TANK)
             continue;
-        if (TrySpecSpell(m, kFearWard))
-            return true;
+        for (Unit* a : m->GetAttackers())
+            if (a && a->IsAlive() && a->GetVictim() == m && a->IsCreature() && static_cast<Creature*>(a)->IsWorldBoss())
+            {
+                bossTank = m;
+                boss = static_cast<Creature*>(a);
+            }
+        tanks.push_back(m);
     }
+    // ...and with the boss tank warded, its backup (AiBotBackupTankFor): a fear on the backup leaves the boss nobody to
+    // turn to but the casters (2026-11-14, Onyxia dev attempt 9: her tank was feared with his backup 4th on threat).
+    if (bossTank && bossTank->HasAura(kFearWard) && boss)
+        if (Player* backup = AiBotBackupTankFor(boss))
+            if (backup != bossTank && !backup->HasAura(kFearWard))
+                bossTank = backup;
+    if (bossTank)
+    {
+        if (bossTank->HasAura(kFearWard))
+            return false;   // the boss tank is warded: this priest's ward waits for it to be spent
+        static std::mutex wardLock;
+        static std::map<ObjectGuid, uint32> wardClaims;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        {
+            std::lock_guard<std::mutex> guard(wardLock);
+            auto c = wardClaims.find(bossTank->GetObjectGuid());
+            if (c != wardClaims.end() && nowMs < c->second)
+                return false;   // another priest's ward is on its way
+        }
+        if (!bossTank->IsWithinDistInMap(me, 30.0f) || !TrySpecSpell(bossTank, kFearWard))
+            return false;
+        {
+            std::lock_guard<std::mutex> guard(wardLock);
+            wardClaims[bossTank->GetObjectGuid()] = nowMs + 3000;
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: Fear Ward on %s (%s)", me->GetName(), bossTank->GetName(),
+            boss && boss->GetVictim() == bossTank ? "holds the boss" : "the boss's backup tank");
+        return true;
+    }
+    for (Player* m : tanks)
+        if (!m->HasAura(kFearWard) && m->IsWithinDistInMap(me, 30.0f) && TrySpecSpell(m, kFearWard))
+            return true;
     return false;
 }
 
@@ -2991,6 +3058,10 @@ static Unit* OwnControlled(Player const* me, std::list<Unit*> const& nearby, Mec
 // Healer, each new sheep replacing the last - one Healer stayed awake and killed the raid).
 static std::mutex gPolyClaimLock;
 static std::map<ObjectGuid, std::pair<ObjectGuid, uint32>> gPolyClaims;   // target -> (mage, until ms)
+// The sheep each mage last cast, remembered by guid: found only by a 45 yd search, three of four mages fighting at the
+// Elites' pull spot (45-60 yd from the sleeping Healers) never saw theirs again, none renewed it and a Healer woke at
+// +57 s (2026-11-12, Majordomo week 3 night 2, attempt 2). Guarded by gPolyClaimLock.
+static std::map<ObjectGuid, ObjectGuid> gMySheep;   // mage -> target
 
 bool AiBotAI::TrySpecPolymorphSpareElite()
 {
@@ -3024,6 +3095,19 @@ bool AiBotAI::TrySpecPolymorphSpareElite()
         MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck wideCheck(me, me, 45.0f);
         MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> wideSearcher(wide, wideCheck);
         Cell::VisitAllObjects(me, wideSearcher, 45.0f);
+    }
+    {
+        ObjectGuid remembered;
+        {
+            std::lock_guard<std::mutex> guard(gPolyClaimLock);
+            auto it = gMySheep.find(me->GetObjectGuid());
+            if (it != gMySheep.end())
+                remembered = it->second;
+        }
+        if (!remembered.IsEmpty())
+            if (Unit* u = me->GetMap()->GetUnit(remembered))
+                if (u->IsAlive() && std::find(wide.begin(), wide.end(), u) == wide.end())
+                    wide.push_back(u);   // OwnControlled checks it still wears my polymorph
     }
     if (Unit* mine = OwnControlled(me, wide, MECHANIC_POLYMORPH))
     {
@@ -3074,6 +3158,10 @@ bool AiBotAI::TrySpecPolymorphSpareElite()
         }
         if (left >= 0 && left < 12000 && !reflects && mine != PlaybookReleaseTarget(me) && DoCastSpell(mine, poly) == SPELL_CAST_OK)
         {
+            {
+                std::lock_guard<std::mutex> guard(gPolyClaimLock);
+                gMySheep[me->GetObjectGuid()] = mine->GetObjectGuid();
+            }
             sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: renews the polymorph on %s (guid %u), %d ms left",
                 me->GetName(), mine->GetName(), mine->GetGUIDLow(), left);
             return true;
@@ -3148,6 +3236,7 @@ bool AiBotAI::TrySpecPolymorphSpareElite()
     {
         std::lock_guard<std::mutex> guard(gPolyClaimLock);
         gPolyClaims[spare->GetObjectGuid()] = std::make_pair(me->GetObjectGuid(), WorldTimer::getMSTime() + 2500);
+        gMySheep[me->GetObjectGuid()] = spare->GetObjectGuid();
     }
     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-CC] %s: polymorph %s (guid %u) - %u elites on the raid, %u tanks",
         me->GetName(), spare->GetName(), spare->GetGUIDLow(), active, tanks);

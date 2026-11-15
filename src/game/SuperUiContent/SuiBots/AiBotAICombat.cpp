@@ -845,6 +845,8 @@ static void RangedChaseInPlace(Player* me, Unit* pVictim)
     me->GetMotionMaster()->MoveChase(pVictim, dist);
 }
 
+bool AiBotThreatHoldKeepsSwingOff(Player* me, Unit* victim);   // AiBotAIMain.cpp
+
 bool AiBotAI::AttackStart(Unit* pVictim)
 {
     // [SUI] Manual primary: only an explicit RTS ATTACK order (m_suiOrderedAttackPass) may start
@@ -858,6 +860,10 @@ bool AiBotAI::AttackStart(Unit* pVictim)
 
     if (me->IsMounted())
         me->RemoveSpellsCausingAura(SPELL_AURA_MOUNTED);   // cb:fold hot per-update detail
+
+    // [TACTICS] A threat hold has stopped the swing on this victim: it stays off until the hold lifts.
+    if (AiBotThreatHoldKeepsSwingOff(me, pVictim))
+        return true;
 
     if (me->Attack(pVictim, true))
     {   // cb:fold hot per-update detail
@@ -3620,6 +3626,87 @@ bool AiBotAI::MaintainTankFacing(Unit* victim)
         SuiRaidTelemetry::EntryConeRadius(victim->GetEntry()) <= 0.0f)
         return false;
 
+    // A world boss that breathes a cone is held with its head to the nearest wall, and held there: its breath goes into
+    // the stone and its facing no longer follows the raid. Squaring it to the group's middle turned it every time the
+    // group moved, and the group moved every time it turned (2026-11-14, Onyxia dev attempt 16: 372 "out of the front"
+    // steps in the first minute, the ranged casting 35 % of the fight; the raid's guides tank her facing the north wall).
+    // The facing is chosen once where it stands and kept for every tank who holds it, until it moves 12 yd.
+    if (victim->IsCreature() && static_cast<Creature*>(victim)->IsWorldBoss() &&
+        SuiRaidTelemetry::EntryConeRadius(victim->GetEntry()) > 0.0f &&
+        !victim->IsFlying() && !victim->IsLevitating() && !victim->IsHovering())
+    {
+        struct WallFacing { float bx, by, fx, fy; uint32 setMs; bool none; };
+        static std::mutex wallLock;
+        static std::unordered_map<uint64, WallFacing> walls;
+        float const reach = victim->GetObjectBoundingRadius() + me->GetObjectBoundingRadius() +
+            (victim->GetCombatReach() >= 8.0f ? std::min(victim->GetCombatReach() * 0.35f, 7.0f) : 1.5f);
+        float const bx = victim->GetPositionX(), by = victim->GetPositionY(), bz = victim->GetPositionZ();
+        WallFacing wf{};
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> guard(wallLock);
+            auto it = walls.find(victim->GetObjectGuid().GetRawValue());
+            if (it != walls.end() && now - it->second.setMs < 900000 &&
+                (it->second.bx - bx) * (it->second.bx - bx) + (it->second.by - by) * (it->second.by - by) < 144.0f)
+            {
+                wf = it->second;
+                have = true;
+            }
+        }
+        if (!have)
+        {
+            // 24 directions; the wall is where the boss's line of sight at head height first breaks, 2 yd steps out to
+            // 30 yd. The tank must have room between the boss and the wall and floor to stand on.
+            float bestWall = 1e9f, bestFx = 0.0f, bestFy = 0.0f;
+            for (int k = 0; k < 24; ++k)
+            {
+                float const th = float(k) * float(M_PI) / 12.0f, fx = std::cos(th), fy = std::sin(th);
+                float wall = 0.0f;
+                for (float d = 6.0f; d <= 30.0f; d += 2.0f)
+                    if (!victim->GetMap()->isInLineOfSight(bx, by, bz + 3.0f, bx + fx * d, by + fy * d, bz + 3.0f))
+                    {
+                        wall = d;
+                        break;
+                    }
+                if (wall <= 0.0f || wall < reach + 3.0f || wall >= bestWall)
+                    continue;
+                float x = bx + fx * reach, y = by + fy * reach, z = bz;
+                ReGroundZ(x, y, z, "tank-wall");
+                if (std::fabs(z - bz) > 4.0f || Molten(me, x, y, z))
+                    continue;
+                bestWall = wall;
+                bestFx = fx;
+                bestFy = fy;
+            }
+            wf = { bx, by, bestFx, bestFy, now, bestWall > 1e8f };
+            {
+                std::lock_guard<std::mutex> guard(wallLock);
+                walls[victim->GetObjectGuid().GetRawValue()] = wf;
+            }
+            if (wf.none)
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: no wall within 30 yd of %s at (%.1f, %.1f) - turns it from the group",
+                    me->GetName(), victim->GetName(), bx, by);
+            else
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: holds %s with its head to the wall (%.0f deg, wall %.0f yd) at (%.1f, %.1f)",
+                    me->GetName(), victim->GetName(), std::atan2(wf.fy, wf.fx) * 180.0f / float(M_PI), bestWall, bx, by);
+        }
+        if (!wf.none)
+        {
+            float tx = me->GetPositionX() - bx, ty = me->GetPositionY() - by;
+            float const tlen = std::sqrt(tx * tx + ty * ty);
+            if (tlen > 0.1f && (tx * wf.fx + ty * wf.fy) / tlen > 0.94f)   // within ~20 degrees
+                return false;
+            m_tankFacingNextMs = now + 1500;
+            float x = bx + wf.fx * reach, y = by + wf.fy * reach, z = bz;
+            ReGroundZ(x, y, z, "tank-wall");
+            if (std::fabs(z - bz) > 4.0f || !TankStepOk(me, victim, x, y, z))
+                return false;
+            CB_HIT(me->GetGUIDLow(), "cpp-combat: tank holding a cone boss's head to the wall");
+            me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            return true;
+        }
+    }
+
     float cx = 0.0f, cy = 0.0f;
     uint32 count = 0;
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
@@ -4068,9 +4155,32 @@ bool AiBotAI::AvoidGroundHazard()
     // I carry a bomb: away from every member until it has gone off (2026-09-24, Baron Geddon's
     // Living Bomb - recognised from its data: a harmful aura that triggers area damage around me).
     uint32 bombMs = 0, bombAura = 0;
-    if (float const bomb = PulsingAreaRadius(me, true, &bombMs, &bombAura))
+    // ...except a tank holding a world boss: the boss follows it and turns its breath with it, and the raid keeps
+    // clear of the carrier anyway (2026-11-14, Onyxia phase 3: tanks walked Engulfing Flames away 32 times a fight;
+    // she turned after them and her Flame Breath killed five beside her while she was tanked).
+    bool holdsBoss = false;
+    if (GetCombatActiveRole() == ROLE_TANK)
+        for (Unit* a : me->GetAttackers())
+            if (a && a->IsAlive() && a->GetVictim() == me && a->IsCreature() && static_cast<Creature*>(a)->IsWorldBoss())
+                holdsBoss = true;
+    if (float const bomb = holdsBoss ? 0.0f : PulsingAreaRadius(me, true, &bombMs, &bombAura))
     {
         Group* group = me->GetGroup();
+        // Where the other carriers are walking counts as where they stand: several carriers chose their spots on their
+        // own and walked to the same corner, burning each other (2026-11-14, Onyxia dev attempt 12: one Fireball gave
+        // Engulfing Flames to four melee on a whelp; all four died to each other's flames within 6 s).
+        struct BombSpot { uint64 who; float x, y; uint32 until; };
+        static std::mutex bombSpotLock;
+        static std::vector<BombSpot> bombSpots;
+        std::vector<BombSpot> others;
+        {
+            std::lock_guard<std::mutex> guard(bombSpotLock);
+            bombSpots.erase(std::remove_if(bombSpots.begin(), bombSpots.end(), [now](BombSpot const& b) { return now >= b.until; }),
+                bombSpots.end());
+            for (BombSpot const& b : bombSpots)
+                if (b.who != me->GetObjectGuid().GetRawValue())
+                    others.push_back(b);
+        }
         auto nearest = [&](float x, float y)
         {
             float best = 1e9f;
@@ -4078,6 +4188,8 @@ bool AiBotAI::AvoidGroundHazard()
                 if (Player* m = itr->getSource())
                     if (m != me && m->IsAlive() && m->IsInMap(me))
                         best = std::min(best, m->GetDistance2d(x, y));
+            for (BombSpot const& b : others)
+                best = std::min(best, float(std::sqrt((b.x - x) * (b.x - x) + (b.y - y) * (b.y - y))) - 4.0f);
             return best;
         };
         float const need = bomb + 4.0f;
@@ -4085,6 +4197,9 @@ bool AiBotAI::AvoidGroundHazard()
             return me->IsMoving();   // far enough: stay put (keep casting)
         std::vector<GroundHazard> idle;
         CollectIdleHostiles(me, 60.0f, idle);
+        // ...nor into an idle boss's roam (2026-11-11, week 2: a mage carried Geddon's Living Bomb into Shazzrah, 14 yd
+        // from his home - the plain idle circle counts only where he stood)
+        CollectIdleBosses(me, idle);
         // ...and never into fire on the way (2026-09-25: Baron Geddon's tank carried his Living
         // Bomb away from the raid straight into his Inferno).
         std::vector<GroundHazard> burning;
@@ -4118,6 +4233,12 @@ bool AiBotAI::AvoidGroundHazard()
             return false;
         if (me->IsNonMeleeSpellCasted(false))
             me->InterruptNonMeleeSpells(false);
+        {
+            std::lock_guard<std::mutex> guard(bombSpotLock);
+            bombSpots.erase(std::remove_if(bombSpots.begin(), bombSpots.end(),
+                [this](BombSpot const& b) { return b.who == me->GetObjectGuid().GetRawValue(); }), bombSpots.end());
+            bombSpots.push_back({me->GetObjectGuid().GetRawValue(), bestX, bestY, now + bombMs + 1000});
+        }
         m_repositionUntilMs = now + bombMs + 500;
         SuiRaidTelemetry::OnReposition(me, "bomb");
         if (Player* anchor = FindEscortBoss())
@@ -4339,7 +4460,8 @@ bool AiBotAI::AvoidFrontalCone()
             float const dx = me->GetPositionX() - u->GetPositionX(), dy = me->GetPositionY() - u->GetPositionY();
             float const along = dx * fx + dy * fy;
             float const lateral = dx * fy - dy * fx;   // signed distance off the line
-            if (along < 0.0f || std::fabs(lateral) > 32.0f || (role == ROLE_TANK && me->GetDistance(u) < 20.0f))
+            // (only the tank it breathes at stays: 2026-11-14, Onyxia phase 3 - off-tanks holding whelps stood in her front)
+            if (along < 0.0f || std::fabs(lateral) > 32.0f || (role == ROLE_TANK && u->GetVictim() == me))
                 continue;
             float const side = lateral >= 0.0f ? 1.0f : -1.0f;
             for (float shift : {36.0f, 44.0f})
@@ -4362,17 +4484,23 @@ bool AiBotAI::AvoidFrontalCone()
             }
         }
     }
-    if (role == ROLE_TANK)
-        return false;
-
+    // A tank keeps out of the front and tail of a coned kind it does not hold, like everyone else: the small adds it
+    // holds stand where it stands, and the melee and casters killing them follow (2026-11-14, Onyxia phase 3: three
+    // off-tanks held whelps inside her front; one Flame Breath at her own tank killed five beside them).
     std::list<Unit*> nearby;
     me->GetEnemyListInRadiusAround(me, 50.0f, nearby);
     for (Unit* u : nearby)
     {
         if (!u || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat())
             continue;
+        if (role == ROLE_TANK && u->GetVictim() == me)
+            continue;
         float const cone = SuiRaidTelemetry::EntryConeRadius(u->GetEntry());
         if (cone <= 0.0f)
+            continue;
+        // (2026-11-14, Onyxia phase 2: hovering, she has no Flame Breath or Tail Sweep, and the healers stepped "out of
+        // her front" 124 times a fight - moving 59 % of it. A breath she casts from the air is the block above.)
+        if (u->IsFlying() || u->IsLevitating() || u->IsHovering())
             continue;
         float const reach = cone + u->GetObjectBoundingRadius() + 3.0f;
         float const d = me->GetDistance2d(u);
@@ -4396,7 +4524,7 @@ bool AiBotAI::AvoidFrontalCone()
             me->InterruptNonMeleeSpells(false);
         }
         // Its side or back, at my own distance (melee: close behind it).
-        bool const melee = role == ROLE_MELEE_DPS;
+        bool const melee = role == ROLE_MELEE_DPS || role == ROLE_TANK;
         float const bigReach = u->GetCombatReach() >= 8.0f ? std::min(u->GetCombatReach() * 0.5f, 10.0f) : 1.0f;
         float const keep = melee ? u->GetObjectBoundingRadius() + me->GetObjectBoundingRadius() + bigReach :
             std::max(d, 12.0f);
@@ -4405,27 +4533,66 @@ bool AiBotAI::AvoidFrontalCone()
         std::vector<GroundHazard> idle;
         CollectIdleHostiles(me, 60.0f, idle);
         float bestX = 0, bestY = 0, bestZ = 0, bestScore = 1e9f;
-        // its flanks - behind the shoulder, clear of both its front and its tail
-        for (float off : {1.83f, -1.83f, 1.7f, -1.7f, 1.57f, -1.57f})
+        // its flanks - behind the shoulder, clear of both its front and its tail; at my own distance first, then nearer
+        // and farther (2026-11-14, Onyxia dev attempt 11: a warlock 19 yd out at 22 degrees found no flank spot at 19 yd
+        // in her cave, stood still and took three Flame Breaths in 30 s - six flank spots, all walled or out of sight)
+        std::vector<float> keeps = { keep };
+        if (!melee)
+            for (float k : { keep * 0.7f, keep * 1.3f, 12.0f, keep * 0.5f, keep * 1.6f })
+                if (k >= 10.0f && k <= 33.0f)   // still in spell range
+                    keeps.push_back(k);
+        uint32 rejZ = 0, rejSight = 0, rejMolten = 0, rejHazard = 0, rejIdle = 0, rejWalk = 0;
+        auto tryBand = [&](float k, std::initializer_list<float> offs)
         {
-            float const ang = u->GetOrientation() + off;
-            float x = u->GetPositionX() + keep * std::cos(ang), y = u->GetPositionY() + keep * std::sin(ang);
-            float z = u->GetPositionZ();
-            me->UpdateAllowedPositionZ(x, y, z);
-            if (std::fabs(z - u->GetPositionZ()) > 6.0f || !SeesFrom(me, x, y, z, u) ||
-                Molten(me, x, y, z) || InHazard(hazards, x, y) || InHazard(idle, x, y))
-                continue;
-            float const score = me->GetDistance2d(x, y);
-            if (score < bestScore && Walkable(me, x, y, z))
+            for (float off : offs)
             {
+                float const ang = u->GetOrientation() + off;
+                float x = u->GetPositionX() + k * std::cos(ang), y = u->GetPositionY() + k * std::sin(ang);
+                float z = u->GetPositionZ();
+                me->UpdateAllowedPositionZ(x, y, z);
+                if (std::fabs(z - u->GetPositionZ()) > 6.0f) { ++rejZ; continue; }
+                if (!SeesFrom(me, x, y, z, u)) { ++rejSight; continue; }
+                if (Molten(me, x, y, z)) { ++rejMolten; continue; }
+                if (InHazard(hazards, x, y)) { ++rejHazard; continue; }
+                if (InHazard(idle, x, y)) { ++rejIdle; continue; }
+                float const score = me->GetDistance2d(x, y);
+                if (score >= bestScore)
+                    continue;
+                if (!Walkable(me, x, y, z)) { ++rejWalk; continue; }
                 bestScore = score;
                 bestX = x;
                 bestY = y;
                 bestZ = z;
             }
+        };
+        for (float k : keeps)
+        {
+            tryBand(k, {1.83f, -1.83f, 1.7f, -1.7f, 1.57f, -1.57f, 1.4f, -1.4f});
+            if (bestScore < 1e8f)
+                break;   // the nearest band that has a spot
         }
+        // ...then the whole flank arcs, near to far (2026-11-14, Onyxia dev attempt 15: fought where she woke, with walls
+        // and egg piles at her sides - 1024 "no flank spot" in one fight; the ranged stood behind her and took her Tail
+        // Sweep 15-32 times each)
         if (bestScore > 1e8f)
+            for (float k = melee ? keep : 8.0f; k <= (melee ? keep + 6.0f : 33.0f) && bestScore > 1e8f; k += 3.0f)
+                tryBand(k, {1.31f, -1.31f, 1.48f, -1.48f, 1.66f, -1.66f, 1.83f, -1.83f});
+        if (bestScore > 1e8f)
+        {
+            static std::mutex noSpotLock;
+            static std::unordered_map<uint64, uint32> noSpotLogMs;
+            std::lock_guard<std::mutex> guard(noSpotLock);
+            uint32& next = noSpotLogMs[me->GetObjectGuid().GetRawValue()];
+            if (now >= next)
+            {
+                next = now + 5000;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: in the front of %s (%.0f yd) - no flank spot found "
+                    "(rejected: height %u sight %u lava %u hazard %u idle %u path %u; it stands at %.1f, %.1f, %.1f facing %.2f)",
+                    me->GetName(), u->GetName(), d, rejZ, rejSight, rejMolten, rejHazard, rejIdle, rejWalk,
+                    u->GetPositionX(), u->GetPositionY(), u->GetPositionZ(), u->GetOrientation());
+            }
             return false;
+        }
         m_coneNextMs = now + 1500;
         m_repositionUntilMs = now + 2500;
         SuiRaidTelemetry::OnReposition(me, "cone");
@@ -4469,6 +4636,13 @@ static bool SleepersMayWake(std::list<Unit*> const& around, bool anyHealth = fal
 // sleeping burster -> (the tank standing by it, until ms): one tank to each
 static std::mutex gSleeperWatchLock;
 static std::map<ObjectGuid, std::pair<ObjectGuid, uint32>> gSleeperWatch;
+
+namespace
+{
+    struct HealSpotClaim { ObjectGuid who; float x, y; uint32 untilMs; };
+    std::mutex gHealSpotLock;
+    std::vector<HealSpotClaim> gHealSpots;
+}
 
 bool AiBotAI::MaintainRangedSpacing()
 {
@@ -4589,6 +4763,74 @@ bool AiBotAI::MaintainRangedSpacing()
     // (...and so is a wounded one: the tanks drag the Healers apart, the rogues chase them, and three at 20-48 %
     // never stepped out of Shadow Shock - 2026-11-09, Majordomo attempt 87)
     bool const chasing = me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE;
+    // A melee damage dealer under a boss in the air has nothing to hit and stands with the other melee: it spreads
+    // like a caster when the boss's spells splash (2026-11-14, Onyxia dev attempt 8: nine melee stood under her in
+    // phase 2 and one Fireball's Engulfing Flames killed five of them in the same second).
+    if (role == ROLE_MELEE_DPS && me->IsInCombat() && meleeVictim && meleeVictim->IsCreature() &&
+        static_cast<Creature*>(meleeVictim)->IsWorldBoss() &&
+        (meleeVictim->IsFlying() || meleeVictim->IsLevitating() || meleeVictim->IsHovering()) &&
+        me->GetGroup() && !m_possessed && !m_suiManual && !me->IsNonMeleeSpellCasted(false) &&
+        WorldTimer::getMSTime() >= m_rangedSpacingNextMs)
+    {
+        // (5 yd at least: Onyxia's Fireball splashes through Engulfing Flames, a triggered spell the splash census does not see)
+        float const splash = std::max(SuiRaidTelemetry::EntrySplashRadius(meleeVictim->GetEntry()),
+            SuiRaidPlaybook::SpreadYards(meleeVictim->GetEntry()));
+        {
+            float const apart = std::max(5.0f, splash + 1.0f);
+            Group* group = me->GetGroup();
+            auto crowd = [&](float x, float y)
+            {
+                uint32 n = 0;
+                for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+                {
+                    Player* o = itr->getSource();
+                    if (o && o != me && o->IsAlive() && o->IsInWorld() && o->IsInMap(me) && o->GetDistance2d(x, y) < apart)
+                        ++n;
+                }
+                return n;
+            };
+            uint32 bestN = crowd(me->GetPositionX(), me->GetPositionY());
+            if (bestN > 0)
+            {
+                std::vector<GroundHazard> burning;
+                CollectGroundHazards(me, burning);
+                float bestX = 0, bestY = 0, bestZ = 0;
+                for (float dist : {apart, apart * 1.4f, apart * 1.8f})
+                    for (int i = 0; i < 12; ++i)
+                    {
+                        float const ang = i * float(M_PI) / 6.0f;
+                        float x = me->GetPositionX() + dist * std::cos(ang), y = me->GetPositionY() + dist * std::sin(ang);
+                        float z = me->GetPositionZ();
+                        me->UpdateAllowedPositionZ(x, y, z);
+                        if (std::fabs(z - me->GetPositionZ()) > 4.0f || !me->IsWithinLOS(x, y, z + 1.5f))
+                            continue;
+                        if (me->GetTerrain()->getLiquidStatus(x, y, z + 0.01f, MAP_LIQUID_TYPE_MAGMA | MAP_LIQUID_TYPE_SLIME, nullptr) &
+                            (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER | LIQUID_MAP_WATER_WALK))
+                            continue;
+                        if (meleeVictim->GetDistance2d(x, y) > std::max(30.0f, meleeVictim->GetDistance2d(me) + 2.0f))
+                            continue;   // near enough to be back in reach when it lands
+                        if (InHazard(burning, x, y))
+                            continue;
+                        uint32 const n = crowd(x, y);
+                        if (n < bestN && Walkable(me, x, y, z))
+                        {
+                            bestN = n;
+                            bestX = x;
+                            bestY = y;
+                            bestZ = z;
+                        }
+                    }
+                if (bestX != 0 || bestY != 0)
+                {
+                    m_rangedSpacingNextMs = WorldTimer::getMSTime() + 3000;
+                    m_repositionUntilMs = WorldTimer::getMSTime() + 2000;
+                    SuiRaidTelemetry::OnReposition(me, "spread");
+                    me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                    return true;
+                }
+            }
+        }
+    }
     if ((role != ROLE_RANGE_DPS && role != ROLE_HEALER && !woundedMelee && !heldBurstMelee) ||
         !(me->IsInCombat() || HealerOnDuty()) || !me->GetGroup() ||
         (me->IsMoving() && !((heldBurstMelee || woundedMelee) && chasing)) ||
@@ -4683,6 +4925,16 @@ bool AiBotAI::MaintainRangedSpacing()
             continue;
         if (heldBurstMelee && !held)
             continue;   // that melee minds only the sleeping bursters; the awake ones are its fight
+        // A multiplier's spawn (Lava Spawn) is killed, not walked from: it chases whoever it hits, and ranged stepping clear
+        // of every spawn near them cast 19 % of the fight (2026-11-11, week 1 fight 21 and week 3 fight 7: two Firelords,
+        // 120-180 spawns, 342 clear steps, one Firelord left at 7 % - all 40 dead).
+        if (IsKnownMultiplier(u->GetEntry()) && !SuiRaidTelemetry::EntryPulseRadius(u->GetEntry()))
+            continue;
+        // ...and so is any small add beating on someone else: it hits for little and is the tanks' to gather (2026-11-14,
+        // Onyxia phase 2: ~70 whelps; casters and healers stepped clear of whelps on others 326 times a fight).
+        if (!static_cast<Creature*>(u)->IsElite() && !static_cast<Creature*>(u)->IsWorldBoss() && u->GetVictim() != me &&
+            !SuiRaidTelemetry::EntryPulseRadius(u->GetEntry()))
+            continue;
         float const d = me->GetDistance(u);
         // A kind seen pulsing fire around itself (an inferno): ranged and healers stay outside
         // that circle all fight long - from 1 yd inside it the first four ticks kill a caster
@@ -4862,8 +5114,10 @@ bool AiBotAI::MaintainRangedSpacing()
             {
                 std::list<Unit*> foes;
                 me->GetEnemyListInRadiusAround(me, 100.0f, foes);
+                // (not a multiplier's spawns: 200 Lava Spawns made every caster spread 531 times in one fight - 2026-11-12,
+                // week 3, two Firelords)
                 for (Unit* f : foes)
-                    if (f && f->IsCreature() && f->IsAlive() && f->IsInCombat())
+                    if (f && f->IsCreature() && f->IsAlive() && f->IsInCombat() && !IsKnownMultiplier(f->GetEntry()))
                         splash = std::max({splash, SuiRaidTelemetry::EntrySplashRadius(f->GetEntry()),
                             SuiRaidPlaybook::SpreadYards(f->GetEntry())});
             }
@@ -4893,10 +5147,14 @@ bool AiBotAI::MaintainRangedSpacing()
                         if (me->GetTerrain()->getLiquidStatus(x, y, z + 0.01f, MAP_LIQUID_TYPE_MAGMA | MAP_LIQUID_TYPE_SLIME, nullptr) &
                             (LIQUID_MAP_IN_WATER | LIQUID_MAP_UNDER_WATER | LIQUID_MAP_WATER_WALK))
                             continue;
-                        if (anchor && anchor != me && (anchor->GetDistance(x, y, z) > (role == ROLE_HEALER ? 28.0f : 35.0f) ||
+                        // (an anchor already beyond the limit only forbids spots farther than now: 2026-11-14, Onyxia phase 2 -
+                        // healers stood stacked in pairs 66-71 yd from their tank, no spot passed, and one Fireball's splash
+                        // gave Engulfing Flames to the whole clump)
+                        if (anchor && anchor != me && (anchor->GetDistance(x, y, z) >
+                                std::max(role == ROLE_HEALER ? 28.0f : 35.0f, anchor->GetDistance(me) + 2.0f) ||
                             !SeesFrom(me, x, y, z, anchor)))
                             continue;
-                        if (victim && role == ROLE_RANGE_DPS && (victim->GetDistance(x, y, z) > 33.0f ||
+                        if (victim && role == ROLE_RANGE_DPS && (victim->GetDistance(x, y, z) > std::max(33.0f, victim->GetDistance(me) + 2.0f) ||
                             !SeesFrom(me, x, y, z, victim)))
                             continue;
                         if (InHazard(idleNear, x, y) || InHazard(burning, x, y))
@@ -5043,7 +5301,21 @@ bool AiBotAI::MaintainRangedSpacing()
                     continue;
                 if (!SeesFrom(me, x, y, z, tank))
                     continue;
-                cands.push_back({x, y, z, me->GetDistance(x, y, z)});
+                // ...nor onto another member or a spot another healer is walking to (2026-11-14, Onyxia phase 2: healers
+                // closing on one tank took the same ring spot in pairs; a Fireball splash there is Engulfing Flames on both)
+                float penalty = 0.0f;
+                for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+                    if (Player* o = itr->getSource())
+                        if (o != me && o->IsAlive() && o->IsInMap(me) && o->GetDistance2d(x, y) < 7.0f)
+                            penalty += 12.0f;
+                {
+                    std::lock_guard<std::mutex> guard(gHealSpotLock);
+                    for (auto const& c : gHealSpots)
+                        if (c.who != me->GetObjectGuid() && now < c.untilMs &&
+                            (c.x - x) * (c.x - x) + (c.y - y) * (c.y - y) < 49.0f)
+                            penalty += 25.0f;
+                }
+                cands.push_back({x, y, z, me->GetDistance(x, y, z) + penalty});
             }
         std::sort(cands.begin(), cands.end(), [](Cand const& a, Cand const& b) { return a.score < b.score; });
         uint32 tried = 0;
@@ -5087,6 +5359,12 @@ bool AiBotAI::MaintainRangedSpacing()
             sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: closing on %s (%.0f yd%s) -> %.0f yd from it",
                 me->GetName(), tank->GetName(), me->GetDistance(tank), me->IsWithinLOSInMap(tank) ? "" : ", no sight",
                 tank->GetDistance(c.x, c.y, c.z));
+            {
+                std::lock_guard<std::mutex> guard(gHealSpotLock);
+                gHealSpots.erase(std::remove_if(gHealSpots.begin(), gHealSpots.end(), [&](HealSpotClaim const& h)
+                    { return h.who == me->GetObjectGuid() || now >= h.untilMs; }), gHealSpots.end());
+                gHealSpots.push_back({me->GetObjectGuid(), c.x, c.y, now + 4000});
+            }
             CB_HIT(me->GetGUIDLow(), "cpp-combat: healer closing to heal range of the tank"); m_repositionUntilMs = WorldTimer::getMSTime() + 3000; SuiRaidTelemetry::OnReposition(me, "healrange");
             me->GetMotionMaster()->MovePoint(0, c.x, c.y, c.z, MOVE_PATHFINDING | MOVE_RUN_MODE);
             return true;
@@ -5303,6 +5581,11 @@ Player* AiBotAI::ActiveTank() const
         {
             if (!attacker || !attacker->IsAlive() || attacker->GetVictim() != m)
                 continue;
+            // A boss in the air picks whom it casts at (2026-11-14, Onyxia phase 2: each Fireball's target, a new caster
+            // every 3 s, became the healers' "tank" - they ran 40-70 yd after it and the dying mages got nothing in 8 s).
+            if (Creature* cr = attacker->ToCreature())
+                if (cr->IsWorldBoss() && (cr->IsFlying() || cr->IsLevitating() || cr->IsHovering()))
+                    continue;
             if (Creature* cr = attacker->ToCreature())
                 score += cr->IsWorldBoss() ? 10.0f : (cr->IsElite() ? 3.0f : 1.0f);
             else

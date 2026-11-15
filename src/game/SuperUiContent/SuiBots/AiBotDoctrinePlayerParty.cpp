@@ -81,6 +81,8 @@
 #include "SpellMgr.h"
 #include "Spell.h"
 
+Player* AiBotBackupTankFor(Creature* boss);   // AiBotAIMain.cpp
+
 namespace
 {
 
@@ -504,6 +506,19 @@ private:
                 return held;
         }
 
+        // The backup tank of a boss another tank holds hits the boss, not whelps (AiBotBackupTankFor).
+        if (!heldElite)
+        {
+            std::list<Unit*> bosses;
+            MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck bossCheck(me, me, 50.0f);
+            MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> bossSearcher(bosses, bossCheck);
+            Cell::VisitAllObjects(me, bossSearcher, 50.0f);
+            for (Unit* u : bosses)
+                if (u->IsCreature() && u->IsAlive() && u->IsInCombat() && static_cast<Creature*>(u)->IsWorldBoss() &&
+                    bot.IsValidAssistTarget(u) && AiBotBackupTankFor(static_cast<Creature*>(u)) == me)
+                    return u;
+        }
+
         Group* group = me->GetGroup();
         if (!group)
             return nullptr;
@@ -618,8 +633,12 @@ private:
                 best = mob;
             }
         }
-        if (held && !(best && best->IsCreature() && static_cast<Creature*>(best)->IsElite()))
-            return held;   // keep what I hold unless a loose elite needs me
+        // A small add I hold keeps beating on me while I take the next one loose on the raid: tanks gather a stream
+        // of small adds instead of holding one each (2026-11-13, Onyxia phase 2: ~80 whelps a fight, six tanks with
+        // one whelp each, whelps 2072 s on healers/casters vs 329 s on tanks - 362 of 717 deaths were whelp melee).
+        bool const heldSmall = held && held->IsCreature() && !heldElite && !static_cast<Creature*>(held)->IsWorldBoss();
+        if (held && !(best && best->IsCreature() && (static_cast<Creature*>(best)->IsElite() || heldSmall)))
+            return held;   // keep what I hold unless a loose elite needs me (or a loose small add, holding one)
         // A tank with no taunt and nothing loose to take goes for the boss a taunting tank holds: the boss's
         // threat is wiped every 20-30 s (Majordomo's teleport) and then turns to the one beside it, and the
         // taunting tank is free for the next sheep (2026-11-08, Majordomo: the paladin tank woke Healers he
@@ -771,7 +790,36 @@ private:
                     std::find(nearby.begin(), nearby.end(), u) == nearby.end())
                     nearby.push_back(u);
         }
-        auto rankOf = [orderBoss, release, noFreeTank, &bot](Unit* mob)
+        // A ranged damage dealer counts the world boss of the fight wherever it is within 100 yd: past my 45 yd it was
+        // out of my list and the small adds near me took all the ranged damage (2026-11-14, Onyxia phase 2: she hovers
+        // and moves round the room, "focus -> Onyxian Whelp (kill order)" for the ranged, her health 60 -> 53 % in five
+        // minutes against 2.5 % every 5 s on the ground). Whelps on me still come first (the peel rule below).
+        if (bot.GetCombatActiveRole() == ROLE_RANGE_DPS)
+        {
+            std::list<Unit*> wideBoss;
+            MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck bossCheck(me, me, 100.0f);
+            MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> bossSearcher(wideBoss, bossCheck);
+            Cell::VisitAllObjects(me, bossSearcher, 100.0f);
+            for (Unit* u : wideBoss)
+                if (u->IsCreature() && u->IsAlive() && u->IsInCombat() && static_cast<Creature*>(u)->IsWorldBoss() &&
+                    bot.IsValidAssistTarget(u) && std::find(nearby.begin(), nearby.end(), u) == nearby.end())
+                    nearby.push_back(u);
+        }
+        // The boss goes after his adds only when the playbook orders them or they are elites (MC's Firesworn,
+        // Protectors, Elites - the order every MC kill so far was won with); small adds never hold him up
+        // (2026-11-14: every world boss was ranked last, so Onyxia came after each of her whelps and the ranged
+        // killed whelps for the whole phase 2 - 2956 "focus -> Onyxian Whelp (kill order)" in one hour).
+        bool bossOrders = false;
+        if (orderBoss)
+            for (Unit* mob : nearby)
+                if (mob->IsCreature() && mob->IsAlive() && mob->GetEntry() != orderBoss &&
+                    (SuiRaidPlaybook::KillOrder(orderBoss, mob->GetEntry()) >= 0 ||
+                     (static_cast<Creature*>(mob)->IsElite() && !static_cast<Creature*>(mob)->IsWorldBoss())))
+                {
+                    bossOrders = true;
+                    break;
+                }
+        auto rankOf = [orderBoss, bossOrders, release, noFreeTank, &bot](Unit* mob)
         {
             if (AiBotAI::IsKnownMultiplier(mob->GetEntry()))
                 return uint8(0);
@@ -796,7 +844,7 @@ private:
                 // the boss that orders its adds comes after all of them (2026-11-08, Majordomo: his own spells
                 // rank him 2, the Elites came 4th in the order once the Healers slept, and 70 s of the raid's
                 // damage went into a boss that cannot die - no Elite fell)
-                if (mob->GetEntry() == orderBoss)
+                if (mob->GetEntry() == orderBoss && bossOrders)
                     return uint8(10);
             }
             return uint8(2 + KillRank(static_cast<Creature*>(mob)) * 2);
@@ -1029,6 +1077,30 @@ private:
             if ((mob != release && !bot.IsValidAssistTarget(mob)) || (mob == release && !mob->IsAlive()) ||
                 (AiBotAI::IsKnownRebounder(mob->GetEntry()) && !AiBotAI::IsKnownMultiplier(mob->GetEntry())))
                 continue;
+            // A melee damage dealer leaves a small add standing in a grounded cone boss's front or tail to the ranged: it
+            // ran in after the whelp, stepped out of her front, ran back in - and her breath and tail took it there
+            // (2026-11-14, Onyxia dev attempt 16, phase 3: the melee "converge Onyxian Whelp" and "out of the front of
+            // Onyxia" every 2 s; nine melee in one Tail Sweep at 126 degrees, seven of them dead to one Flame Breath).
+            // The same zones as AvoidFrontalCone: within 70 degrees of where it faces, or of its back for a dragon.
+            if (bot.GetCombatActiveRole() == ROLE_MELEE_DPS && mob->IsCreature() &&
+                !static_cast<Creature*>(mob)->IsElite() && !static_cast<Creature*>(mob)->IsWorldBoss())
+            {
+                bool inZone = false;
+                for (Unit* b : nearby)
+                {
+                    if (b == mob || !b->IsCreature() || !b->IsAlive() || !b->IsInCombat() ||
+                        !static_cast<Creature*>(b)->IsWorldBoss() || b->IsFlying() || b->IsLevitating() || b->IsHovering())
+                        continue;
+                    float const cone = SuiRaidTelemetry::EntryConeRadius(b->GetEntry());
+                    if (cone <= 0.0f || b->GetDistance2d(mob) > cone + b->GetObjectBoundingRadius() + 3.0f)
+                        continue;
+                    if (b->HasInArc(mob, float(M_PI) * 7.0f / 9.0f) ||
+                        (b->GetCombatReach() >= 15.0f && !b->HasInArc(mob, float(M_PI) * 11.0f / 9.0f)))
+                        inZone = true;
+                }
+                if (inZone)
+                    continue;
+            }
             // an awake one of a rank before a sheeped one of the same rank; a sheep before a worse rank
             uint8 rank = rankOf(mob);
             // Peel: a small add chewing on a healer or a caster dies before anything else

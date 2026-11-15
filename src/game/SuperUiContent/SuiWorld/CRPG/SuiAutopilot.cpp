@@ -76,6 +76,10 @@ namespace
         uint32 restMs = 0;
         uint32 approachMs = 0;
         uint32 stuckMs = 0;
+        // Walkers that were waited for at their pull spot once and never came back in reach (2026-11-13: an
+        // Onyxian Warder's walk kept it out of sight of every spot - 48 waits of 90 s, then "stands in the way"
+        // picked it again; 75 min lost): the next time it is closed on like a pack out of sight.
+        std::map<ObjectGuid, uint32> walkerTimedOut;
         float lastX = 0.0f, lastY = 0.0f;   // where the leader stood at the last progress check
         uint32 moveCooldownMs = 0;
         float bestDist = 1e9f;
@@ -933,9 +937,11 @@ namespace
             auto used = pilot.usedObjects.find(pair.first);
             if (used != pilot.usedObjects.end() && nowMs < used->second)
                 return false;
-            // a loaded object already used (a doused rune) is done
+            // a loaded object already used (a doused rune) is done: its state toggled away from the spawn's. Molten
+            // Core's runes spawn ACTIVE (startOpen) and a douse flips them to READY - the old "not READY = used" test
+            // skipped every loaded undoused rune, and after Sulfuron the leader explored instead (2026-11-12, week 3).
             if (GameObject const* live = me->GetMap()->GetGameObject(ObjectGuid(HIGHGUID_GAMEOBJECT, data.id, pair.first)))
-                if (live->GetGoState() != GO_STATE_READY)
+                if (live->GetGoState() != data.go_state)
                     return false;
             // An encounter's rune waits for its boss: it is doused only once he is dead, and walking to
             // it pulls him (2026-11-03: "nothing left to fight - going to use" the Rune of Mohn, Garr
@@ -2319,7 +2325,11 @@ namespace
                 // last clear spot it walked through and fights there, not next to the packs
                 // around the target (2026-09-24: a Lava Annihilator met on the walk dragged a
                 // Destroyer, a Giant and a Firelord into the fight and wiped the raid).
-                if (pilot.hasSafe && me->GetDistance(target) > 12.0f &&
+                // A boss alone in its room is fought where it woke: nothing near it to drag in, and the walk back
+                // with it pulled it through the casters - she turned on a melee and a hunter in the first 5 s and four
+                // ranged died in 25 s (2026-11-14, Onyxia dev attempt 8).
+                bool const loneBoss = target->IsWorldBoss() && IdleNeighbours(me, target, target, 45.0f) == 0;
+                if (pilot.hasSafe && !loneBoss && me->GetDistance(target) > 12.0f &&
                     me->GetDistance(pilot.safeX, pilot.safeY, pilot.safeZ) > 10.0f &&
                     me->GetDistance(pilot.safeX, pilot.safeY, pilot.safeZ) < 120.0f)
                 {
@@ -3220,7 +3230,8 @@ namespace
             {
                 uint32 const shot = RangedPullSpell(me);
                 float const toSpot = me->GetDistance(pilot.pullX, pilot.pullY, pilot.pullZ);
-                if (shot && toSpot <= 3.0f && !(dist <= 29.0f && me->IsWithinLOSInMap(target)) && Patrols(target))
+                if (shot && toSpot <= 3.0f && !(dist <= 29.0f && me->IsWithinLOSInMap(target)) && Patrols(target) &&
+                    !pilot.walkerTimedOut.count(pilot.target))
                 {
                     // A walker comes back along its route: it is waited for at the spot, never chased
                     // (2026-11-05: the leader followed an Ancient Core Hound 65 yd off its pull spot
@@ -3229,7 +3240,9 @@ namespace
                         me->StopMoving();
                     if ((pilot.stuckMs += step) >= 90000)
                     {
-                        Note(pilot, me, "%s did not come back in reach of the pull spot - skipped", target->GetName());
+                        Note(pilot, me, "%s did not come back in reach of the pull spot - skipped (next time it is closed on)",
+                            target->GetName());
+                        pilot.walkerTimedOut[pilot.target] = WorldTimer::getMSTime();
                         pilot.skip[pilot.target] = WorldTimer::getMSTime() + 5 * 60 * 1000;
                         pilot.phase = Phase::Idle;
                         pilot.target.Clear();
@@ -4019,11 +4032,27 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
                 PSendSysMessage("%u: no equipment slot", itemId);
                 continue;
             }
+            // What the slot held goes to the bags (2026-11-12: fire resistance pieces for Ragnaros over loot earned in
+            // the run - "wear" puts it back). Never destroyed (2026-11-13: full bags had silently destroyed three earned
+            // pieces): with no bag room the slot keeps its piece and this item is refused.
+            auto stash = [&](uint8 equipSlot) -> bool
+            {
+                Item* old = leader->GetItemByPos(INVENTORY_SLOT_BAG_0, equipSlot);
+                if (!old)
+                    return true;
+                ItemPosCountVec bagDest;
+                if (leader->CanStoreItem(NULL_BAG, NULL_SLOT, bagDest, old, false) == EQUIP_ERR_OK && !bagDest.empty())
+                    leader->SwapItem(old->GetPos(), bagDest[0].pos);
+                return !leader->GetItemByPos(INVENTORY_SLOT_BAG_0, equipSlot);
+            };
+            if (!stash(slot) || (proto->InventoryType == INVTYPE_2HWEAPON && !stash(EQUIPMENT_SLOT_OFFHAND)))
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %u refused - no bag room for the worn piece (kept)",
+                    leader->GetName(), itemId);
+                PSendSysMessage("%u: refused - no bag room for the piece it would replace (kept worn)", itemId);
+                continue;
+            }
             filled |= 1u << slot;
-            if (leader->GetItemByPos(INVENTORY_SLOT_BAG_0, slot))
-                leader->DestroyItem(INVENTORY_SLOT_BAG_0, slot, true);
-            if (proto->InventoryType == INVTYPE_2HWEAPON && leader->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND))
-                leader->DestroyItem(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_OFFHAND, true);
             uint16 dest = 0;
             InventoryResult const result = leader->CanEquipNewItem(slot, dest, itemId, false);
             if (result != EQUIP_ERR_OK || !leader->EquipNewItem(dest, itemId, true))
@@ -4035,6 +4064,44 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
         }
         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %u item(s) equipped (setup)", leader->GetName(), equipped);
         PSendSysMessage("%s: %u item(s) equipped", leader->GetName(), equipped);
+        return true;
+    }
+    // Setup between pulls: put carried items (bags) back on by id, the worn piece going to the bags in their place - the
+    // way back from "equip" (2026-11-12, fire resistance pieces worn for Ragnaros only).
+    if (action == "wear")
+    {
+        uint32 itemId = 0, worn = 0, filled = 0;
+        while (ExtractUInt32(&args, itemId))
+        {
+            Item* carried = nullptr;
+            for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END && !carried; ++i)
+                if (Item* it = leader->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                    if (it->GetEntry() == itemId)
+                        carried = it;
+            for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !carried; ++b)
+                if (Bag* bag = dynamic_cast<Bag*>(leader->GetItemByPos(INVENTORY_SLOT_BAG_0, b)))
+                    for (uint32 j = 0; j < bag->GetBagSize() && !carried; ++j)
+                        if (Item* it = bag->GetItemByPos(uint8(j)))
+                            if (it->GetEntry() == itemId)
+                                carried = it;
+            uint8 slot = carried ? leader->FindEquipSlot(carried->GetProto(), NULL_SLOT, true) : uint8(NULL_SLOT);
+            if ((slot == EQUIPMENT_SLOT_FINGER1 || slot == EQUIPMENT_SLOT_TRINKET1) && (filled & (1u << slot)))
+                ++slot;
+            if (slot == NULL_SLOT)
+            {
+                PSendSysMessage("%u: %s", itemId, carried ? "no equipment slot" : "not carried");
+                continue;
+            }
+            filled |= 1u << slot;
+            leader->SwapItem(carried->GetPos(), uint16(INVENTORY_SLOT_BAG_0) << 8 | slot);
+            Item* now = leader->GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
+            if (now && now->GetEntry() == itemId)
+                ++worn;
+            else
+                PSendSysMessage("%u: swap refused", itemId);
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %u item(s) worn from the bags (setup)", leader->GetName(), worn);
+        PSendSysMessage("%s: %u item(s) worn", leader->GetName(), worn);
         return true;
     }
     // A boss chest is opened by a member: bots loot only corpses, so the Cache of the Firelord (a chest the
@@ -4122,6 +4189,133 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s opens %s (spawn %u):%s", leader->GetName(), chest->GetName(),
             chest->GetDBTableGUIDLow(), items.str().c_str());
         PSendSysMessage("%s opens %s:%s", leader->GetName(), chest->GetName(), items.str().c_str());
+        return true;
+    }
+    // Loot council (owner 2026-11-14, rerun 3: "upgrade-first loot council"): every raid drop a member carries - an epic
+    // weapon or armour piece of item level 66 or more, or any of the item ids given - goes to the member whose own gear
+    // scoring gains most from it (relative to what that slot holds now) and is worn. Corpse loot landed in one member's
+    // bags: a warlock held the rogue and hunter tier-2 helms, and of 73 raid items earned in rerun 2 only 4 were worn.
+    if (action == "council")
+    {
+        Group* group = leader->GetGroup();
+        if (!group)
+        {
+            SendSysMessage("usage: .autopilot council <leader> [item id...] (leader in a group)");
+            SetSentErrorMessage(true);
+            return false;
+        }
+        std::set<uint32> extra;
+        uint32 extraId = 0;
+        while (ExtractUInt32(&args, extraId))
+            extra.insert(extraId);
+        std::vector<Player*> members;
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+            if (Player* m = itr->getSource())
+                if (m->IsInWorld() && dynamic_cast<AiBotAI*>(m->AI()))
+                    members.push_back(m);
+        auto wantedProto = [&](ItemPrototype const* p)
+        {
+            if (!p || (p->Class != ITEM_CLASS_WEAPON && p->Class != ITEM_CLASS_ARMOR))
+                return false;
+            return extra.count(p->ItemId) != 0 || (p->Quality >= ITEM_QUALITY_EPIC && p->ItemLevel >= 66);
+        };
+        // what wearing it would gain this member: its score over the slot's present piece (the weaker of a pair)
+        auto gainFor = [&](Player* m, ItemPrototype const* p, float& rel) -> bool
+        {
+            AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
+            if (!ai || m->CanUseItem(p) != EQUIP_ERR_OK)
+                return false;
+            uint8 slot = m->FindEquipSlot(p, NULL_SLOT, true);
+            if (slot == NULL_SLOT)
+                return false;
+            auto wornScore = [&](uint8 s) -> float
+            {
+                Item* w = m->GetItemByPos(INVENTORY_SLOT_BAG_0, s);
+                return w ? ai->ScoreItem(w->GetProto(), s) : 0.0f;
+            };
+            float old = wornScore(slot);
+            if (slot == EQUIPMENT_SLOT_FINGER1 || slot == EQUIPMENT_SLOT_TRINKET1)
+                old = std::min(old, wornScore(slot + 1));
+            if (p->InventoryType == INVTYPE_2HWEAPON)
+                old += wornScore(EQUIPMENT_SLOT_OFFHAND);
+            float const now = ai->ScoreItem(p, slot);
+            if (now <= old)
+                return false;
+            // against the members own average worn piece, not this slots: a cloak scored ~0 for a priest made any
+            // cloak a "17378 %" upgrade (first council test, 2026-11-14)
+            float sum = 0.0f;
+            uint32 n = 0;
+            for (uint8 s = EQUIPMENT_SLOT_START; s < EQUIPMENT_SLOT_TABARD; ++s)
+                if (s != EQUIPMENT_SLOT_BODY)
+                    if (float const w = wornScore(s))
+                    {
+                        sum += w;
+                        ++n;
+                    }
+            rel = (now - old) / std::max(n ? sum / n : 1.0f, 1.0f);
+            return true;
+        };
+        uint32 moved = 0, kept = 0;
+        std::ostringstream report;
+        for (Player* holder : members)
+        {
+            std::vector<uint32> ids;
+            for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END; ++i)
+                if (Item* it = holder->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                    if (wantedProto(it->GetProto()))
+                        ids.push_back(it->GetEntry());
+            for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END; ++b)
+                if (Bag* bag = dynamic_cast<Bag*>(holder->GetItemByPos(INVENTORY_SLOT_BAG_0, b)))
+                    for (uint32 j = 0; j < bag->GetBagSize(); ++j)
+                        if (Item* it = bag->GetItemByPos(uint8(j)))
+                            if (wantedProto(it->GetProto()))
+                                ids.push_back(it->GetEntry());
+            for (uint32 id : ids)
+            {
+                ItemPrototype const* p = sObjectMgr.GetItemPrototype(id);
+                Player* best = nullptr;
+                float bestRel = 0.0f;
+                for (Player* m : members)
+                {
+                    float rel = 0.0f;
+                    if (m->HasItemCount(id, 1, true) && m != holder && p->MaxCount == 1)
+                        continue;   // a unique piece it already has
+                    if (gainFor(m, p, rel) && rel > bestRel)
+                    {
+                        bestRel = rel;
+                        best = m;
+                    }
+                }
+                if (!best)
+                {
+                    ++kept;
+                    report << " " << p->Name1 << ": no upgrade (" << holder->GetName() << " keeps it);";
+                    continue;
+                }
+                if (best != holder)
+                {
+                    ItemPosCountVec dest;
+                    if (best->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, id, 1) != EQUIP_ERR_OK || !holder->HasItemCount(id, 1, false))
+                    {
+                        ++kept;
+                        report << " " << p->Name1 << ": " << best->GetName() << " has no bag room;";
+                        continue;
+                    }
+                    holder->DestroyItemCount(id, 1, true);
+                    if (Item* item = best->StoreNewItem(dest, id, true))
+                        best->SendNewItem(item, 1, true, false);
+                }
+                if (AiBotAI* ai = dynamic_cast<AiBotAI*>(best->AI()))
+                    ai->TryAutoEquip();
+                bool const worn = best->HasItemWithIdEquipped(id, 1);
+                ++moved;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] LOOT %u %s: %s -> %s (+%.0f %%, %s)", id, p->Name1,
+                    holder->GetName(), best->GetName(), bestRel * 100.0f, worn ? "worn" : "kept in bags");
+                report << " " << p->Name1 << " -> " << best->GetName() << " (+" << int32(bestRel * 100.0f) << "%, "
+                       << (worn ? "worn" : "in bags") << ");";
+            }
+        }
+        PSendSysMessage("council: %u handed out, %u kept:%s", moved, kept, report.str().c_str());
         return true;
     }
     // Our own loot handed to a member who can use it (bots trade nothing and read no mail): one item moves from

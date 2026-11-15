@@ -559,6 +559,24 @@ void SuiRaidTelemetry::OnDamage(Unit* attacker, Unit* victim, uint32 damage, Spe
                 sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[TELEMETRY] CONE learned: %s (entry %u) breathes %.0f yd in front",
                     attacker->GetName(), attacker->GetEntry(), cone);
             }
+            // Where a boss's cone found a member who is not its target: the angle off its facing and the distance,
+            // and what that member was doing (2026-11-14, Onyxia dev attempt 10: Flame Breath killed seven at once
+            // while her tank held her steady).
+            if (static_cast<Creature*>(attacker)->IsWorldBoss() && attacker->GetVictim() != victim)
+            {
+                float const dx = victim->GetPositionX() - attacker->GetPositionX(), dy = victim->GetPositionY() - attacker->GetPositionY();
+                float off = std::atan2(dy, dx) - attacker->GetOrientation();
+                while (off > float(M_PI)) off -= 2.0f * float(M_PI);
+                while (off < -float(M_PI)) off += 2.0f * float(M_PI);
+                Unit* tv = attacker->GetVictim();
+                Player const* pv = static_cast<Player const*>(victim);
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[TELEMETRY] CONEHIT %s %s -> %s (%s) %u dmg at %.0f deg off her facing, %.0f yd%s%s; her target %s %.0f deg",
+                    attacker->GetName(), spell->SpellName[0].c_str(), victim->GetName(), RoleName(RoleOf(pv)), damage,
+                    off * 180.0f / float(M_PI), attacker->GetDistance2d(victim), victim->IsMoving() ? ", moving" : "",
+                    victim->IsNonMeleeSpellCasted(false) ? ", casting" : "", tv ? tv->GetName() : "-",
+                    tv ? [&]() { float o = std::atan2(tv->GetPositionY() - attacker->GetPositionY(), tv->GetPositionX() - attacker->GetPositionX()) - attacker->GetOrientation();
+                        while (o > float(M_PI)) o -= 2.0f * float(M_PI); while (o < -float(M_PI)) o += 2.0f * float(M_PI); return o * 180.0f / float(M_PI); }() : 0.0f);
+            }
         }
     // Death bursts: the same circle cast by a creature that has just died (a Firesworn's eruption)
     // is no pulse - nothing comes again; it is a blast when that kind dies.
@@ -922,6 +940,27 @@ void SuiRaidTelemetry::Sample(Player const* leader)
         f.lowest = std::min(f.lowest, f.hpPct);
         if (every5 && f.rank == CREATURE_ELITE_WORLDBOSS)
             f.hpTrace.push_back(uint32(f.hpPct + 0.5f));
+        // Who stands behind the target on a boss's threat list, every 5 s: whether a tank is second when the
+        // target dies (2026-11-14, Onyxia rerun 3: twelve of 38 turns were "dead" swaps onto damage dealers).
+        if (every5 && f.rank == CREATURE_ELITE_WORLDBOSS)
+        {
+            std::vector<std::pair<float, Unit*>> rows;
+            for (HostileReference* ref : c->GetThreatManager().getThreatList())
+                if (Unit* u = ref ? ref->getTarget() : nullptr)
+                    rows.emplace_back(ref->getThreat(), u);
+            std::sort(rows.begin(), rows.end(), [](std::pair<float, Unit*> const& a, std::pair<float, Unit*> const& b) { return a.first > b.first; });
+            std::ostringstream os;
+            for (size_t i = 0; i < rows.size() && i < 8; ++i)
+            {
+                Player const* p = rows[i].second->IsPlayer() ? static_cast<Player const*>(rows[i].second) : nullptr;
+                os << ' ' << rows[i].second->GetName() << '/' << (p ? RoleName(RoleOf(p)) : "pet") << '=' << uint32(rows[i].first)
+                   << (rows[i].second->IsAlive() ? "" : "(dead)");
+            }
+            Unit* tv = c->GetVictim();
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[TELEMETRY] THREAT %s at +%us %.0f%%%s on %s:%s", c->GetName(),
+                (WorldTimer::getMSTime() - gFight.startedAt) / 1000, f.hpPct, c->IsLevitating() || c->IsFlying() ? " (air)" : "",
+                tv ? tv->GetName() : "-", os.str().c_str());
+        }
         bool controlled = c->HasBreakableByDamageCrowdControlAura();
         for (auto const& entry : c->GetSpellAuraHolderMap())
             if (entry.second && entry.second->HasMechanic(MECHANIC_BANISH))

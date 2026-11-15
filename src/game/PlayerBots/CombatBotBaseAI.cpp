@@ -8,6 +8,8 @@
 #include "WorldPacket.h"
 #include "Spell.h"
 #include "SpellAuras.h"
+
+bool AiBotHealerThreatHold(Player* healer);   // SuperUiContent/SuiBots/AiBotAIMain.cpp
 #include "Chat.h"
 #include "CharacterDatabaseCache.h"
 #include <random>
@@ -2076,6 +2078,13 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
 {
     Unit* pTarget = nullptr;
     float healthPercent = 100.0f;
+    // [TACTICS] A world boss's tanks-first window holds heals off everyone above 40 % (AiBotHealerThreatHold)
+    bool const threatHold = AiBotHealerThreatHold(me);
+    if (threatHold)
+    {
+        selfHealPercent = std::min(selfHealPercent, 40.0f);
+        groupHealPercent = std::min(groupHealPercent, 40.0f);
+    }
 
     if (me->GetHealthPercent() < selfHealPercent)
     {
@@ -2142,7 +2151,7 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
             // lean lost the tank to rogues and casters at 25 % every time (2026-09-25, Shazzrah:
             // "healed 0 in last 8 s" with nine healers casting in range).
             float const effective = hp - (emergency ? 60.0f : tanking && tankHealer ? 60.0f : (tanking && hp < 50.0f ? 20.0f : 0.0f));
-            if (!IsValidHealTarget(pMember, tanking && tankHealer ? std::max(groupHealPercent, 95.0f) : groupHealPercent) ||
+            if (!IsValidHealTarget(pMember, tanking && tankHealer && !threatHold ? std::max(groupHealPercent, 95.0f) : groupHealPercent) ||
                 healthPercent <= effective)
                 continue;
             int32 const missing = int32(pMember->GetMaxHealth() - pMember->GetHealth());
@@ -2181,6 +2190,11 @@ Unit* CombatBotBaseAI::SelectHealTarget(float selfHealPercent, float groupHealPe
 
 Unit* CombatBotBaseAI::SelectPeriodicHealTarget(float selfHealPercent, float groupHealPercent) const
 {
+    if (AiBotHealerThreatHold(me))   // [TACTICS] see SelectHealTarget
+    {
+        selfHealPercent = std::min(selfHealPercent, 40.0f);
+        groupHealPercent = std::min(groupHealPercent, 40.0f);
+    }
     if (me->GetHealthPercent() < selfHealPercent &&
        !me->HasAuraType(SPELL_AURA_PERIODIC_HEAL))
         return me;
@@ -2211,6 +2225,8 @@ Unit* CombatBotBaseAI::SelectPeriodicHealTarget(float selfHealPercent, float gro
 
 bool CombatBotBaseAI::FindAndPreHealTarget()
 {
+    if (AiBotHealerThreatHold(me))   // [TACTICS] no heal ahead of the damage while a world boss is the tank's to take
+        return false;
     Unit* pTarget = me;
     int32 maxIncomingDamage = GetIncomingdamage(me);
 

@@ -157,11 +157,212 @@ WorldSession* AiBotAI::SuiCommanderSession() const
     return nullptr;
 }
 
-// True when this damage dealer should hold its damage: its victim is an elite someone else in its
-// group holds, and its own threat is up to 90 % of the holder's.
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+// [TACTICS] Threat discipline (rewritten 2026-11-14, Onyxia). Raid practice, no encounter named:
+//  - a damage dealer does not take an elite off the tank holding it: melee waits at 75 % of the tank's
+//    threat, ranged at 80 % (the game moves aggro at 110 % in melee range, 130 % beyond; a Knock Away
+//    style -25 % on the tank must not hand the boss to the rogue behind it);
+//  - a world boss whose whole threat list was just wiped (a phase change) is left to the tanks until one
+//    has held it for 4 s - nobody else builds threat first;
+//  - a world boss loose on a non-tank while a tank stands near is left alone by every damage dealer, the
+//    holder included (which drops its threat if it can), for up to 10 s, so the tank takes it back;
+//  - a flying boss picks its own targets (Onyxia's air phase: every Fireball zeroes its target's threat),
+//    so nobody waits on it - except in the wipe window above;
+//  - a hold stops white swings and Auto Shot too, not only the spell rotation.
+// 2026-11-14, Onyxia week 4 attempt 5: Onyxia cannot be taunted (immunity_flags TAUNT). At the phase-3
+// landing (DoResetThreat) the casters who already held her kept casting; she turned ten times in 30 s,
+// and a Flame Breath turned with her killed eight.
+namespace
+{
+    struct BossThreatWatch
+    {
+        float lastTop = 0.0f;
+        uint32 sampledMs = 0;
+        uint32 wipedAtMs = 0;       // threat list wiped; tanks only until one has held it 4 s
+        uint32 tankSinceMs = 0;     // a tank has been its victim since
+        ObjectGuid looseOn;         // a non-tank holds it
+        uint32 looseSinceMs = 0;
+        bool wasAirborne = false;   // it was in the air at the last sample
+    };
+    std::mutex gThreatHoldLock;
+    std::unordered_map<uint64, BossThreatWatch> gBossThreat;
+    std::unordered_map<uint64, uint32> gThreatHoldLogMs;
+    std::unordered_set<uint64> gThreatHoldSwingStopped;
+
+    bool HoldsAsTank(Unit const* u)
+    {
+        Player const* p = u ? u->ToPlayer() : nullptr;
+        if (!p)
+            return false;
+        if (AiBotAI const* ai = dynamic_cast<AiBotAI const*>(const_cast<Player*>(p)->AI()))
+            return ai->GetCombatActiveRole() == ROLE_TANK;
+        return p->GetClass() == CLASS_WARRIOR || p->GetClass() == CLASS_PALADIN || p->GetClass() == CLASS_DRUID;
+    }
+
+    bool LivingTankNear(Player* me, Unit* foe, float range)
+    {
+        Group* group = me->GetGroup();
+        if (!group)
+            return false;
+        for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+        {
+            Player* m = itr->getSource();
+            if (m && m != me && m->IsAlive() && m->IsInMap(me) && HoldsAsTank(m) && m->IsWithinDistInMap(foe, range))
+                return true;
+        }
+        return false;
+    }
+
+    // A holder that can shed its threat does (Feign Death, Fade, Feint) - the boss cannot always be taunted.
+    void DropThreatIfAble(Player* me, Unit* foe)
+    {
+        static uint32 const kDrops[] = { 5384,                                       // Feign Death
+            10942, 10941, 9592, 9579, 9578, 586,                                     // Fade
+            25302, 11303, 8637, 6768, 1966 };                                        // Feint
+        for (uint32 id : kDrops)
+        {
+            if (!me->HasSpell(id) || !me->IsSpellReady(id))
+                continue;
+            SpellEntry const* info = sSpellMgr.GetSpellEntry(id);
+            if (!info || me->HasGCD(info))
+                return;
+            if (me->IsNonMeleeSpellCasted(false))
+                me->InterruptNonMeleeSpells(false);
+            bool const onFoe = id == 25302 || id == 11303 || id == 8637 || id == 6768 || id == 1966;
+            if (me->CastSpell(onFoe ? foe : static_cast<Unit*>(me), id, false) == SPELL_CAST_OK)
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: holds %s as a non-tank - sheds threat with %s",
+                    me->GetName(), foe->GetName(), info->SpellName[0].c_str());
+            return;
+        }
+    }
+}
+
+// The backup tank of a boss a tank holds (2026-11-14, Onyxia dev attempt 7: in phase 3 the four spare tanks held
+// whelps at 1500-1900 threat for 160 s while the damage dealers stood at 6000-10000 behind her tank; when he died
+// she went down the casters and killed six in 15 s). The living tank other than her target with the most threat on
+// her, and no elite of its own to hold: it hits her (TankDuty), keeps under her tank, and the damage dealers keep
+// under it - whoever she turns to when her tank falls is a tank.
+Player* AiBotBackupTankFor(Creature* boss)
+{
+    if (!boss || !boss->IsAlive() || !boss->IsWorldBoss() || !boss->CanHaveThreatList())
+        return nullptr;
+    if (boss->IsFlying() || boss->IsLevitating() || boss->IsHovering())
+        return nullptr;
+    Unit* v = boss->GetVictim();
+    Player* holder = v ? v->ToPlayer() : nullptr;
+    if (!holder || !HoldsAsTank(holder) || !holder->GetGroup())
+        return nullptr;
+    uint32 const now = WorldTimer::getMSTime();
+    uint64 const key = boss->GetObjectGuid().GetRawValue();
+    static std::mutex lock;
+    static std::unordered_map<uint64, std::pair<ObjectGuid, uint32>> cache;
+    ObjectGuid previous;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        auto it = cache.find(key);
+        if (it != cache.end())
+        {
+            previous = it->second.first;
+            if (now - it->second.second < 1000)
+            {
+                if (previous.IsEmpty())
+                    return nullptr;
+                Player* p = boss->GetMap()->GetPlayer(previous);
+                if (p && p->IsAlive() && p != holder)
+                    return p;
+            }
+        }
+    }
+    Player* best = nullptr;
+    float bestThreat = -1.0f;
+    for (GroupReference* itr = holder->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || m == holder || !m->IsAlive() || !m->IsInMap(boss) || !HoldsAsTank(m) || !m->IsWithinDistInMap(boss, 45.0f))
+            continue;
+        Unit* mv = m->GetVictim();
+        if (mv && mv != boss && mv->IsCreature() && static_cast<Creature*>(mv)->IsElite() && mv->GetVictim() == m)
+            continue;   // a tank holding an elite add of its own keeps it
+        float const t = boss->GetThreatManager().getThreat(m);
+        if (t > bestThreat || (t == bestThreat && best && m->GetGUIDLow() < best->GetGUIDLow()))
+        {
+            best = m;
+            bestThreat = t;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        cache[key] = std::make_pair(best ? best->GetObjectGuid() : ObjectGuid(), now);
+    }
+    if (best && best->GetObjectGuid() != previous)
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: backup tank on %s (threat %.0f, %s holds %.0f)",
+            best->GetName(), boss->GetName(), bestThreat, holder->GetName(), boss->GetThreatManager().getThreat(holder));
+    return best;
+}
+
+// True when this damage dealer should hold all its damage this sub-tick (see above).
+// Whether a healer holds its heals off everyone above 40 % for a world boss's sake: while the boss's tanks-first window is
+// open (pull, threat wipe, landing) every heal's threat lands on a taunt-immune boss before the tank's, and outside it a
+// healer at 90 % of the tank's threat is one heal from turning her (2026-11-14, Onyxia dev attempt 16: a paladin healer
+// had her at +1 s; her breath on him killed seven). Emergencies (under 40 %) are always healed.
+bool AiBotHealerThreatHold(Player* healer)
+{
+    if (!healer || !healer->IsInCombat() || !healer->GetGroup())
+        return false;
+    uint32 const now = WorldTimer::getMSTime();
+    std::list<Unit*> foes;
+    healer->GetEnemyListInRadiusAround(healer, 60.0f, foes);
+    for (Unit* u : foes)
+    {
+        if (!u || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat() || !static_cast<Creature*>(u)->IsWorldBoss() ||
+            !u->CanHaveThreatList() || u->IsFlying() || u->IsLevitating() || u->IsHovering())
+            continue;
+        Unit* holder = u->GetVictim();
+        if (holder == healer)
+            continue;
+        float top = 0.0f;
+        for (HostileReference* ref : u->GetThreatManager().getThreatList())
+            if (ref)
+                top = std::max(top, ref->getThreat());
+        bool window;
+        {
+            std::lock_guard<std::mutex> guard(gThreatHoldLock);
+            auto it = gBossThreat.find(u->GetObjectGuid().GetRawValue());
+            if (it == gBossThreat.end() || !it->second.sampledMs || now - it->second.sampledMs > 60000)
+                window = top < 5000.0f;   // nobody has looked at this pull yet: it is fresh
+            else
+                window = it->second.wipedAtMs != 0;
+        }
+        char const* why = nullptr;
+        if (window)
+            why = "tanks first";
+        else if (holder && HoldsAsTank(holder) &&
+                 u->GetThreatManager().getThreat(healer) >= u->GetThreatManager().getThreat(holder) * 0.9f)
+            why = "at the tank's threat";
+        if (!why)
+            continue;
+        static std::unordered_map<uint64, uint32> logged;
+        static std::mutex logLock;
+        std::lock_guard<std::mutex> guard(logLock);
+        uint32& last = logged[healer->GetObjectGuid().GetRawValue()];
+        if (now - last > 5000)
+        {
+            last = now;
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: holds heals above 40 %% on %s (%s; mine %.0f, %s %.0f)",
+                healer->GetName(), u->GetName(), why, u->GetThreatManager().getThreat(healer),
+                holder ? holder->GetName() : "nobody", holder ? u->GetThreatManager().getThreat(holder) : 0.0f);
+        }
+        return true;
+    }
+    return false;
+}
+
 static bool ThreatHoldFor(Player* me, CombatBotRoles role)
 {
-    if (role != ROLE_MELEE_DPS && role != ROLE_RANGE_DPS)
+    bool const tankRole = role == ROLE_TANK;
+    if (!tankRole && role != ROLE_MELEE_DPS && role != ROLE_RANGE_DPS)
         return false;
     Unit* victim = me->GetVictim();
     if (!victim || !victim->IsCreature() || !victim->IsAlive() || !victim->CanHaveThreatList() || !me->GetGroup())
@@ -170,11 +371,180 @@ static bool ThreatHoldFor(Player* me, CombatBotRoles role)
     if (!foe->IsElite() && !foe->IsWorldBoss())
         return false;   // small adds die fast; nobody waits on them
     Unit* holder = foe->GetVictim();
-    if (!holder || holder == me || !holder->IsPlayer() || !me->GetGroup()->IsMember(holder->GetObjectGuid()))
+    if (!holder || !holder->IsPlayer() || !me->GetGroup()->IsMember(holder->GetObjectGuid()))
         return false;
-    float const held = foe->GetThreatManager().getThreat(holder);
+    bool const boss = foe->IsWorldBoss();
+    bool const holderTank = HoldsAsTank(holder);
+    uint32 const now = WorldTimer::getMSTime();
+    char const* why = nullptr;
+    // The backup tank keeps under the tank: at 80 % a Knock Away (-25 % off the tank) still leaves it under the
+    // 110 % that would turn her.
+    if (tankRole)
+    {
+        if (!boss || !holderTank || holder == me || AiBotBackupTankFor(foe) != me)
+            return false;
+        if (foe->GetThreatManager().getThreat(me) < foe->GetThreatManager().getThreat(holder) * 0.8f)
+            return false;
+        why = "backup tank, under the tank";
+    }
+    bool wiped = false, loose = false;
+    if (boss)
+    {
+        std::lock_guard<std::mutex> guard(gThreatHoldLock);
+        BossThreatWatch& w = gBossThreat[foe->GetObjectGuid().GetRawValue()];
+        // A fresh pull is the same tanks-first window as a wipe: the healers' first heals and the rogues' first blows
+        // came before the tank's (2026-11-14, Onyxia dev attempt 16: a paladin healer had 488 threat at +1 s and 2170 at
+        // +11 s against the tank's 1037; she breathed on him and the casters beside him - seven dead at +16 s).
+        if (!w.sampledMs || now - w.sampledMs > 60000)
+        {
+            float top = 0.0f;
+            for (HostileReference* ref : foe->GetThreatManager().getThreatList())
+                if (ref)
+                    top = std::max(top, ref->getThreat());
+            w = BossThreatWatch();
+            if (top < 5000.0f)
+            {
+                w.wipedAtMs = now;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: pulled - tanks only until one holds it 4 s with a lead",
+                    foe->GetName());
+            }
+        }
+        if (now - w.sampledMs >= 250)
+        {
+            w.sampledMs = now;
+            float top = 0.0f, topOther = 0.0f;
+            for (HostileReference* ref : foe->GetThreatManager().getThreatList())
+                if (ref)
+                {
+                    top = std::max(top, ref->getThreat());
+                    if (!HoldsAsTank(ref->getTarget()))
+                        topOther = std::max(topOther, ref->getThreat());
+                }
+            if (w.lastTop > 5000.0f && top < w.lastTop * 0.05f)
+            {
+                w.wipedAtMs = now;
+                w.tankSinceMs = 0;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: threat list wiped (%.0f -> %.0f) - tanks only until one holds it 4 s with a lead",
+                    foe->GetName(), w.lastTop, top);
+            }
+            w.lastTop = top;
+            // A boss that lands is a fresh fight: the same tanks-first window as a wipe. Its threat in the air had been
+            // cut by every Fireball, so no wipe showed (2026-11-14, Onyxia dev attempt 13: she landed at 39 % with no tank
+            // on her list and the casters kept her 30 s - eight dead to her breath and tail).
+            bool const airNow = foe->IsFlying() || foe->IsLevitating() || foe->IsHovering();
+            if (w.wasAirborne && !airNow)
+            {
+                w.wipedAtMs = now;
+                w.tankSinceMs = 0;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: landed - tanks only until one holds it 4 s with a lead",
+                    foe->GetName());
+            }
+            w.wasAirborne = airNow;
+            if (holderTank)
+            {
+                if (!w.tankSinceMs)
+                    w.tankSinceMs = now;
+                w.looseOn.Clear();
+            }
+            else
+            {
+                w.tankSinceMs = 0;
+                if (w.looseOn != holder->GetObjectGuid())
+                {
+                    w.looseOn = holder->GetObjectGuid();
+                    w.looseSinceMs = now;
+                }
+            }
+            // (held 4 s AND 1.5x the first non-tank: at 4 s alone the casters' damage over time had already passed the new
+            // tank - 2026-11-14, Onyxia dev attempt 9, a warlock took her 6 s after the landing and her breath killed four)
+            if (w.wipedAtMs && (now - w.wipedAtMs >= 30000 || (w.tankSinceMs && now - w.tankSinceMs >= 4000 &&
+                    foe->GetThreatManager().getThreat(holder) >= topOther * 1.5f)))
+                w.wipedAtMs = 0;
+        }
+        wiped = w.wipedAtMs != 0;
+        loose = !holderTank && !w.looseOn.IsEmpty() && now - w.looseSinceMs < 10000;
+    }
     float const mine = foe->GetThreatManager().getThreat(me);
-    return mine >= held * 0.9f;
+    float const held = foe->GetThreatManager().getThreat(holder);
+    bool const airborne = foe->IsFlying() || foe->IsLevitating() || foe->IsHovering();
+    if (why)
+        ;
+    else if (wiped)
+        why = "threat wiped, tanks first";
+    else if (airborne)
+        return false;
+    else if (holderTank && holder != me)
+    {
+        // (ranged 80 %: inside a big boss's reach the 110 % rule applies to casters too, and Knock Away takes 25 % off the
+        // tank - 2026-11-14, a warlock took Onyxia off her tank after four minutes)
+        float cap = held * (role == ROLE_MELEE_DPS ? 0.75f : 0.8f);
+        // ...and under the backup tank once it has built a real share (see AiBotBackupTankFor)
+        if (boss)
+            if (Player* backup = AiBotBackupTankFor(foe))
+                if (backup != me)
+                {
+                    float const b = foe->GetThreatManager().getThreat(backup);
+                    if (b >= held * 0.25f && b * 0.95f < cap)
+                        cap = b * 0.95f;
+                }
+        if (mine >= cap)
+            why = cap < held * 0.75f ? "under the backup tank" : "at the tank's threat";
+    }
+    else if (boss && loose && LivingTankNear(me, foe, 40.0f))
+    {
+        why = holder == me ? "holds it as a non-tank" : "loose on a non-tank";
+        if (holder == me)
+            DropThreatIfAble(me, foe);
+    }
+    else if (holder != me && mine >= held * 0.9f)
+        why = "at the holder's threat";
+    if (!why)
+        return false;
+    {
+        std::lock_guard<std::mutex> guard(gThreatHoldLock);
+        uint32& next = gThreatHoldLogMs[me->GetObjectGuid().GetRawValue()];
+        if (now >= next)
+        {
+            next = now + 5000;
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: holds on %s (%s; mine %.0f, %s %.0f)",
+                me->GetName(), foe->GetName(), why, mine, holder->GetName(), held);
+        }
+    }
+    return true;
+}
+
+// A hold stops white swings and Auto Shot as well; the swing comes back when the hold lifts.
+static void ThreatHoldStopAutos(Player* me)
+{
+    if (me->HasUnitState(UNIT_STATE_MELEE_ATTACKING) && me->GetVictim())
+    {
+        me->ClearUnitState(UNIT_STATE_MELEE_ATTACKING);
+        me->SendMeleeAttackStop(me->GetVictim());
+        std::lock_guard<std::mutex> guard(gThreatHoldLock);
+        gThreatHoldSwingStopped.insert(me->GetObjectGuid().GetRawValue());
+    }
+    if (me->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        me->InterruptSpell(CURRENT_AUTOREPEAT_SPELL, true);
+}
+
+static void ThreatHoldResumeSwing(Player* me)
+{
+    {
+        std::lock_guard<std::mutex> guard(gThreatHoldLock);
+        if (!gThreatHoldSwingStopped.erase(me->GetObjectGuid().GetRawValue()))
+            return;
+    }
+    if (Unit* v = me->GetVictim())
+        me->Attack(v, true);
+}
+
+// While a hold has stopped this body's swing, nothing else restarts it on the same victim.
+bool AiBotThreatHoldKeepsSwingOff(Player* me, Unit* victim)
+{
+    if (!me || !victim || me->GetVictim() != victim)
+        return false;
+    std::lock_guard<std::mutex> guard(gThreatHoldLock);
+    return gThreatHoldSwingStopped.count(me->GetObjectGuid().GetRawValue()) != 0;
 }
 
 bool AiBotAI::SuiValidateOrderDest(float& x, float& y, float& z)
@@ -1927,9 +2297,13 @@ void AiBotAI::UpdateAI(uint32 const diff)
             // range, 130 % beyond). 2026-09-25: Onyxia turned to a warlock and a mage in the first
             // ten seconds, before her tank had built anything, and breathed on the raid.
             else if (ThreatHoldFor(me, GetCombatActiveRole()))
+            {
+                ThreatHoldStopAutos(me);
                 SuiRaidTelemetry::OnRotationTick(me, 4);
+            }
             else if (!m_pullActive && !m_stalemateHoldMs && !m_overpullFleeHoldMs)
             {
+                ThreatHoldResumeSwing(me);
                 CB_HIT(me->GetGUIDLow(), "cpp-main: built-in spec cast attempt");
                 SuiRaidTelemetry::OnRotationTick(me, 0);
                 UpdateSpecCombatAI();
@@ -3645,7 +4019,13 @@ void AiBotAI::UpdateAI(uint32 const diff)
         if (Unit* pFocus = m_doctrine->MaintainTarget(*this, pVictim))   // cb:fold decl-in-condition artifact, body probed
         {
             CB_HIT(me->GetGUIDLow(), "cpp-main: mid-combat convergence check");
-            if (pFocus != pVictim && AttackStart(pFocus))
+            // A healer does not follow the leader onto a small add: its target heals nobody, and the walk to it took the
+            // healers into a boss's front again and again (2026-11-14, Onyxia dev attempt 17, phase 3: "focus -> Onyxian
+            // Whelp (my human's victim)", "converge", "out of the front of Onyxia" every 1-2 s; one Flame Breath killed
+            // five healers on their way).
+            bool const healerToSmall = GetCombatActiveRole() == ROLE_HEALER && pFocus->IsCreature() &&
+                !static_cast<Creature*>(pFocus)->IsElite() && !static_cast<Creature*>(pFocus)->IsWorldBoss();
+            if (pFocus != pVictim && !healerToSmall && AttackStart(pFocus))
             {
                 CB_HIT(me->GetGUIDLow(), "cpp-main: converging to anchor victim");
                 sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
