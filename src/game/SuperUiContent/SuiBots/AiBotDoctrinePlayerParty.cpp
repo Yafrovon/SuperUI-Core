@@ -169,6 +169,22 @@ private:
             return nullptr;
         }
 
+        // [TACTICS] 2026-11-18 R4W0 Onyxia: a whelp-post tank takes the whelps at its post and never chases one across
+        // the lair (SuiTactic::WhelpPostsAtSpawns; the post itself is AiBotAI::WhelpPostFor).
+        if (bot.GetCombatActiveRole() == ROLE_TANK && me->GetMapId() == SuiTactic::kOnyxia)
+            if (Creature* ony = me->FindNearestCreature(10184, 150.0f, true))
+                if (SuiTactic::On(me, SuiTactic::WhelpPostsAtSpawns, ony))
+                {
+                    bool postTank = false;
+                    Unit* whelp = bot.WhelpPostTarget(postTank);
+                    if (whelp)
+                    {
+                        TraceFocus(me, whelp, "whelp post");
+                        return whelp;
+                    }
+                    if (postTank)
+                        return nullptr;   // nothing at my post: wait there
+                }
         // [TACTICS] A tank's first duty is the group's safety, not the anchor's target.
         if (bot.GetCombatActiveRole() == ROLE_TANK)
             if (Unit* duty = TankDuty(bot, me))
@@ -184,6 +200,68 @@ private:
         {
             if (Unit* first = KillPriority(bot, me))
             {
+                // While a world boss of the fight is in the air, the melee spread over its small adds - two on one at
+                // most: seven rogues on one whelp beside the healers took one Fireball's Engulfing Flames together and
+                // burned each other, fifteen dead in a second (2026-11-15, R3W2 Onyxia attempt 2, phase 2 at 45 %).
+                if (bot.GetCombatActiveRole() == ROLE_MELEE_DPS && first->IsCreature() &&
+                    !static_cast<Creature*>(first)->IsElite() && !static_cast<Creature*>(first)->IsWorldBoss() && me->GetGroup())
+                {
+                    std::list<Unit*> around;
+                    MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck aroundCheck(me, me, 100.0f);
+                    MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> aroundSearcher(around, aroundCheck);
+                    Cell::VisitAllObjects(me, aroundSearcher, 100.0f);
+                    bool airBoss = false;
+                    for (Unit* u : around)
+                        if (u->IsCreature() && u->IsAlive() && u->IsInCombat() && static_cast<Creature*>(u)->IsWorldBoss() &&
+                            (u->IsFlying() || u->IsLevitating() || u->IsHovering()) && SuiTactic::On(me, SuiTactic::AirborneMeleeSpread, u))
+                            airBoss = true;
+                    if (airBoss)
+                    {
+                        Group* group = me->GetGroup();
+                        auto onIt = [&](Unit* add)
+                        {
+                            uint32 n = 0;
+                            for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+                            {
+                                Player* o = itr->getSource();
+                                if (!o || o == me || !o->IsAlive() || !o->IsInMap(me) || o->GetVictim() != add)
+                                    continue;
+                                AiBotAI* oai = dynamic_cast<AiBotAI*>(o->AI());
+                                if (oai && oai->GetCombatActiveRole() == ROLE_MELEE_DPS)
+                                    ++n;
+                            }
+                            return n;
+                        };
+                        if (onIt(first) >= 2)
+                        {
+                            Unit* better = nullptr;
+                            uint32 betterN = onIt(first);
+                            float betterD = 1e9f;
+                            for (Unit* u : around)
+                            {
+                                if (u == first || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat() ||
+                                    u->GetEntry() != first->GetEntry() || me->GetDistance(u) > 40.0f || !bot.IsValidAssistTarget(u))
+                                    continue;
+                                uint32 const n = onIt(u);
+                                float const d = me->GetDistance(u);
+                                if (n < betterN || (n == betterN && n < 2 && d < betterD))
+                                {
+                                    better = u;
+                                    betterN = n;
+                                    betterD = d;
+                                }
+                            }
+                            if (better && betterN < 2)
+                            {
+                                first = better;
+                                m_killPickGuid = first->GetObjectGuid();
+                                m_killPickMs = WorldTimer::getMSTime();
+                                TraceFocus(me, first, "kill order, spread over the adds while the boss is in the air");
+                                return first;
+                            }
+                        }
+                    }
+                }
                 // A melee damage dealer keeps its pick 4 s: the pick flipped Healer <-> Elite every 1-2 s and the
                 // rogues ran between them (2026-11-09, Majordomo attempt 55: 30-54 switches each, ~75 dps a rogue).
                 if (bot.GetCombatActiveRole() == ROLE_MELEE_DPS && first->GetObjectGuid() != m_killPickGuid)
@@ -810,19 +888,65 @@ private:
         // (2026-11-14: every world boss was ranked last, so Onyxia came after each of her whelps and the ranged
         // killed whelps for the whole phase 2 - 2956 "focus -> Onyxian Whelp (kill order)" in one hour).
         bool bossOrders = false;
+        // [TACTICS] 2026-11-20 R4W4 Onyxia att. 3: her whelps are elite, so the rule below ranked her after them - in
+        // phase 3 "focus -> Onyxian Whelp (kill order)" 138 times against Onyxia 54, she lost 22 % in 173 s while the
+        // whelps killed 24. Her whelps do not make her a boss who orders its adds; a whelp on me is still peeled first.
+        // Gated by SuiTactic::OnyxiaBeforeWhelps.
         if (orderBoss)
             for (Unit* mob : nearby)
                 if (mob->IsCreature() && mob->IsAlive() && mob->GetEntry() != orderBoss &&
+                    !SuiTactic::On(me, SuiTactic::OnyxiaBeforeWhelps, mob) &&
                     (SuiRaidPlaybook::KillOrder(orderBoss, mob->GetEntry()) >= 0 ||
                      (static_cast<Creature*>(mob)->IsElite() && !static_cast<Creature*>(mob)->IsWorldBoss())))
                 {
                     bossOrders = true;
                     break;
                 }
-        auto rankOf = [orderBoss, bossOrders, release, noFreeTank, &bot](Unit* mob)
+        // [TACTICS] 2026-11-17 R3W6/W9/W16 MC: three two-Firelord pulls ran away into 100-220 Lava Spawns while the whole raid
+        // killed spawns and both Firelords stood at 34-44 % summoning more. A ranged damage dealer takes the summoner first
+        // (rank 0, its spawn after it); the melee keep the spawn down. Gated by SuiTactic::SpawnerFirstForRanged.
+        uint32 spawnerFirst = 0;
+        // (2026-11-21 R4W7 MC 11:23 + 12:32: two pair runaways, 156 and 188 spawns - every ranged bot "focus -> Lava Spawn
+        // (kill order / my human's victim)", the Firelord 2 times: the ranged had cleared and spread away from the chasing
+        // spawns, past their 45 yd look, so no Firelord was a candidate. A summoner in combat within 80 yd is one now; the
+        // bot walks into range of it.)
+        if (bot.GetCombatActiveRole() == ROLE_RANGE_DPS)
         {
-            if (AiBotAI::IsKnownMultiplier(mob->GetEntry()))
+            std::list<Unit*> far;
+            MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck farCheck(me, me, 80.0f);
+            MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> farSearcher(far, farCheck);
+            Cell::VisitAllObjects(me, farSearcher, 80.0f);
+            for (Unit* mob : far)
+                if (mob->IsCreature() && mob->IsAlive() && mob->IsInCombat() && bot.IsValidAssistTarget(mob) &&
+                    std::find(nearby.begin(), nearby.end(), mob) == nearby.end() &&
+                    SuiTactic::On(me, SuiTactic::SpawnerFirstForRanged, mob))
+                {
+                    nearby.push_back(mob);
+                    static std::map<uint64, uint32> farNoted;
+                    uint32 const nowMs = WorldTimer::getMSTime();
+                    uint32& next = farNoted[me->GetObjectGuid().GetRawValue()];
+                    if (nowMs >= next)
+                    {
+                        next = nowMs + 10000;
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-SPAWN] %s: %s %.0f yd out is still mine to kill first (summoner beyond my 45 yd)",
+                            me->GetName(), mob->GetName(), me->GetDistance(mob));
+                    }
+                }
+        }
+        if (bot.GetCombatActiveRole() == ROLE_RANGE_DPS)
+            for (Unit* mob : nearby)
+                if (mob->IsCreature() && mob->IsAlive() && mob->IsInCombat() &&
+                    SuiTactic::On(me, SuiTactic::SpawnerFirstForRanged, mob))
+                {
+                    spawnerFirst = mob->GetEntry();
+                    break;
+                }
+        auto rankOf = [orderBoss, bossOrders, release, noFreeTank, spawnerFirst, &bot](Unit* mob)
+        {
+            if (spawnerFirst && mob->GetEntry() == spawnerFirst)
                 return uint8(0);
+            if (AiBotAI::IsKnownMultiplier(mob->GetEntry()))
+                return uint8(spawnerFirst ? 1 : 0);
             if (mob->HasBreakableByDamageCrowdControlAura() && mob != release)
                 return uint8(9);
             // An add the raid could sheep, awake while no tank is free and not woken on purpose, is sheeped
@@ -936,7 +1060,11 @@ private:
                 // (mob_core_hound). Nothing hits one at the floor or lying down until all are there.
                 // 2026-11-03: the old 8 % line with "help the healthiest" floored them one at a time - a
                 // five-hound pack (236k health) took 261 s and 1.6M damage.
-                float const floorPct = 18.0f;
+                // [TACTICS] 2026-11-19 R4W0/R4W1 MC Core Hound packs (P56634, P56629, P56638): the window opens when the
+                // first one falls - by splash or a tank, while its kin stood at 17-25 % - and then ~80 % of a hound had to
+                // die in 10 s; the last one at 2-15 % outlived it again and again (one fight 358 s, four tanks dead). With
+                // the floor at 10 % half of that is left when the clock starts. Gated by SuiTactic::RiserBurstFocus.
+                float const floorPct = SuiTactic::On(me, SuiTactic::RiserBurstFocus, standing.front()) ? 10.0f : 18.0f;
                 std::vector<Unit*> up, low;
                 for (Unit* s : standing)
                 {
@@ -947,6 +1075,18 @@ private:
                 auto byGuid = [](Unit* x, Unit* y) { return x->GetGUIDLow() < y->GetGUIDLow(); };
                 std::sort(up.begin(), up.end(), byGuid);
                 std::sort(low.begin(), low.end(), byGuid);
+                // [TACTICS] 2026-11-17 R3W11/R3W12 MC Core Hounds: each bot's share reshuffled at every fall (low.size()
+                // changed), ~60 target switches went out in 3 s and the last two at 5-6 % outlived the window - the pack
+                // rose 27 times in one 595 s fight. In the burst a bot stays on its own low one until it falls, then all go
+                // to the lowest left: each dies at once, well inside the window. Gated by SuiTactic::RiserBurstFocus.
+                if (up.empty() && !low.empty() && SuiTactic::On(me, SuiTactic::RiserBurstFocus, low.front()))
+                {
+                    Unit* current = me->GetVictim();
+                    if (current && std::find(low.begin(), low.end(), current) != low.end())
+                        return current;
+                    return *std::min_element(low.begin(), low.end(), [](Unit* x, Unit* y)
+                        { return x->GetHealth() != y->GetHealth() ? x->GetHealth() < y->GetHealth() : x->GetGUIDLow() < y->GetGUIDLow(); });
+                }
                 if (up.empty())
                     return low.empty() ? nullptr : low[me->GetGUIDLow() % low.size()];   // the burst: each its share
                 Unit* top = *std::max_element(up.begin(), up.end(), [](Unit* x, Unit* y)
@@ -1108,7 +1248,21 @@ private:
             // Ranged damage dealers peel only what chews on themselves: a stream of small adds
             // otherwise keeps every caster off the boss for good (2026-09-25: Onyxia's second
             // phase took six minutes, her whelps drawing all the ranged damage the whole time).
-            if (!static_cast<Creature*>(mob)->IsElite() && victimPlayer &&
+            // [TACTICS] 2026-11-23 R4W14-R4W16 Onyxia att. 1 each night: 4, 7 and 6 healers died first to whelp melee in phase 2
+            // (+160-250 s) and every wipe followed from it. This peel skips elites, and her whelps are elite - only the post tanks
+            // ever took a whelp off a healer (R4W16: whelp 1701038 went Vexmark -> Nerret -> Clawknight in 45 s while each healer
+            // walked it to a tank). A whelp on a healer is peeled like a small add: by the melee, and by a ranged damage dealer
+            // within 25 yd of that healer. Gated by SuiTactic::WhelpsOffHealers.
+            bool const whelpOnHealer = victimPlayer && mob->GetEntry() == 11262 &&
+                SuiTactic::On(me, SuiTactic::WhelpsOffHealers, mob) && [victimPlayer]()
+                {
+                    AiBotAI* vai = dynamic_cast<AiBotAI*>(victimPlayer->AI());
+                    return vai && vai->GetCombatActiveRole() == ROLE_HEALER;
+                }();
+            if (whelpOnHealer && rank > 1 &&
+                (bot.GetCombatActiveRole() != ROLE_RANGE_DPS || me->GetDistance(victimPlayer) <= 25.0f))
+                rank = 1;
+            else if (!static_cast<Creature*>(mob)->IsElite() && victimPlayer &&
                 (bot.GetCombatActiveRole() != ROLE_RANGE_DPS || victimPlayer == me))
                 if (AiBotAI* vai = dynamic_cast<AiBotAI*>(victimPlayer->AI()))
                     if (vai->GetCombatActiveRole() != ROLE_TANK && rank > 1)
@@ -1131,6 +1285,35 @@ private:
             best = mob;
             bestRank = rank;
             bestHealth = mob->GetHealthPercent();
+        }
+        // [TACTICS] 2026-11-20 R4W4 MC 15:21 (P56777) + 15:44 (P56720): both Firelords dead, then the Lava Spawns ran away -
+        // 2933 "focus -> Lava Spawn (kill order)" switches and 4 spawns killed in one fight, 366 up. The multiplier rule ("the
+        // oldest, unless one is under half") was resolved per bot over its own 45 yd, so bots in different spots chose
+        // different spawns and every split or death re-chose. One spawn is the raid's target, kept until it dies: the first
+        // bot's pick is shared by the group, the rest take it while it is within 60 yd of them. Gated by
+        // SuiTactic::RaidWideSpawnTarget.
+        if (best && AiBotAI::IsKnownMultiplier(best->GetEntry()) && SuiTactic::On(me, SuiTactic::RaidWideSpawnTarget, best))
+        {
+            static std::mutex sharedLock;
+            static std::unordered_map<uint32, ObjectGuid> shared;   // group id -> the raid's spawn
+            ObjectGuid chosen;
+            {
+                std::lock_guard<std::mutex> guard(sharedLock);
+                chosen = shared[group->GetId()];
+            }
+            Unit* cur = chosen.IsEmpty() ? nullptr : me->GetMap()->GetUnit(chosen);
+            bool const curGood = cur && cur->IsAlive() && cur->IsInCombat() && cur->GetEntry() == best->GetEntry();
+            if (curGood && cur != best && me->GetDistance(cur) <= 60.0f && bot.IsValidAssistTarget(cur))
+                best = cur;
+            else if (!curGood)
+            {
+                {
+                    std::lock_guard<std::mutex> guard(sharedLock);
+                    shared[group->GetId()] = best->GetObjectGuid();
+                }
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-SPAWN] %s: the raid's %s target is now guid %u (%.0f %%, %.0f yd from me)",
+                    me->GetName(), best->GetName(), best->GetGUIDLow(), best->GetHealthPercent(), me->GetDistance(best));
+            }
         }
         // A melee held off everything in its 45 yd goes to a tanked add above half further out (the tanks
         // stand up to 35 yd from the healers), never back to the one it was held off (2026-11-08, Majordomo

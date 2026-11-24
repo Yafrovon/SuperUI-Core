@@ -454,6 +454,33 @@ void SuiRaidTelemetry::OnCreatureCast(Unit* caster, SpellEntry const* spell)
             caster->GetName(), added, spell->SpellName[0].c_str(), spell->Id);
 }
 
+void SuiRaidTelemetry::ChainImpacts(uint32 spellId, uint32 mapId, std::vector<std::tuple<float, float, float>>& out)
+{
+    uint32 id = spellId;
+    for (uint32 k = 0; k < 40 && id; ++k)
+    {
+        SpellEntry const* s = sSpellMgr.GetSpellEntry(id);
+        if (!s)
+            break;
+        float radius = 0.0f;
+        uint32 next = 0;
+        for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        {
+            if (s->Effect[i] == SPELL_EFFECT_SCHOOL_DAMAGE)
+                if (SpellRadiusEntry const* r = sSpellRadiusStore.LookupEntry(s->EffectRadiusIndex[i]))
+                    radius = std::max(radius, Spells::GetSpellRadius(r));
+            if (s->Effect[i] == SPELL_EFFECT_TRIGGER_SPELL && s->EffectTriggerSpell[i])
+                next = s->EffectTriggerSpell[i];
+        }
+        if (SpellTargetPosition const* pos = sSpellMgr.GetSpellTargetPosition(id))
+            if (pos->mapId == mapId && radius > 0.0f)
+                out.emplace_back(pos->x, pos->y, radius);
+        if (next == id)
+            break;
+        id = next;
+    }
+}
+
 void SuiRaidTelemetry::ForecastHazards(Unit const* around, float range, std::vector<std::tuple<float, float, float>>& out)
 {
     uint32 const now = WorldTimer::getMSTime();

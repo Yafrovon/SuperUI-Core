@@ -118,6 +118,24 @@
         19891
       ],
       "paladinAuraWhy": "Fire Resistance Aura (60/45/30 fire resistance to the paladin's party): Ragnaros' damage is all fire. The bots pick a random aura of seven otherwise."
+    },
+    "12118": {
+      "name": "Lucifron",
+      "lure": {
+        "at": [
+          1000.0,
+          -945.0,
+          -180.0
+        ],
+        "camp": [
+          955.0,
+          -928.0,
+          -180.0
+        ],
+        "why": "2026-11-17 R3W8-W13: Lucifron walks a 136 yd line (1000,-958) <-> (1120,-1018) passing 8-20 yd from all four Core Hound packs; a pack fight (50-106 s) outlasts his ~55 s leg, so timed pack pulls brought him in (W8 x2, W9, W13 x4 wipes). He is met first: the lure 13 yd north of his west turn, the camp up the entry corridor (~60 yd from the nearest pack).",
+        "clearance": 25.0,
+        "whyClearance": "pack A (982-1002, -965..-979) stands 22-30 yd from the lure: with 25 yd it is pulled first while he is away (R3W14: then the lure, KILL att. 1); with 20 the lure was taken with pack A alive and it joined him (R3W15 19:03, 34/40) - 2026-11-17"
+      }
     }
   }
 }

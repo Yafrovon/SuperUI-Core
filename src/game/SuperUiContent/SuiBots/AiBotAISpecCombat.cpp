@@ -232,6 +232,32 @@ namespace
     }
 }
 
+bool SuiTactic::OffByFile(char const* key)
+{
+    static std::once_flag once;   // read once; afterwards a read-only set (On() is on hot paths)
+    static std::set<std::string> off;
+    std::call_once(once, []()
+    {
+        std::string conf = sConfig.GetFilename();
+        size_t slash = conf.find_last_of('/');
+        std::ifstream in((slash == std::string::npos ? std::string() : conf.substr(0, slash + 1)) + "sui-tactics-off.txt");
+        std::string line;
+        while (std::getline(in, line))
+        {
+            size_t const hash = line.find('#');
+            if (hash != std::string::npos)
+                line.erase(hash);
+            size_t const a = line.find_first_not_of(" \t\r"), b = line.find_last_not_of(" \t\r");
+            if (a == std::string::npos)
+                continue;
+            off.insert(line.substr(a, b - a + 1));
+        }
+        for (std::string const& k : off)
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[TACTICS] row %s switched OFF by sui-tactics-off.txt", k.c_str());
+    });
+    return !off.empty() && off.count(key) != 0;
+}
+
 void AiBotAI::NoteRiser(uint32 entry)
 {
     std::lock_guard<std::mutex> guard(gRisersLock);
@@ -831,6 +857,32 @@ static bool DotOnRiser(Unit* target, SpellEntry const* spell)
     return false;
 }
 
+// [TACTICS] No direct damage on a riser held at its floor while a kin still stands above it: the tanks' own Heroic
+// Strike / Shield Slam / Revenge floored their hounds one at a time once Sunder Armor kept them in rage (2026-11-15,
+// R3W0 MC: Lucifron's second hound pack went down and up for 167 s with its kin at 58-71 %, then he walked in).
+// Threat-only spells (Sunder Armor, Taunt) still go out; the burst is untouched (no kin above the floor then).
+static bool DamageOnFlooredRiser(Player* me, Unit* target, SpellEntry const* spell)
+{
+    if (!target || !target->IsCreature() || !target->IsAlive() || !AiBotAI::IsKnownRiser(target->GetEntry()) ||
+        target->GetHealthPercent() > 20.0f || !SuiTactic::On(me, SuiTactic::FlooredRiserNoDamage, target))
+        return false;
+    bool damage = false;
+    for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+        if (spell->Effect[i] == SPELL_EFFECT_SCHOOL_DAMAGE || spell->Effect[i] == SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL ||
+            spell->Effect[i] == SPELL_EFFECT_WEAPON_PERCENT_DAMAGE || spell->Effect[i] == SPELL_EFFECT_WEAPON_DAMAGE ||
+            spell->Effect[i] == SPELL_EFFECT_NORMALIZED_WEAPON_DMG)
+            damage = true;
+    if (!damage)
+        return false;
+    std::list<Creature*> kin;
+    me->GetCreatureListWithEntryInGrid(kin, target->GetEntry(), 100.0f);
+    for (Creature* k : kin)
+        if (k != target && k->IsAlive() && k->IsInCombat() && !k->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) &&
+            k->GetHealthPercent() > 20.0f)
+            return true;
+    return false;
+}
+
 static bool AreaWouldWakeIdle(Player* me, Unit* target, SpellEntry const* spell)
 {
     for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
@@ -884,7 +936,7 @@ bool AiBotAI::TrySpecSpell(Unit* target, SpellEntry const* spell)
         return false;   // cb:fold rotation rung, outcome probed at cast
     }
     if (me->GetGroup() && (AreaWouldWakeIdle(me, target, spell) || AreaWouldFloorRiserEarly(me, target, spell) ||
-        DotOnRiser(target, spell)))
+        DotOnRiser(target, spell) || DamageOnFlooredRiser(me, target, spell)))
     {
         SuiRaidTelemetry::OnCastAttempt(me, spell->Id, -3);
         return false;   // cb:fold rotation rung, outcome probed at cast
@@ -1124,6 +1176,12 @@ bool AiBotAI::CanUseSpecAoE(Unit* center, float radius, uint32 minimumTargets) c
             continue;   // cb:fold hot per-update detail
         if (!enemy->IsInCombat() || SuiCommanderRaid::ForbidsSplash(me, enemy))
             return false;   // cb:fold hot per-update detail
+        // [TACTICS] 2026-11-19 R4W0 Onyxia drill 3 pulls 4-6: mages' Arcane Explosion and Frost Nova were the first hit on
+        // 42-47 whelps a pull that no tank held (on a random member, or still choosing one); they turned on the mages and
+        // the healers beside them. A whelp no tank holds blocks a non-tank's splash (SuiTactic::NoSplashOnLooseWhelps).
+        if (!tank && enemy->GetEntry() == 11262 && SuiTactic::On(me, SuiTactic::NoSplashOnLooseWhelps, enemy) &&
+            (!enemy->GetVictim() || !IsSpecAoETankHolder(enemy->GetVictim())))
+            return false;   // cb:fold hot per-update detail
         // In combat but not swinging at anyone yet (a fresh summon or split choosing its
         // victim): it neither blocks the splash nor counts toward it.
         if (!enemy->GetVictim())
@@ -1225,6 +1283,12 @@ bool AiBotAI::TrySpecTaunt(Unit* target)
 {
     if (!target || GetCombatActiveRole() != ROLE_TANK || target->GetVictim() == me)
         return false;   // cb:fold rotation rung, outcome probed at cast
+    // [TACTICS] 2026-11-16 R3W6 Onyxia 39 %: the tanks taunted her while she flew (her air target is her Fireball's, a taunt
+    // does nothing), so Taunt was on cooldown when she landed with her threat wiped; a hunter held her 14 s and one Flame
+    // Breath killed six beside him. The taunt is kept for the landing. Gated by SuiTactic::SaveTauntForLanding.
+    if ((target->IsFlying() || target->IsLevitating() || target->IsHovering()) &&
+        SuiTactic::On(me, SuiTactic::SaveTauntForLanding, target))
+        return false;
     // [TACTICS] Never taunt a mob off another tank who is holding it (owner 2026-09-23).
     // A taunt is for a mob on a healer or a caster, or a tank that is going down.
     if (Unit* holder = target->GetVictim())
@@ -1241,16 +1305,46 @@ bool AiBotAI::TrySpecTaunt(Unit* target)
                 return false;   // cb:fold rotation rung, outcome probed at cast
         }
     for (SpellEntry const* taunt : m_spellListTaunt)
+    {
+        // [TACTICS] 2026-11-19 R4W1 MC Garr 91 %: Challenging Shout (range self, area around me) was refused at the gate on
+        // every try - CanTryToCastSpell measured the enemy against its 0 yd range (telemetry 1161:gate 9-39 a fight) - and the
+        // paladin tank died at the pull holding the Firesworn. A self-centred area taunt is cast on myself, for a target in
+        // its reach and at least two mobs within 10 yd that no tank holds (its 10 min cooldown is not spent on one mob).
+        // Gated by SuiTactic::SelfAreaTaunt.
+        SpellRangeEntry const* tr = sSpellRangeStore.LookupEntry(taunt->rangeIndex);
+        if (tr && tr->maxRange <= 0.0f && SuiTactic::On(me, SuiTactic::SelfAreaTaunt, target))
+        {
+            if (me->GetDistance(target) > 9.0f)
+                continue;
+            std::list<Unit*> close;
+            me->GetEnemyListInRadiusAround(me, 10.0f, close);
+            uint32 loose = 0;
+            for (Unit* c : close)
+                if (c && c->IsAlive() && c->IsInCombat() && c->GetVictim() && c->GetVictim() != me &&
+                    !IsSpecAoETankHolder(c->GetVictim()))
+                    ++loose;
+            if (loose < 2)
+                continue;
+            if (TrySpecSpell(me, taunt))
+            {
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TAUNT] %s: %s - %u loose mobs within 10 yd (%s on %s)",
+                    me->GetName(), taunt->SpellName[0].c_str(), loose, target->GetName(),
+                    target->GetVictim() ? target->GetVictim()->GetName() : "nobody");
+                return true;   // cb:fold rotation rung, outcome probed at cast
+            }
+            continue;
+        }
         if (TrySpecSpell(target, taunt))
             return true;   // cb:fold rotation rung, outcome probed at cast
+    }
     // (diagnostic 2026-11-10: Majordomo verification V5 - Taunt "gate" 104 times, never cast, while woken Healers turned on
     // the casters; which check refuses it)
     uint32 const nowMs = WorldTimer::getMSTime();
     if (!m_spellListTaunt.empty() && nowMs >= m_tauntWhyLogMs && target->IsCreature())
     {
         m_tauntWhyLogMs = nowMs + 5000;
-        SpellEntry const* t = m_spellListTaunt.front();
         Unit* holder = target->GetVictim();
+        for (SpellEntry const* t : m_spellListTaunt)
         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL,
             "[AIBOT-TAUNT] %s: %s on %s (on %s) not cast: ready %d gcd %d form %d immune %d reach %d dist %.1f",
             me->GetName(), t->SpellName[0].c_str(), target->GetName(), holder ? holder->GetName() : "nobody",
@@ -1272,6 +1366,8 @@ bool AiBotAI::CommandSpecPet(Unit* target, bool mendHunterPet)
         me->GetHealthPercent() > 35.0f && TrySpecSpell(pet, SP_MEND_PET))
         return true;   // cb:fold hot per-update detail
 
+    if (HoldPetAtCamp(pet))
+        return false;   // the pull is still coming to the camp
     if (target && (!pet->GetVictim() || pet->GetVictim() != target) && pet->GetCharmInfo())
     {   // cb:fold hot per-update detail
         CB_HITV(me->GetGUIDLow(), "cpp-spec: pet ordered onto target", target->GetEntry());
@@ -2250,14 +2346,35 @@ bool AiBotAI::UpdateSpecCombatPaladin(uint8 spec)
     // the add cycle lost its fifth tank at 44 s).
     if (spec == 1 && me->IsInCombat() && me->GetHealthPercent() < 25.0f && !me->HasAura(25771))
     {
-        bool held = false;
+        bool held = false, bossHeld = false;
         for (Unit* a : me->GetAttackers())
             if (a && a->IsCreature() && a->GetVictim() == me && static_cast<Creature*>(a)->IsElite())
+            {
                 held = true;
+                if (static_cast<Creature*>(a)->IsWorldBoss() && SuiTactic::On(me, SuiTactic::NoBubbleUnderBoss, a))
+                    bossHeld = true;
+            }
         if (held)
         {
             float const hp = me->GetHealthPercent();
-            if (TrySpecSpell(me, 642))
+            // ...but never under a boss: a boss leaves the shield for the next on its list - Onyxia walked off the
+            // shielded paladin into the healers and casters and breathed on 21 at once (2026-11-15, R3W2 Onyxia attempt
+            // 1, +16 s; the same bubble at +16 s in the R3W1 kill). Raid practice: the paladin tank never bubbles on a
+            // boss. Lay on Hands below 25 % instead.
+            if (bossHeld)
+            {
+                for (uint32 id : {10310u, 2800u, 633u})
+                    if (me->HasSpell(id))
+                    {
+                        if (me->IsSpellReady(id) && DoCastSpell(me, sSpellMgr.GetSpellEntry(id)) == SPELL_CAST_OK)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: Lay on Hands on itself at %.0f%% (a boss holds it: no bubble)", me->GetName(), hp);
+                            return true;
+                        }
+                        break;
+                    }
+            }
+            else if (TrySpecSpell(me, 642))
             {
                 sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: Divine Shield at %.0f%%", me->GetName(), hp);
                 return true;
@@ -2809,6 +2926,20 @@ Player* AiBotAI::SelectValuedDispelTarget(SpellEntry const* spell, float minValu
     uint32 const now = WorldTimer::getMSTime();
     Player* best = nullptr;
     float bestValue = 0.0f;
+    // [TACTICS] 2026-11-16 R3W7 MC Shazzrah 31 %: five priests died by +50 s to doubled Arcane Explosions; the mages
+    // decursed whoever stood near them (paladins 13-18 times, the priests 1-4). Under this boss a healer's curse counts
+    // three times. Gated by SuiTactic::HealersDecursedFirst.
+    bool healersFirst = false;
+    {
+        std::list<Unit*> foes;
+        me->GetEnemyListInRadiusAround(me, 80.0f, foes);
+        for (Unit* u : foes)
+            if (u && u->IsCreature() && u->IsAlive() && u->IsInCombat() && SuiTactic::On(me, SuiTactic::HealersDecursedFirst, u))
+            {
+                healersFirst = true;
+                break;
+            }
+    }
     std::lock_guard<std::mutex> guard(gDispelClaimLock);
     for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
     {
@@ -2822,6 +2953,10 @@ Player* AiBotAI::SelectValuedDispelTarget(SpellEntry const* spell, float minValu
         float value = DispelValue(m, mask);
         if (value < minValue)
             continue;
+        if (healersFirst)
+            if (AiBotAI const* mai = dynamic_cast<AiBotAI const*>(m->AI()))
+                if (mai->GetCombatActiveRole() == ROLE_HEALER)
+                    value *= 3.0f;
         auto claim = gDispelClaims.find(m->GetObjectGuid());
         if (claim != gDispelClaims.end() && claim->second > now)
             value *= 0.25f;   // another dispeller just worked there
@@ -2837,8 +2972,98 @@ Player* AiBotAI::SelectValuedDispelTarget(SpellEntry const* spell, float minValu
 bool AiBotAI::TrySpecValuedDispel(SpellEntry const* spell, float minValue)
 {
     Player* target = SelectValuedDispelTarget(spell, minValue);
+    // [TACTICS] 2026-11-16 R3W7 MC Shazzrah: the cursed priests stood 36 yd from him and out of every mage's 30 yd reach.
+    // With nobody to decurse in reach, a decurser walks to the nearest cursed healer within 55 yd - to a spot 22 yd from
+    // it and 33 yd or more from the boss (his explosion reaches 30). Gated by SuiTactic::HealersDecursedFirst.
+    if (!target && spell && me->GetGroup() && me->IsInCombat() && me->IsSpellReady(spell->Id))
+    {
+        Unit* boss = nullptr;
+        std::list<Unit*> foes;
+        me->GetEnemyListInRadiusAround(me, 80.0f, foes);
+        for (Unit* u : foes)
+            if (u && u->IsCreature() && u->IsAlive() && u->IsInCombat() && SuiTactic::On(me, SuiTactic::HealersDecursedFirst, u))
+            {
+                boss = u;
+                break;
+            }
+        uint32 mask = 0;
+        for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+            if (spell->Effect[i] == SPELL_EFFECT_DISPEL)
+                mask |= Spells::GetDispellMask(DispelType(spell->EffectMiscValue[i]));
+        static std::mutex walkLock;
+        static std::unordered_map<uint32, uint32> nextWalk;
+        // one decurser walks to each healer: R3W8 Shazzrah (kill, 240 s) - six to ten mages walked to the same cursed priest
+        // every 2 s and the mages' damage went into walking (2026-11-16, same tactic)
+        static std::unordered_map<uint32, std::pair<uint32, uint32>> walkClaim;   // healer guid -> (mage guid, until)
+        uint32 const nowMs = WorldTimer::getMSTime();
+        bool due = false;
+        {
+            std::lock_guard<std::mutex> g(walkLock);
+            due = nowMs >= nextWalk[me->GetGUIDLow()];
+        }
+        if (boss && mask && due && !me->IsNonMeleeSpellCasted(false))
+        {
+            Player* far = nullptr;
+            float farD = 55.0f;
+            for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+            {
+                Player* m = itr->getSource();
+                AiBotAI const* mai = m && m != me && m->IsAlive() && m->IsInMap(me) ? dynamic_cast<AiBotAI const*>(m->AI()) : nullptr;
+                if (!mai || mai->GetCombatActiveRole() != ROLE_HEALER)
+                    continue;
+                float const d = me->GetDistance(m);
+                if (d <= 30.0f || d >= farD || DispelValue(m, mask) < minValue)
+                    continue;
+                {
+                    std::lock_guard<std::mutex> g(walkLock);
+                    auto c = walkClaim.find(m->GetGUIDLow());
+                    if (c != walkClaim.end() && c->second.first != me->GetGUIDLow() && nowMs < c->second.second)
+                        continue;
+                }
+                far = m;
+                farD = d;
+            }
+            if (far)
+            {
+                float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f, bestD = 1e9f;
+                for (int k = 0; k < 16; ++k)
+                {
+                    float const a = float(k) * float(M_PI) / 8.0f;
+                    float x = far->GetPositionX() + 22.0f * std::cos(a), y = far->GetPositionY() + 22.0f * std::sin(a);
+                    float z = far->GetPositionZ();
+                    me->UpdateAllowedPositionZ(x, y, z);
+                    if (std::fabs(z - far->GetPositionZ()) > 5.0f || boss->GetDistance2d(x, y) < 33.0f ||
+                        !me->GetMap()->isInLineOfSight(x, y, z + 2.0f, far->GetPositionX(), far->GetPositionY(), far->GetPositionZ() + 2.0f))
+                        continue;
+                    float const d = me->GetDistance2d(x, y);
+                    if (d < bestD)
+                    {
+                        bestD = d;
+                        bestX = x;
+                        bestY = y;
+                        bestZ = z;
+                    }
+                }
+                if (bestD < 1e8f)
+                {
+                    {
+                        std::lock_guard<std::mutex> g(walkLock);
+                        nextWalk[me->GetGUIDLow()] = nowMs + 2000;
+                        walkClaim[far->GetGUIDLow()] = { me->GetGUIDLow(), nowMs + 6000 };
+                    }
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-DISPEL] %s: walks to decurse %s (%.0f yd, %.0f from %s)",
+                        me->GetName(), far->GetName(), farD, boss->GetDistance2d(bestX, bestY), boss->GetName());
+                    me->GetMotionMaster()->MovePoint(0, bestX, bestY, bestZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                    return true;
+                }
+            }
+        }
+    }
     if (!target || !TrySpecSpell(target, spell))
         return false;
+    // 2026-11-15 [TACTICS-SCOPE-EXEMPT: diagnostic log only] which dispel went on whom (Shazzrah's Curse unproven)
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-DISPEL] %s: %s on %s", me->GetName(), spell->SpellName[0].c_str(),
+        target->GetName());
     std::lock_guard<std::mutex> guard(gDispelClaimLock);
     gDispelClaims[target->GetObjectGuid()] = WorldTimer::getMSTime() + 800;
     return true;
@@ -2887,7 +3112,25 @@ bool AiBotAI::TrySpecPurgeEnemy(SpellEntry const* spell)
                 break;
         }
         if (worth && TrySpecSpell(u, spell))
+        {
+            // 2026-11-16 [TACTICS-SCOPE-EXEMPT: diagnostic log only] whether Shazzrah's Deaden Magic is ever taken off
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-PURGE] %s: %s on %s", me->GetName(), spell->SpellName[0].c_str(),
+                u->GetName());
             return true;
+        }
+        if (worth && u->IsCreature() && static_cast<Creature*>(u)->IsWorldBoss())
+        {
+            // 2026-11-16 [TACTICS-SCOPE-EXEMPT: diagnostic log only] a boss buff worth removing that was not removed
+            static std::unordered_map<uint64, uint32> lastLog;
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32& last = lastLog[me->GetObjectGuid().GetRawValue()];
+            if (nowMs - last > 10000)
+            {
+                last = nowMs;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-PURGE] %s: %s on %s not cast (%.0f yd)", me->GetName(),
+                    spell->SpellName[0].c_str(), u->GetName(), me->GetDistance(u));
+            }
+        }
     }
     return false;
 }
@@ -2930,10 +3173,16 @@ bool AiBotAI::TrySpecFearWardTank()
         if (Player* backup = AiBotBackupTankFor(boss))
             if (backup != bossTank && !backup->HasAura(kFearWard))
                 bossTank = backup;
+    // ...and with both warded the other tanks get theirs: whoever she lands on or turns to after a fear must already
+    // hold one (2026-11-15, R3W0 Onyxia: the first ward came 35 s after she landed, after her first fear swap)
+    if (bossTank && bossTank->HasAura(kFearWard))
+    {
+        if (!SuiTactic::On(me, SuiTactic::FearWardEveryTank))
+            return false;   // outside its scope: the boss tank is warded, this priest's ward waits (the old rule)
+        bossTank = nullptr;
+    }
     if (bossTank)
     {
-        if (bossTank->HasAura(kFearWard))
-            return false;   // the boss tank is warded: this priest's ward waits for it to be spent
         static std::mutex wardLock;
         static std::map<ObjectGuid, uint32> wardClaims;
         uint32 const nowMs = WorldTimer::getMSTime();
@@ -3293,12 +3542,15 @@ bool AiBotAI::TrySpecBanishSpareElite()
             if (Player* m = itr->getSource())
                 if (m != me && m->IsAlive() && m->GetVictim() == u)
                     ++hitters;
-        if (hitters >= 3 || u->GetHealthPercent() < 80.0f)
+        // 2026-11-15 R3W3 MC: the Lava Elementals/Reavers of the Firewalker+Flameguard packs are banished at the pull
+        // (every guide; the other two are banish-immune and die first) - not "a spare one" after the raid is losing.
+        bool const packBanish = SuiTactic::On(me, SuiTactic::BanishPackElementals, u) && u->GetHealthPercent() >= 40.0f;
+        if (!packBanish && (hitters >= 3 || u->GetHealthPercent() < 80.0f))
             continue;
         AiBotAI* holderAi = dynamic_cast<AiBotAI*>(vp->AI());
         bool const onTank = holderAi && holderAi->GetCombatActiveRole() == ROLE_TANK;
         // Prefer one no tank holds (it is killing someone), then any but a tank's own target.
-        int const score = onTank ? (vp->GetVictim() == u ? 0 : 1) : 2;
+        int const score = packBanish ? 3 : (onTank ? (vp->GetVictim() == u ? 0 : 1) : 2);
         if (score > spareScore && CanTryToCastSpell(u, banish))
         {
             spareScore = score;
@@ -3309,7 +3561,21 @@ bool AiBotAI::TrySpecBanishSpareElite()
     // elite at once (2026-09-25: Firewalker + Flameguard + two Lava Elementals wiped the raid again
     // and again with five warlocks never banishing - the old rule waited for more elites than tanks).
     uint32 const cap = std::max<uint32>(1u, (tanks + 1) / 2);
-    if (!spare || active <= cap || spareScore == 0)
+    bool packFirst = false;   // a pack elemental while an elite that is not one still fights us (scoped above)
+    if (spare && spareScore == 3)
+        for (Unit* u : nearby)
+            if (u != spare && u->IsCreature() && u->IsAlive() && u->IsInCombat() && static_cast<Creature*>(u)->IsElite() &&
+                !IsBanishedUnit(u) && !SuiTactic::On(me, SuiTactic::BanishPackElementals, u))
+            {
+                Unit* v = u->GetVictim();
+                Player* vp = v ? v->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+                if (vp && group->IsMember(vp->GetObjectGuid()))
+                {
+                    packFirst = true;
+                    break;
+                }
+            }
+    if (!spare || (!packFirst && (active <= cap || spareScore == 0)))
         return false;
     if (!TrySpecSpell(spare, banish))
         return false;

@@ -43,6 +43,7 @@
 #define MANGOS_AIBOTAI_H
 
 #include "CombatBotBaseAI.h"
+#include "SuiTacticScope.h"   // [TACTICS LAW] raid tactics are scoped to their raid/boss/pack
 #include "Timer.h"
 #include "Log.h"
 #include "PathFinder.h"   // Vector3, PointsArray — needed for SmoothPathCorners' signature
@@ -780,6 +781,21 @@ public:
     // [TACTICS] Out of the front of a creature kind seen breathing a cone (every role but the tank).
     bool AvoidFrontalCone();
     uint32 m_coneNextMs = 0;
+    // [TACTICS] A healer or caster an elite has turned on walks to the nearest tank (raid practice: bring it to the tank).
+    bool PeelToTank();
+    bool StageForLanding();
+    uint32 m_stageNextMs = 0;
+    bool m_stageMeeting = false;   // StageForLanding owns the body between its ticks (PairMeetsHer walk)
+    // whelp posts at Onyxia's whelp spawn points (SuiTactic::WhelpPostsAtSpawns)
+    bool WhelpPostFor(float& x, float& y, float& z);
+    Unit* WhelpPostTarget(bool& postTank);
+    bool HoldWhelpPost();
+    uint32 m_whelpPostCheckMs = 0, m_whelpPostNextMs = 0, m_whelpPostLogMs = 0;
+    bool m_whelpPostOn = false;
+    float m_whelpPostX = 0.0f, m_whelpPostY = 0.0f, m_whelpPostZ = 0.0f;
+    uint32 m_stageLogMs = 0;
+    uint32 m_peelNextMs = 0;
+    uint32 m_peelLogMs = 0;
     uint32 m_posLogNextMs = 0;   // [TELEMETRY] where tanks and healers stand in a fight
     bool TrySpecFearWardTank();
     // [TACTICS] Dispel by value: the member whose dispellable harm costs the raid most soon
@@ -812,6 +828,15 @@ public:
     static uint32 PlaybookReleaseAgeMs(Unit const* u);
     uint32 m_potionNextMs = 0;
     uint32 m_hazardNextMs = 0;
+    // a held Deep Breath escape (SuiTactic::DeepBreathEscape)
+    bool EscapeBreathForecast(uint32 now);
+    bool HealerClearBreathLane(uint32 now);
+    uint32 m_hLaneUntilMs = 0, m_hLaneNextMs = 0;
+    int m_hLanePoint = -1;
+    float m_hLaneX = 0.0f, m_hLaneY = 0.0f, m_hLaneZ = 0.0f;
+    uint32 m_spawnKeepLogMs = 0;
+    uint32 m_breathEscUntilMs = 0;
+    float m_breathEscX = 0.0f, m_breathEscY = 0.0f, m_breathEscZ = 0.0f;
     uint32 m_hazardHoldUntil = 0;
     uint32 m_repositionUntilMs = 0;
     uint32 m_hazardMeleeHoldUntil = 0;     // my target stands in a pulse: wait outside         // a tactical move the rotation must not cancel           // escaped a hazard: do not follow back into it
@@ -859,6 +884,7 @@ public:
     bool StopNearlyFullHeal();
     bool TrySpecTaunt(Unit* target);
     bool CommandSpecPet(Unit* target, bool mendHunterPet);
+    bool HoldPetAtCamp(Pet* pet);
     bool UpdateSpecCombatWarrior(uint8 spec);
     bool UpdateSpecCombatPaladin(uint8 spec);
     bool UpdateSpecCombatHunter(uint8 spec);

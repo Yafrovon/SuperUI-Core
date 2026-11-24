@@ -185,6 +185,8 @@ namespace
         ObjectGuid looseOn;         // a non-tank holds it
         uint32 looseSinceMs = 0;
         bool wasAirborne = false;   // it was in the air at the last sample
+        uint32 lastWipeMs = 0;      // the last threat wipe this fight
+        bool shortWindow = false;   // its wipes repeat: the tanks-first window is 4 s, not up to 30 s
     };
     std::mutex gThreatHoldLock;
     std::unordered_map<uint64, BossThreatWatch> gBossThreat;
@@ -322,6 +324,12 @@ bool AiBotHealerThreatHold(Player* healer)
         Unit* holder = u->GetVictim();
         if (holder == healer)
             continue;
+        // (2026-11-15, R3W2 MC: the healers held their heals on Shazzrah's "tanks first" window too - a damage race)
+        if (SuiTactic::On(healer, SuiTactic::DamageRaceNoThreatHold, u))
+            continue;
+        // (2026-11-15: an Onyxia rule; it held every MC boss pull's heals above 40 % - scoped)
+        if (!SuiTactic::On(healer, SuiTactic::OnyxiaThreatDiscipline, u))
+            continue;
         float top = 0.0f;
         for (HostileReference* ref : u->GetThreatManager().getThreatList())
             if (ref)
@@ -359,6 +367,49 @@ bool AiBotHealerThreatHold(Player* healer)
     return false;
 }
 
+// [TACTICS] A Core Hound held at its floor while a kin still stands above it gets no white swing and no cast that is
+// already on its way: floored-riser-no-damage only refuses NEW casts, so tank auto-attacks and Frostbolts/Shadow Bolts
+// started at 22 % floored the held hounds one at a time (2026-11-20 R4W5 MC 23:42, P56634: first down at kin 28 24 24 16,
+// 13 downs in 187 s). Returns true when this body's swing must stay off. Gated by SuiTactic::FlooredRiserStopSwing.
+static bool FlooredRiserBelowKin(Player* me, Unit* u)
+{
+    if (!u || !u->IsCreature() || !u->IsAlive() || u->GetHealthPercent() > 20.0f || !AiBotAI::IsKnownRiser(u->GetEntry()) ||
+        u->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) || !SuiTactic::On(me, SuiTactic::FlooredRiserStopSwing, u))
+        return false;
+    std::list<Creature*> kin;
+    me->GetCreatureListWithEntryInGrid(kin, u->GetEntry(), 100.0f);
+    for (Creature* k : kin)
+        if (k != u && k->IsAlive() && k->IsInCombat() && !k->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) &&
+            k->GetHealthPercent() > 20.0f)
+            return true;
+    return false;
+}
+
+static bool FlooredRiserHold(Player* me)
+{
+    if (!me->GetGroup())
+        return false;
+    if (Spell* cast = me->GetCurrentSpell(CURRENT_GENERIC_SPELL))
+    {
+        Unit* t = cast->m_targets.getUnitTarget();
+        SpellEntry const* info = cast->m_spellInfo;
+        bool damage = false;
+        if (info)
+            for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                if (info->Effect[i] == SPELL_EFFECT_SCHOOL_DAMAGE || info->Effect[i] == SPELL_EFFECT_WEAPON_DAMAGE ||
+                    info->Effect[i] == SPELL_EFFECT_WEAPON_DAMAGE_NOSCHOOL || info->Effect[i] == SPELL_EFFECT_WEAPON_PERCENT_DAMAGE ||
+                    info->Effect[i] == SPELL_EFFECT_NORMALIZED_WEAPON_DMG)
+                    damage = true;
+        if (damage && t && t != me && FlooredRiserBelowKin(me, t))
+        {
+            me->InterruptSpell(CURRENT_GENERIC_SPELL, false);
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-RISER] %s: stopped %s on %s (guid %u, %.0f %%) - a kin stands above the floor",
+                me->GetName(), info->SpellName[0].c_str(), t->GetName(), t->GetGUIDLow(), t->GetHealthPercent());
+        }
+    }
+    return FlooredRiserBelowKin(me, me->GetVictim());
+}
+
 static bool ThreatHoldFor(Player* me, CombatBotRoles role)
 {
     bool const tankRole = role == ROLE_TANK;
@@ -370,10 +421,60 @@ static bool ThreatHoldFor(Player* me, CombatBotRoles role)
     Creature* foe = static_cast<Creature*>(victim);
     if (!foe->IsElite() && !foe->IsWorldBoss())
         return false;   // small adds die fast; nobody waits on them
+    // [TACTICS] 2026-11-19 R4W0 Onyxia drill 3 pull 2: the descent hold below never fired - on her landing flight she
+    // has no victim and the holder test returned first; a caster had 910 threat at touch-down. Checked first now.
+    // Gated by SuiTactic::LandingDescentHold.
+    // (R4W4 Onyxia att. 2: the hold began at < 40 % but a warlock's Corruption / Curse of Agony / Immolate ticked on
+    // through her landing flight - 2443 threat at touch-down, she went caster to caster and one breath hit 12. Damage
+    // over time lasts 15-24 s: warlocks and hunters (Serpent Sting) hold from 46 % in the air, so theirs runs out first.)
+    float const descentPct = (me->GetClass() == CLASS_WARLOCK || me->GetClass() == CLASS_HUNTER) ? 46.0f : 40.0f;
+    if (!tankRole && foe->IsWorldBoss() && (foe->IsFlying() || foe->IsLevitating() || foe->IsHovering()) &&
+        foe->GetHealthPercent() < descentPct && SuiTactic::On(me, SuiTactic::LandingDescentHold, foe))
+    {
+        uint32 const nowMs = WorldTimer::getMSTime();
+        std::lock_guard<std::mutex> guard(gThreatHoldLock);
+        uint32& next = gThreatHoldLogMs[me->GetObjectGuid().GetRawValue()];
+        if (nowMs >= next)
+        {
+            next = nowMs + 5000;
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: holds on %s (she is landing (her threat resets), tanks first; mine %.0f)",
+                me->GetName(), foe->GetName(), foe->GetThreatManager().getThreat(me));
+        }
+        return true;
+    }
     Unit* holder = foe->GetVictim();
     if (!holder || !holder->IsPlayer() || !me->GetGroup()->IsMember(holder->GetObjectGuid()))
         return false;
+    // 2026-11-15 (owner law, raid tactics are contained): the rules below were built for Onyxia on 11-14 and held every MC
+    // boss pull and every tank-held trash elite back (MC fell from 8/9 a night in rerun 1 to 4-6/10). Everywhere but her:
+    // the rule rerun 1 cleared with - a damage dealer holds at 90 % of whoever holds the mob.
+    if (!SuiTactic::On(me, SuiTactic::OnyxiaThreatDiscipline, foe))
+    {
+        // [TACTICS] 2026-11-16 R3W4 MC Shazzrah 13 %: this 90 % hold ran before the damage-race check below - 141 holds
+        // (0 vs 0 after each Gate), 751 raid dps, 40/40 (kills: 0 holds, 1290-1787 dps). Gated by SuiTactic::DamageRaceNoThreatHold.
+        if (SuiTactic::On(me, SuiTactic::DamageRaceNoThreatHold, foe))
+            return false;
+        if (tankRole || holder == me ||
+            foe->GetThreatManager().getThreat(me) < foe->GetThreatManager().getThreat(holder) * 0.9f)
+            return false;
+        uint32 const nowMs = WorldTimer::getMSTime();
+        std::lock_guard<std::mutex> guard(gThreatHoldLock);
+        uint32& next = gThreatHoldLogMs[me->GetObjectGuid().GetRawValue()];
+        if (nowMs >= next)
+        {
+            next = nowMs + 5000;
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: holds on %s (at the holder's threat, 90 %%; mine %.0f, %s %.0f)",
+                me->GetName(), foe->GetName(), foe->GetThreatManager().getThreat(me), holder->GetName(),
+                foe->GetThreatManager().getThreat(holder));
+        }
+        return true;
+    }
     bool const boss = foe->IsWorldBoss();
+    // A boss whose Gate wipes the threat list every ~45 s and who Blinks onto a random player is a damage race, as every
+    // guide fights it: the tanks taunt him back and nobody waits for threat (2026-11-15, R3W2 MC: Shazzrah 44 % after
+    // 305 s at 646 raid dps, the casters held at 0 threat behind tanks at 0; the 11-04/11-06 kills had no holds).
+    if (SuiTactic::On(me, SuiTactic::DamageRaceNoThreatHold, foe))
+        return false;
     bool const holderTank = HoldsAsTank(holder);
     uint32 const now = WorldTimer::getMSTime();
     char const* why = nullptr;
@@ -422,6 +523,12 @@ static bool ThreatHoldFor(Player* me, CombatBotRoles role)
                 }
             if (w.lastTop > 5000.0f && top < w.lastTop * 0.05f)
             {
+                // A boss whose wipes repeat (Shazzrah's Gate every ~45 s) is a damage race, as every guide fights it:
+                // the raid keeps hitting it and the tanks take it back. Up to 30 s of tanks-only after each wipe left
+                // the raid idle most of the fight (2026-11-15, R3W1 MC: Shazzrah 18 % and 40 % at 680-808 raid dps,
+                // 411 holds in one attempt). Its second and later wipes hold 4 s.
+                w.shortWindow = w.lastWipeMs && now - w.lastWipeMs < 120000 && SuiTactic::On(foe, SuiTactic::ShortRepeatWipeHold, foe);
+                w.lastWipeMs = now;
                 w.wipedAtMs = now;
                 w.tankSinceMs = 0;
                 sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: threat list wiped (%.0f -> %.0f) - tanks only until one holds it 4 s with a lead",
@@ -434,6 +541,7 @@ static bool ThreatHoldFor(Player* me, CombatBotRoles role)
             bool const airNow = foe->IsFlying() || foe->IsLevitating() || foe->IsHovering();
             if (w.wasAirborne && !airNow)
             {
+                w.shortWindow = false;
                 w.wipedAtMs = now;
                 w.tankSinceMs = 0;
                 sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-THREAT] %s: landed - tanks only until one holds it 4 s with a lead",
@@ -457,7 +565,7 @@ static bool ThreatHoldFor(Player* me, CombatBotRoles role)
             }
             // (held 4 s AND 1.5x the first non-tank: at 4 s alone the casters' damage over time had already passed the new
             // tank - 2026-11-14, Onyxia dev attempt 9, a warlock took her 6 s after the landing and her breath killed four)
-            if (w.wipedAtMs && (now - w.wipedAtMs >= 30000 || (w.tankSinceMs && now - w.tankSinceMs >= 4000 &&
+            if (w.wipedAtMs && (now - w.wipedAtMs >= (w.shortWindow ? 4000u : 30000u) || (w.tankSinceMs && now - w.tankSinceMs >= 4000 &&
                     foe->GetThreatManager().getThreat(holder) >= topOther * 1.5f)))
                 w.wipedAtMs = 0;
         }
@@ -471,6 +579,12 @@ static bool ThreatHoldFor(Player* me, CombatBotRoles role)
         ;
     else if (wiped)
         why = "threat wiped, tanks first";
+    // [TACTICS] 2026-11-19 R4W0 Onyxia drill 2: her script resets her threat as she turns to land (< 40 % in the air,
+    // boss_onyxia PhaseTransition DoResetThreat); the casters fired through the descent and one of them held her at
+    // touch-down in 4 of 6 pulls. From < 40 % in the air nobody adds threat until a tank holds her after the landing
+    // (the "landed" window above). Gated by SuiTactic::LandingDescentHold.
+    else if (airborne && boss && foe->GetHealthPercent() < 40.0f && SuiTactic::On(me, SuiTactic::LandingDescentHold, foe))
+        why = "she is landing (her threat resets), tanks first";
     else if (airborne)
         return false;
     else if (holderTank && holder != me)
@@ -2303,7 +2417,10 @@ void AiBotAI::UpdateAI(uint32 const diff)
             }
             else if (!m_pullActive && !m_stalemateHoldMs && !m_overpullFleeHoldMs)
             {
-                ThreatHoldResumeSwing(me);
+                if (FlooredRiserHold(me))
+                    ThreatHoldStopAutos(me);   // spells still go out; floored-riser-no-damage refuses damage on it
+                else
+                    ThreatHoldResumeSwing(me);
                 CB_HIT(me->GetGUIDLow(), "cpp-main: built-in spec cast attempt");
                 SuiRaidTelemetry::OnRotationTick(me, 0);
                 UpdateSpecCombatAI();
@@ -2877,6 +2994,18 @@ void AiBotAI::UpdateAI(uint32 const diff)
 
     // [TACTICS] Nobody stands in fire on the ground.
     if (AvoidGroundHazard())
+        return;
+
+    // [TACTICS] A landing boss finds its tanks where it lands (scoped: SuiTactic::TanksStageForLanding).
+    if (StageForLanding())
+        return;
+
+    // [TACTICS] Onyxia's off-tanks take her whelps at their spawn points (scoped: SuiTactic::WhelpPostsAtSpawns).
+    if (HoldWhelpPost())
+        return;
+
+    // [TACTICS] An elite on a healer or a caster is walked to a tank, not dodged around.
+    if (PeelToTank())
         return;
 
     // [TACTICS] Nobody but the tank stands in front of a breath.

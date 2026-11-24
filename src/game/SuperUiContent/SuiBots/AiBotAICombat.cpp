@@ -51,6 +51,7 @@
 #include "SuiRaidPlaybook.h"
 #include "SuiAutopilot.h"
 #include "Movement/WaypointManager.h"
+#include "MoveSpline.h"
 
 // BG flag auras (referenced in the combat methods below — never active in open world).
 // File-local: these formerly lived in the AiBotSpells enum, but that enum moved to the shared
@@ -787,6 +788,25 @@ bool AiBotAI::HandlePullRetreat()
 
 // Where a melee body stands on its victim: tanks in front, damage dealers behind or at the flank,
 // both further out on a creature of long reach. Every melee chase goes through here.
+// [AUTOPILOT] A pet waits at the camp with its owner while the leader brings a pull there: a hunter's cat sent
+// out bit Baron Geddon at his walk point 25 yd from a Firewalker pack, which joined at +1 s (2026-11-15, R3W0 MC:
+// 40 dead at 98 %); the owners were held at the camp, their pets were not.
+bool AiBotAI::HoldPetAtCamp(Pet* pet)
+{
+    float hx = 0.0f, hy = 0.0f, hz = 0.0f;
+    if (!pet || !pet->IsAlive() || !SuiTactic::On(me, SuiTactic::PetHoldAtCamp) || !SuiAutopilot::CampHold(me, hx, hy, hz))
+        return false;
+    if (pet->GetVictim() && pet->GetVictim()->GetDistance(hx, hy, hz) > 15.0f)
+    {
+        pet->AttackStop();
+        if (pet->GetCharmInfo())
+            pet->GetCharmInfo()->SetIsCommandAttack(false);
+    }
+    if (!pet->GetVictim() && pet->GetMotionMaster()->GetCurrentMovementGeneratorType() != FOLLOW_MOTION_TYPE)
+        pet->GetMotionMaster()->MoveFollow(me, PET_FOLLOW_DIST, PET_FOLLOW_ANGLE);
+    return true;
+}
+
 static void ChaseInPlace(Player* me, Unit* pVictim, CombatBotRoles role)
 {
     // [AUTOPILOT] The leader is bringing a timed pull back to the camp: wait there for it, do not run
@@ -1039,6 +1059,12 @@ void AiBotAI::UpdateOutOfCombatAI()
             me->RemoveSpellsCausingAura(SPELL_AURA_MOD_SHAPESHIFT);   // cb:fold hot per-update detail
     }
 
+    // Raid practice: the tanks are Fear Warded before the pull, not after the first fear (it lasts 10 min, so a ward put
+    // on at the pull still holds when Onyxia lands at ~3.5 min - 2026-11-15, R3W0 Onyxia: two phase-3 wipes began with a
+    // feared tank and one Flame Breath over the casters).
+    if (me->GetClass() == CLASS_PRIEST && SuiTactic::On(me, SuiTactic::PrePullFearWard) && TrySpecFearWardTank())
+        return;
+
     // A validated persisted profile owns its deterministic OOC maintenance.
     // Unknown/conflict/invalid/error profiles intentionally fall through to
     // the proven legacy class behavior below.
@@ -1277,7 +1303,9 @@ void AiBotAI::UpdateOutOfCombatAI_Paladin()
 
 void AiBotAI::UpdateInCombatAI_Paladin()
 {
+    // (never a tank: a boss leaves the shield for the healers - 2026-11-15, R3W2 Onyxia; see UpdateSpecCombatPaladin)
     if (m_spells.paladin.pDivineShield &&
+        !(GetCombatActiveRole() == ROLE_TANK && SuiTactic::OnAnyAttacker(me, SuiTactic::NoBubbleUnderBoss)) &&
        (me->GetHealthPercent() < 20.0f) &&
        (me->GetPowerPercent(POWER_MANA) > 40.0f) &&
        !me->HasAura(AURA_WARSONG_FLAG) &&
@@ -1580,7 +1608,7 @@ void AiBotAI::UpdateOutOfCombatAI_Hunter()
 
         if (Pet* pPet = me->GetPet())
         {   // cb:fold rotation rung, outcome probed at cast
-            if (!pPet->GetVictim())
+            if (!HoldPetAtCamp(pPet) && !pPet->GetVictim())
             {   // cb:fold rotation rung, outcome probed at cast
                 pPet->GetCharmInfo()->SetIsCommandAttack(true);
                 pPet->AI()->AttackStart(pVictim);
@@ -2254,7 +2282,7 @@ void AiBotAI::UpdateOutOfCombatAI_Warlock()
     {   // cb:fold rotation rung, outcome probed at cast
         if (Pet* pPet = me->GetPet())
         {   // cb:fold rotation rung, outcome probed at cast
-            if (!pPet->GetVictim())
+            if (!HoldPetAtCamp(pPet) && !pPet->GetVictim())
             {   // cb:fold rotation rung, outcome probed at cast
                 pPet->GetCharmInfo()->SetIsCommandAttack(true);
                 pPet->AI()->AttackStart(pVictim);
@@ -3473,10 +3501,25 @@ static bool TankStepOk(Player* me, Unit* mob, float x, float y, float z)
     return len <= me->GetDistance(x, y, z) * 2.0f + 4.0f;
 }
 
+static std::vector<uint64> OnyxiaLandingPair(Player* me, Creature* boss, Group* group, Map const* map);
+static bool OnyxiaLandedWithPair(Player* me, Creature* ony, bool& inPair, bool& onPair);
+
 bool AiBotAI::MaintainTankFacing(Unit* victim)
 {
     if (!victim || !victim->IsCreature() || GetCombatActiveRole() != ROLE_TANK || !victim->IsAlive())
         return false;
+    // [TACTICS] 2026-11-18 R4W0 Onyxia drill: landed, a tank who is not one of her two never chases her onto another
+    // member (a whelp-post tank chased her off a ranged member, held her and walked her back to its post): the member
+    // she is on brings her to the head spot (SuiTactic::LandingHeadSpot).
+    if (victim->GetEntry() == 10184 && victim->GetVictim() != me && SuiTactic::On(me, SuiTactic::LandingHeadSpot, victim))
+    {
+        // (from the moment her pair is chosen, airborne at <= 42 %: a post tank chased her off a ranged member at her
+        // touch-down tick, before "landed" - R4W0 drill 2 pull 5)
+        std::vector<uint64> const pair = me->GetGroup() && victim->GetHealthPercent() <= 42.0f ?
+            OnyxiaLandingPair(me, static_cast<Creature*>(victim), me->GetGroup(), me->GetMap()) : std::vector<uint64>();
+        if (!pair.empty() && std::find(pair.begin(), pair.end(), me->GetObjectGuid().GetRawValue()) == pair.end())
+            return false;
+    }
     // After a facing step the tank stands on its point; if the mob drifts out of reach,
     // resume the chase rather than standing there swinging at air. Also when the mob has turned
     // on someone else: a threat wipe sends it to a healer, and its tank must follow it to taunt
@@ -3631,6 +3674,11 @@ bool AiBotAI::MaintainTankFacing(Unit* victim)
     // group moved, and the group moved every time it turned (2026-11-14, Onyxia dev attempt 16: 372 "out of the front"
     // steps in the first minute, the ranged casting 35 % of the fight; the raid's guides tank her facing the north wall).
     // The facing is chosen once where it stands and kept for every tank who holds it, until it moves 12 yd.
+    // [TACTICS] 2026-11-16 R3W8/R3W9 Onyxia: each phase-3 wall turn swept her Flame Breath across the raid - hits up to
+    // 59 degrees off her facing on members already moving out of it, 11 dead in one breath. Once she has landed (below
+    // 40 %) her tank holds her where she faces and the raid leaves her front once. Gated by SuiTactic::NoTurnAfterLanding.
+    if (victim->IsCreature() && victim->GetHealthPercent() < 40.0f && SuiTactic::On(me, SuiTactic::NoTurnAfterLanding, victim))
+        return false;
     if (victim->IsCreature() && static_cast<Creature*>(victim)->IsWorldBoss() &&
         SuiRaidTelemetry::EntryConeRadius(victim->GetEntry()) > 0.0f &&
         !victim->IsFlying() && !victim->IsLevitating() && !victim->IsHovering())
@@ -3658,6 +3706,12 @@ bool AiBotAI::MaintainTankFacing(Unit* victim)
             // 24 directions; the wall is where the boss's line of sight at head height first breaks, 2 yd steps out to
             // 30 yd. The tank must have room between the boss and the wall and floor to stand on.
             float bestWall = 1e9f, bestFx = 0.0f, bestFy = 0.0f;
+            // [TACTICS] 2026-11-16 R3W7 Onyxia 33 %: the nearest wall was 28 yd west and the healers and ranged stood
+            // between it and her head; turned there, one Flame Breath killed three at +311 s and the next three more.
+            // The wall chosen is the one with the fewest members inside her cone (50 degrees, 45 yd), the nearer one
+            // when even. Gated by SuiTactic::WallAwayFromRaid.
+            bool const awayFromRaid = SuiTactic::On(me, SuiTactic::WallAwayFromRaid, victim) && me->GetGroup();
+            uint32 bestCrowd = 1000;
             for (int k = 0; k < 24; ++k)
             {
                 float const th = float(k) * float(M_PI) / 12.0f, fx = std::cos(th), fy = std::sin(th);
@@ -3668,12 +3722,27 @@ bool AiBotAI::MaintainTankFacing(Unit* victim)
                         wall = d;
                         break;
                     }
-                if (wall <= 0.0f || wall < reach + 3.0f || wall >= bestWall)
+                uint32 crowd = 0;
+                if (awayFromRaid)
+                    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+                    {
+                        Player* m = itr->getSource();
+                        if (!m || !m->IsAlive() || !m->IsInMap(me))
+                            continue;
+                        float const mx = m->GetPositionX() - bx, my = m->GetPositionY() - by;
+                        float const md = std::sqrt(mx * mx + my * my);
+                        if (md > 45.0f || md < 1.0f)
+                            continue;
+                        if ((mx * fx + my * fy) / md > 0.64f)   // within 50 degrees of her head
+                            ++crowd;
+                    }
+                if (wall <= 0.0f || wall < reach + 3.0f || crowd > bestCrowd || (crowd == bestCrowd && wall >= bestWall))
                     continue;
                 float x = bx + fx * reach, y = by + fy * reach, z = bz;
                 ReGroundZ(x, y, z, "tank-wall");
                 if (std::fabs(z - bz) > 4.0f || Molten(me, x, y, z))
                     continue;
+                bestCrowd = crowd;
                 bestWall = wall;
                 bestFx = fx;
                 bestFy = fy;
@@ -3949,8 +4018,12 @@ namespace
             MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck check(me, me, range);
             MaNGOS::UnitListSearcher<MaNGOS::AnyUnfriendlyUnitInObjectRangeCheck> searcher(foes, check);
             Cell::VisitAllObjects(me, searcher, range);
+            // ...at a third of its health, half while slowed: at a fifth Garr's Magma Shackles (-60 % speed) held
+            // four rogues inside the circle until it went off 3 s later (2026-11-15, R3W0 MC, nine mages on it)
+            float const burstAt = me->HasAuraType(SPELL_AURA_MOD_DECREASE_SPEED) ? 50.0f : 35.0f;
             for (Unit* u : foes)
-                if (u->IsCreature() && u->IsAlive() && u->IsInCombat() && u->GetHealthPercent() <= 20.0f &&
+                if (u->IsCreature() && u->IsAlive() && u->IsInCombat() &&
+                    u->GetHealthPercent() <= (SuiTactic::On(me, SuiTactic::BurstEarlySlowed, u) ? burstAt : 20.0f) &&
                     u->GetVictim() != me)
                     if (float const r = SuiRaidTelemetry::EntryDeathBurstRadius(u->GetEntry()))
                         out.push_back({u->GetPositionX(), u->GetPositionY(), r + 2.0f});
@@ -4019,7 +4092,10 @@ namespace
                  (c->IsWorldBoss() && c->GetDefaultMovementType() == WAYPOINT_MOTION_TYPE)))
             {
                 // an elite sees further than the 20 yd it is credited with once the raid spreads round it
-                out.push_back({c->GetPositionX(), c->GetPositionY(), c->IsElite() ? 28.0f : 25.0f});
+                // [TACTICS] 2026-11-16 R3W4 MC Geddon: a mage stepped to 29 yd of a sleeping Lava pack and it aggroed
+                // (Geddon 44 %, 40/40 dead): these kinds get 34 yd. Gated by SuiTactic::WideIdlePackReach.
+                float const reach = SuiTactic::On(me, SuiTactic::WideIdlePackReach, c) ? 34.0f : (c->IsElite() ? 28.0f : 25.0f);
+                out.push_back({c->GetPositionX(), c->GetPositionY(), reach});
                 // A wanderer's reach is its whole wander circle, not where it stands this second
                 // (2026-11-06: a mage's cone step kept 28 yd off Shazzrah; he wandered 20 yd toward
                 // him, aggroed at 18 yd and joined a Lava Reaver pack's fight - all 39 dead).
@@ -4137,9 +4213,235 @@ namespace
     }
 }
 
+// Onyxia's whelp spawn points (boss_onyxia afSpawnLocations): a breath escape or lane spot of a non-tank keeps 12 yd off
+// them (R4W0 Onyxia drill 3 pull 4: a mage's escape spot was 2 yd from the east spawn; a wave appeared on him, his
+// Arcane Explosion took six whelps and they killed him and two healers beside him). The callers check their own rows.
+static float const kOnyWhelpSpawn[2][2] = { { -30.127f, -254.463f }, { -30.817f, -177.106f } };
+
+// The keep-off radius of a whelp spawn for my role: tanks none (they hold the posts 8 yd inside), melee 12 yd, healers
+// and casters 20 yd - a new wave runs at the nearest member (R4W0 drill 3 pull 8: eight whelps on two priests 10-13 yd
+// from the east spawn).
+static float OnyWhelpSpawnKeepOff(Player* me)
+{
+    AiBotAI* ai = dynamic_cast<AiBotAI*>(me->AI());
+    CombatBotRoles const role = ai ? ai->GetCombatActiveRole() : ROLE_INVALID;
+    if (role == ROLE_TANK)
+        return 0.0f;
+    return role == ROLE_HEALER || role == ROLE_RANGE_DPS ? 20.0f : 12.0f;
+}
+
+static bool NearOnyWhelpSpawn(Player* me, float x, float y)
+{
+    float const r = OnyWhelpSpawnKeepOff(me);
+    for (auto const& p : kOnyWhelpSpawn)
+        if ((x - p[0]) * (x - p[0]) + (y - p[1]) * (y - p[1]) < r * r)
+            return true;
+    return false;
+}
+
 // [TACTICS] Out of the fire: a member standing in a hostile damaging area steps to the nearest
 // clear spot; a melee member or tank prefers a spot still next to its target (the target follows
 // a tank), a caster the shortest step. What a player sees on the ground, nothing more.
+// [TACTICS] 2026-11-18 R4W0 Onyxia att. 1 (39 %): one Deep Breath at +126 s killed five mages and a priest. Its chain of
+// twelve fixed impacts (spell_target_position, 30 yd each) was forecast 6 s ahead, but the general step-out below searched
+// rings to 25 yd, refused any path into the next circle of the chain and pulled toward the raid standing on the line, and
+// the facing-based line step in AvoidFrontalCone re-aimed every 0.5 s onto the room's centre line. Scoped
+// (SuiTactic::DeepBreathEscape): the nearest pathable spot outside every forecast circle is chosen ONCE and held for the
+// breath; a member pushed off it walks back; arrived, it casts as usual.
+bool AiBotAI::EscapeBreathForecast(uint32 now)
+{
+    if (now < m_breathEscUntilMs)
+    {
+        if (me->GetDistance2d(m_breathEscX, m_breathEscY) <= 2.5f)
+            return false;   // there: free to cast
+        if (me->IsNonMeleeSpellCasted(false))
+            me->InterruptNonMeleeSpells(false);
+        if (!me->IsMoving() || me->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+            me->GetMotionMaster()->MovePoint(0, m_breathEscX, m_breathEscY, m_breathEscZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return true;
+    }
+    Creature* boss = me->FindNearestCreature(10184, 150.0f, true);
+    if (!boss || !SuiTactic::On(me, SuiTactic::DeepBreathEscape, boss))
+        return false;
+    std::vector<std::tuple<float, float, float>> fc;
+    SuiRaidTelemetry::ForecastHazards(me, 80.0f, fc);
+    std::vector<GroundHazard> big;
+    for (auto const& f : fc)
+        if (std::get<2>(f) >= 20.0f)
+            big.push_back({std::get<0>(f), std::get<1>(f), std::get<2>(f) + 3.0f});
+    if (big.empty() || !InHazard(big, me->GetPositionX(), me->GetPositionY()))
+        return false;
+    struct Spot { float x, y, z, d; };
+    std::vector<Spot> spots;
+    for (float dist : {6.0f, 10.0f, 14.0f, 18.0f, 22.0f, 26.0f, 30.0f, 34.0f, 38.0f, 42.0f, 48.0f})
+        for (int i = 0; i < 24; ++i)
+        {
+            float const ang = i * float(M_PI) / 12.0f;
+            float x = me->GetPositionX() + dist * std::cos(ang), y = me->GetPositionY() + dist * std::sin(ang);
+            float z = me->GetPositionZ();
+            if (InHazard(big, x, y) || NearOnyWhelpSpawn(me, x, y))
+                continue;
+            me->UpdateAllowedPositionZ(x, y, z);
+            if (std::fabs(z - me->GetPositionZ()) > 8.0f || Molten(me, x, y, z))
+                continue;
+            spots.push_back({x, y, z, dist});
+        }
+    uint32 probes = 0;
+    for (Spot const& s : spots)
+    {
+        if (++probes > 14)
+            break;
+        PathInfo path(me);
+        path.calculate(s.x, s.y, s.z, false);
+        if (path.getPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE))
+            continue;
+        float len = 0.0f;
+        PointsArray const& pts = path.getPath();
+        for (size_t k = 1; k < pts.size(); ++k)
+            len += (pts[k] - pts[k - 1]).length();
+        if (len > s.d * 1.5f + 4.0f)
+            continue;
+        m_breathEscUntilMs = now + 14000;
+        m_breathEscX = s.x;
+        m_breathEscY = s.y;
+        m_breathEscZ = s.z;
+        if (me->IsNonMeleeSpellCasted(false))
+            me->InterruptNonMeleeSpells(false);
+        SuiRaidTelemetry::OnReposition(me, "breath");
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-BREATH] %s: out of %s's Deep Breath -> (%.1f, %.1f), %.0f yd walk, %u circles",
+            me->GetName(), boss->GetName(), s.x, s.y, len, uint32(big.size()));
+        me->GetMotionMaster()->MovePoint(0, s.x, s.y, s.z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return true;
+    }
+    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-BREATH] %s: inside %s's Deep Breath and no spot found (%u candidates, %u probed)",
+        me->GetName(), boss->GetName(), uint32(spots.size()), probes);
+    return false;
+}
+
+// [TACTICS] 2026-11-19 R4W0/R4W1 Onyxia drills 4-5: healers took ~53 of ~100 Deep Breath deaths (10 of 40 members), and a
+// breath that killed healers began the whelp cascade in most phase-2 wipes. Her breath is known ahead: at each flight point
+// she waits 15-25 s, then flies on (70 %) or breathes that point's own spell (30 %; boss_onyxia DoMovement). While she waits,
+// a HEALER more than 12 yd deep in that lane steps to the nearest spot outside it - at most 26 yd, in sight of a tank, off
+// the whelp spawns - and holds it until she moves on. Only healers: the all-member version (deep-breath-lane-clear, reverted
+// 11-19) moved 100-160 members a pull. Gated by SuiTactic::HealerLaneClear.
+// 2026-11-22 R4W12 att. 1 (57 %): the hold re-walked only when no point walk was under way, so a heal-range walk to a tank
+// 2 s after the lane walk kept Gankreaper in the lane and it died there to the breath; only a walk to the lane spot counts now.
+namespace
+{
+    struct OnyFlightPoint { float x, y; uint32 breath; };
+    // boss_onyxia.cpp aMoveData (point, its Deep Breath spell)
+    OnyFlightPoint const kOnyFlight[8] = {
+        { 10.2191f, -247.912f, 18617 }, { -31.4963f, -250.123f, 18576 }, { -63.5156f, -240.096f, 18564 },
+        { -65.8444f, -213.809f, 18351 }, { -58.2509f, -189.020f, 18596 }, { -33.5561f, -182.682f, 18609 },
+        { 6.8951f, -180.246f, 18584 }, { 22.8763f, -217.152f, 17086 } };
+}
+
+bool AiBotAI::HealerClearBreathLane(uint32 now)
+{
+    if (GetCombatActiveRole() != ROLE_HEALER)
+        return false;
+    Creature* ony = me->FindNearestCreature(10184, 150.0f, true);
+    if (!ony || !ony->IsInCombat() || !(ony->IsFlying() || ony->IsLevitating() || ony->IsHovering()) ||
+        !SuiTactic::On(me, SuiTactic::HealerLaneClear, ony))
+    {
+        m_hLaneUntilMs = 0;
+        return false;
+    }
+    int point = -1;
+    if (!ony->IsMoving())
+        for (int i = 0; i < 8; ++i)
+            if (ony->GetDistance2d(kOnyFlight[i].x, kOnyFlight[i].y) < 6.0f)
+                point = i;
+    if (point != m_hLanePoint)
+    {
+        m_hLanePoint = point;
+        m_hLaneUntilMs = 0;
+        m_hLaneNextMs = 0;
+    }
+    if (point < 0)
+        return false;
+    if (now < m_hLaneUntilMs)
+    {
+        if (me->GetDistance2d(m_hLaneX, m_hLaneY) <= 2.5f || me->IsNonMeleeSpellCasted(false))
+            return false;   // there (free to heal), or finishing a heal first
+        // (any point walk used to count as "on my way" - see the R4W12 note above: only a walk ending at the lane spot counts)
+        G3D::Vector3 const dest = me->movespline->FinalDestination();
+        bool const onMyWay = me->IsMoving() && !me->movespline->Finalized() &&
+            (dest - G3D::Vector3(m_hLaneX, m_hLaneY, m_hLaneZ)).length() <= 3.0f;
+        if (!onMyWay)
+            me->GetMotionMaster()->MovePoint(0, m_hLaneX, m_hLaneY, m_hLaneZ, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        return true;
+    }
+    if (now < m_hLaneNextMs)
+        return false;
+    m_hLaneNextMs = now + 1000;
+    std::vector<std::tuple<float, float, float>> chain;
+    SuiRaidTelemetry::ChainImpacts(kOnyFlight[point].breath, me->GetMapId(), chain);
+    std::vector<GroundHazard> lane, deep;
+    for (auto const& c : chain)
+        if (std::get<2>(c) >= 20.0f)
+        {
+            lane.push_back({ std::get<0>(c), std::get<1>(c), std::get<2>(c) + 3.0f });
+            deep.push_back({ std::get<0>(c), std::get<1>(c), std::get<2>(c) + 3.0f - 12.0f });
+        }
+    if (lane.empty() || !InHazard(deep, me->GetPositionX(), me->GetPositionY()))
+        return false;
+    // the tanks I heal: any living tank of the group within 45 yd of the spot must be in its sight
+    std::vector<Player*> tanks;
+    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr; itr = itr->next())
+        if (Player* m = itr->getSource())
+            if (m->IsAlive() && m->IsInMap(me))
+                if (AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI()))
+                    if (ai->GetCombatActiveRole() == ROLE_TANK)
+                        tanks.push_back(m);
+    uint32 probes = 0;   // path probes, at most 12 a second
+    for (float dist : {6.0f, 10.0f, 14.0f, 18.0f, 22.0f, 26.0f})
+        for (int i = 0; i < 24; ++i)
+        {
+            float const ang = i * float(M_PI) / 12.0f;
+            float x = me->GetPositionX() + dist * std::cos(ang), y = me->GetPositionY() + dist * std::sin(ang);
+            float z = me->GetPositionZ();
+            if (InHazard(lane, x, y) || NearOnyWhelpSpawn(me, x, y))
+                continue;
+            me->UpdateAllowedPositionZ(x, y, z);
+            if (std::fabs(z - me->GetPositionZ()) > 8.0f || Molten(me, x, y, z))
+                continue;
+            bool seesTank = tanks.empty();
+            for (Player* t : tanks)
+                if (t->GetDistance2d(x, y) <= 40.0f &&
+                    me->GetMap()->isInLineOfSight(x, y, z + 2.0f, t->GetPositionX(), t->GetPositionY(), t->GetPositionZ() + 2.0f))
+                {
+                    seesTank = true;
+                    break;
+                }
+            if (!seesTank)
+                continue;
+            if (++probes > 12)
+                return false;
+            PathInfo path(me);
+            path.calculate(x, y, z, false);
+            if (path.getPathType() & (PATHFIND_NOPATH | PATHFIND_INCOMPLETE))
+                continue;
+            float len = 0.0f;
+            PointsArray const& pts = path.getPath();
+            for (size_t k = 1; k < pts.size(); ++k)
+                len += (pts[k] - pts[k - 1]).length();
+            if (len > dist * 1.5f + 4.0f)
+                continue;
+            m_hLaneUntilMs = now + 30000;
+            m_hLaneX = x;
+            m_hLaneY = y;
+            m_hLaneZ = z;
+            SuiRaidTelemetry::OnReposition(me, "breath lane");
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-BREATH] %s: healer out of %s's Deep Breath lane at flight point %d -> (%.1f, %.1f), %.0f yd walk",
+                me->GetName(), ony->GetName(), point, x, y, len);
+            if (!me->IsNonMeleeSpellCasted(false))
+                me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+            return true;
+        }
+    return false;
+}
+
 bool AiBotAI::AvoidGroundHazard()
 {
     if (!me->IsAlive() || !me->GetGroup() || m_possessed || m_suiManual)
@@ -4151,6 +4453,68 @@ bool AiBotAI::AvoidGroundHazard()
     if (now < m_hazardNextMs)
         return false;
     m_hazardNextMs = now + 400;
+
+    // [TACTICS] 2026-11-18 R4W0 Onyxia: a forecast Deep Breath first - escaped once, held (SuiTactic::DeepBreathEscape,
+    // the gate is repeated inside for the held spot).
+    if (me->GetMapId() == SuiTactic::kOnyxia)
+        if (Creature* ony = me->FindNearestCreature(10184, 150.0f, true))
+        {
+            if (SuiTactic::On(me, SuiTactic::DeepBreathEscape, ony) && EscapeBreathForecast(now))
+                return true;
+            // (Gated by SuiTactic::HealerLaneClear inside: a healer deep in her next breath's lane steps out early)
+            if (HealerClearBreathLane(now))
+                return true;
+            // [TACTICS] 2026-11-19 R4W0 Onyxia drill 3 pull 8: a new whelp wave runs at the nearest member - eight went for
+            // two priests 10-13 yd from the east spawn. From phase 2 a healer or caster inside 20 yd of a spawn point
+            // walks out to 23 yd (SuiTactic::WhelpSpawnKeepOut).
+            if (ony->IsInCombat() && ony->GetHealthPercent() <= 66.0f && SuiTactic::On(me, SuiTactic::WhelpSpawnKeepOut, ony))
+            {
+                CombatBotRoles const kr = GetCombatActiveRole();
+                if (kr == ROLE_HEALER || kr == ROLE_RANGE_DPS)
+                    for (auto const& p : kOnyWhelpSpawn)
+                    {
+                        float dx = me->GetPositionX() - p[0], dy = me->GetPositionY() - p[1];
+                        float const d = std::sqrt(dx * dx + dy * dy);
+                        if (d >= 20.0f)
+                            continue;
+                        // out to 23 yd from the spawn: along my bearing, turned toward the room centre until the spot
+                        // sees her landing spot (drill 3 pull 10: straight back from the east spawn a healer stood
+                        // behind the rock edge at (-8.8, -263.1), no sight of the tanks, and they died to the whelps)
+                        float const cx = -8.860f - p[0], cy = -212.752f - p[1], cn = std::sqrt(cx * cx + cy * cy);
+                        float bx = cx / cn, by = cy / cn;
+                        if (d >= 1.0f)
+                        {
+                            bx = dx / d;
+                            by = dy / d;
+                        }
+                        float x = 0.0f, y = 0.0f, z = me->GetPositionZ();
+                        for (float t : { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f })
+                        {
+                            float ux = bx * (1.0f - t) + cx / cn * t, uy = by * (1.0f - t) + cy / cn * t;
+                            float const un = std::max(0.1f, std::sqrt(ux * ux + uy * uy));
+                            x = p[0] + ux / un * 23.0f;
+                            y = p[1] + uy / un * 23.0f;
+                            z = me->GetPositionZ();
+                            me->UpdateAllowedPositionZ(x, y, z);
+                            if (std::fabs(z - me->GetPositionZ()) <= 8.0f && !Molten(me, x, y, z) &&
+                                me->GetMap()->isInLineOfSight(x, y, z + 2.0f, -8.860f, -212.752f, -85.5f))
+                                break;
+                        }
+                        if (me->IsNonMeleeSpellCasted(false) && me->GetHealthPercent() > 50.0f && d > 12.0f)
+                            break;   // finish the cast first
+                        m_hazardNextMs = now + 1000;
+                        SuiRaidTelemetry::OnReposition(me, "whelp spawn");
+                        if (now >= m_spawnKeepLogMs)
+                        {
+                            m_spawnKeepLogMs = now + 5000;
+                            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-WHELP] %s: %.0f yd from a whelp spawn point - out to (%.1f, %.1f)",
+                                me->GetName(), d, x, y);
+                        }
+                        me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                        return true;
+                    }
+            }
+        }
 
     // I carry a bomb: away from every member until it has gone off (2026-09-24, Baron Geddon's
     // Living Bomb - recognised from its data: a harmful aura that triggers area damage around me).
@@ -4275,6 +4639,22 @@ bool AiBotAI::AvoidGroundHazard()
                         hazards.push_back({foe->GetPositionX(), foe->GetPositionY(),
                             pr + foe->GetObjectBoundingRadius() + me->GetObjectBoundingRadius() + 1.5f});
                 }
+    // A healer or caster never stands inside an idle elite's reach mid-fight: its ordinary moves (range, sight of
+    // the tank) do not consult it, and the pack wakes on it (2026-11-15, R3W0 MC: Baron Geddon at 49 % and 67 % - the
+    // Firewalker pack joined at +47 s and +93 s on healers standing 21-29 yd from it). Its reach is fire to step out of.
+    {
+        // ...and the tanks and melee too: out of Baron Geddon's Inferno the tanks stepped to (637, -818) and (641, -808),
+        // onto his Firewalker pack, which joined at +44 s and +117 s (2026-11-15, R3W1 MC, both attempts 40/40 and 39/40)
+        if (me->IsInCombat() && me->GetGroup() && me->GetMap()->IsRaid() && SuiTactic::On(me, SuiTactic::IdleReachHazard) &&
+            (GetCombatActiveRole() == ROLE_HEALER || GetCombatActiveRole() == ROLE_RANGE_DPS ||
+             SuiTactic::On(me, SuiTactic::IdleReachAllRoles)))
+        {
+            std::vector<GroundHazard> reach;
+            CollectIdleHostiles(me, 40.0f, reach);
+            for (GroundHazard const& h : reach)
+                hazards.push_back(h);
+        }
+    }
     bool const molten = Molten(me, me->GetPositionX(), me->GetPositionY(), me->GetPositionZ());
     if (!molten && (hazards.empty() || !InHazard(hazards, me->GetPositionX(), me->GetPositionY())))
     {
@@ -4291,6 +4671,26 @@ bool AiBotAI::AvoidGroundHazard()
             if (me->IsMoving() && me->GetMotionMaster()->GetCurrentMovementGeneratorType() == CHASE_MOTION_TYPE)
                 me->StopMoving();
             return true;
+        }
+        // [TACTICS] 2026-11-16 R3W4 MC Geddon: every Inferno step pulled him after his tank and nothing walked him back -
+        // 90 yd south in 140 s, onto the healers in a corner, where one Inferno found no way out for ten (4 tanks). Between
+        // pulses the tank he is on walks back to the fight's camp and he follows. Gated by SuiTactic::TankHoldsBossAtCamp.
+        if (victim && role == ROLE_TANK && victim->IsAlive() && victim->GetVictim() == me &&
+            SuiTactic::On(me, SuiTactic::TankHoldsBossAtCamp, victim))
+        {
+            float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+            if (SuiAutopilot::FightAnchor(me, cx, cy, cz) && victim->GetDistance2d(cx, cy) > 10.0f &&
+                me->GetDistance2d(cx, cy) > 2.5f)
+            {
+                m_hazardMeleeHoldUntil = now + 450;
+                if (!me->IsMoving() || me->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+                {
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: walks %s back to the camp (%.1f, %.1f), %.0f yd off",
+                        me->GetName(), victim->GetName(), cx, cy, victim->GetDistance2d(cx, cy));
+                    me->GetMotionMaster()->MovePoint(0, cx, cy, cz, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                }
+                return true;
+            }
         }
         return false;
     }
@@ -4427,6 +4827,697 @@ bool AiBotAI::AvoidGroundHazard()
     return true;
 }
 
+// [TACTICS] Raid practice: whoever pulls aggro off the tanks brings the mob to a tank - Taunt is melee range in this game,
+// so a tank can only take back what reaches it (2026-11-15, R3W1 MC: the four-elite pack by Geddon turned on healers and
+// warlocks, who dodged away from it while five warriors chased it; not one Taunt landed in two wipes, 78 dead).
+// A non-boss elite hitting a healer or a caster sends it to the nearest living tank; it stops once that mob is in the
+// tank's reach. A cast in progress is finished unless the mob is killing me.
+bool AiBotAI::PeelToTank()
+{
+    if (!me->IsAlive() || !me->IsInCombat() || m_possessed || m_suiManual)
+        return false;
+    Group* group = me->GetGroup();
+    if (!group || !me->GetMap()->IsRaid())
+        return false;
+    CombatBotRoles const role = GetCombatActiveRole();
+    if (role != ROLE_HEALER && role != ROLE_RANGE_DPS)
+        return false;
+    uint32 const now = WorldTimer::getMSTime();
+    if (now < m_peelNextMs)
+        return false;
+    m_peelNextMs = now + 400;
+
+    Unit* mob = nullptr;
+    bool whelpPeel = false;
+    for (Unit* a : me->GetAttackers())
+    {
+        if (!a || !a->IsAlive() || !a->IsCreature() || a->GetVictim() != me)
+            continue;
+        // [TACTICS] 2026-11-19 R4W0 Onyxia drill 3 pulls 3-6: whelps killed 24-33 of 40 a pull in phase 2. Each whelp
+        // attacks a random member (boss_onyxia summons, AttackStart); the one it chose stayed put while the post tanks
+        // waited at the spawn points. Whoever a whelp is on walks it to the nearest tank outside her landing pair
+        // (SuiTactic::WhelpsWalkedToTanks), as for an elite below.
+        if (a->GetEntry() == 11262 && SuiTactic::On(me, SuiTactic::WhelpsWalkedToTanks, a))
+        {
+            if (me->GetDistance(a) > 12.0f)
+                continue;
+            mob = a;
+            whelpPeel = true;
+            break;
+        }
+        if (!static_cast<Creature*>(a)->IsElite() || static_cast<Creature*>(a)->IsWorldBoss() || a->HasBreakableByDamageCrowdControlAura())
+            continue;
+        // ...a real elite, not a summoned add or a kind that multiplies: Firelords' Lava Spawns sent healers and mages
+        // walking to the tanks 87 times in one fight, the spawns multiplied to 211 and the raid wiped (2026-11-15, R3W2 MC)
+        if (!SuiTactic::On(me, SuiTactic::PeelToTank, a))
+            continue;   // its raid and kinds only (Geddon's elite packs)
+        if (static_cast<Creature*>(a)->IsTemporarySummon() || !a->GetCreatorGuid().IsEmpty() || IsKnownMultiplier(a->GetEntry()))
+            continue;
+        if (me->GetDistance(a) > 12.0f)
+            continue;   // a caster mob shooting from range: walking to a tank does not move it
+        mob = a;
+        break;
+    }
+    if (!mob)
+        return false;
+
+    Player* tank = nullptr;
+    float best = 45.0f;
+    // (a whelp is never walked to her landing pair: in phase 3 they stand in her front)
+    std::vector<uint64> onyPair;
+    if (whelpPeel)
+        if (Creature* ony = me->FindNearestCreature(10184, 150.0f, true))
+            onyPair = OnyxiaLandingPair(me, ony, group, me->GetMap());
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || m == me || !m->IsAlive() || !m->IsInMap(me))
+            continue;
+        AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
+        if (!ai || ai->GetCombatActiveRole() != ROLE_TANK)
+            continue;
+        if (whelpPeel && std::find(onyPair.begin(), onyPair.end(), m->GetObjectGuid().GetRawValue()) != onyPair.end())
+            continue;
+        float const dm = me->GetDistance(m);
+        if (dm < best)
+        {
+            best = dm;
+            tank = m;
+        }
+    }
+    if (!tank)
+        return false;
+    // It is in that tank's reach already: stay and cast, the tank takes it.
+    if (mob->GetDistance(tank) <= 6.0f || me->GetDistance(tank) <= 4.0f)
+        return false;
+    if (me->IsNonMeleeSpellCasted(false))
+    {
+        if (me->GetHealthPercent() > 50.0f)
+            return false;
+        me->InterruptNonMeleeSpells(false);
+    }
+    // a spot 2.5 yd short of the tank, on my side of it
+    float dx = me->GetPositionX() - tank->GetPositionX(), dy = me->GetPositionY() - tank->GetPositionY();
+    float const len = std::max(0.5f, std::sqrt(dx * dx + dy * dy));
+    float stopAt = 2.5f;
+    // ...but outside a Flameguard's Fire Shield (19627: 249 fire every 2 s to all within 10 yd): the peeled healers stood at
+    // the tank's feet beside the Flameguard he held and died to its pulse and the Lava Elementals' barrage (2026-11-15,
+    // R3W2 MC: three wipes on Geddon's packs, 8-32 peels each, healers dead first). The mob follows me to that spot and the
+    // tank steps to it; once I stand there I stay and cast.
+    {
+        std::list<Unit*> near;
+        me->GetEnemyListInRadiusAround(tank, 25.0f, near);
+        std::vector<Unit*> shields;
+        for (Unit* u : near)
+            if (u && u->IsAlive() && u->IsCreature() && SuiTactic::On(me, SuiTactic::PeelOutsideFireShield, u))
+                shields.push_back(u);
+        if (!shields.empty())
+        {
+            for (float d = 2.5f; d <= std::min(len, 20.0f); d += 1.5f)
+            {
+                float const px = tank->GetPositionX() + dx / len * d, py = tank->GetPositionY() + dy / len * d;
+                bool clear = true;
+                for (Unit* s : shields)
+                    if (std::hypot(s->GetPositionX() - px, s->GetPositionY() - py) < 11.5f)
+                        clear = false;
+                stopAt = d;
+                if (clear)
+                    break;
+            }
+            if (std::fabs(len - stopAt) <= 2.0f)
+                return false;   // I stand at that spot already: stay and cast
+        }
+    }
+    float x = tank->GetPositionX() + dx / len * stopAt, y = tank->GetPositionY() + dy / len * stopAt, z = tank->GetPositionZ();
+    // (a whelp is walked to a post tank only to 21 yd off that post's spawn point - the post takes whelps within 16 yd -
+    // so the next wave does not take me; R4W0 Onyxia drill 3 pull 8, SuiTactic::WhelpSpawnKeepOut)
+    if (whelpPeel)
+        if (Creature* ony = me->FindNearestCreature(10184, 150.0f, true))
+            if (SuiTactic::On(me, SuiTactic::WhelpSpawnKeepOut, ony))
+                for (auto const& p : kOnyWhelpSpawn)
+                {
+                    float const sx = x - p[0], sy = y - p[1], sd = std::sqrt(sx * sx + sy * sy);
+                    if (sd >= 20.0f)
+                        continue;
+                    float ux = sx, uy = sy, un = sd;
+                    if (un < 1.0f)
+                    {
+                        ux = me->GetPositionX() - p[0];
+                        uy = me->GetPositionY() - p[1];
+                        un = std::max(0.1f, std::sqrt(ux * ux + uy * uy));
+                    }
+                    x = p[0] + ux / un * 21.0f;
+                    y = p[1] + uy / un * 21.0f;
+                    if (me->GetDistance2d(x, y) <= 2.5f)
+                        return false;   // there: the post tank takes it from here
+                }
+    me->UpdateAllowedPositionZ(x, y, z);
+    if (std::fabs(z - tank->GetPositionZ()) > 4.0f || Molten(me, x, y, z))
+    {
+        x = tank->GetPositionX();
+        y = tank->GetPositionY();
+        z = tank->GetPositionZ();
+    }
+    m_peelNextMs = now + 1200;
+    m_repositionUntilMs = now + 1500;
+    m_coneNextMs = now + 1500;
+    SuiRaidTelemetry::OnReposition(me, "peel");
+    if (now >= m_peelLogMs)
+    {
+        m_peelLogMs = now + 4000;
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-PEEL] %s: %s (guid %u) is on me - to tank %s (%.0f yd; it is %.0f yd from the tank)",
+            me->GetName(), mob->GetName(), mob->GetGUIDLow(), tank->GetName(), best, mob->GetDistance(tank));
+    }
+    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+    return true;
+}
+
+// 2026-11-15 R3W3 Onyxia: she lands at 40 % on her landing spot with her threat list wiped (the script's DoResetThreat)
+// and turns on whoever hits her first; the tanks were 66-88 yd away on the whelps and out of the fire, a warlock held her,
+// she was feared off him onto a tank who stood with the casters in her front, and one Flame Breath killed six (wipe at 9 %).
+// Every guide has the tanks at the landing spot before she comes down. While she is airborne under 45 %, the two tanks
+// highest on her list walk there and wait with her head-to-the-wall side free; the ground fight takes over once she lands.
+// [TACTICS] 2026-11-18 R4W0 Onyxia att. 3 (23 %): the pair staged for her landing was re-picked from live threat every
+// 0.5 s (four different tanks walked to the landing spot) and the whelp posts kept a different pair, so at the landing
+// two staged tanks left for the posts and a mage, then a warlock held her (Tail Sweep + Flame Breath through the raid).
+// One pair for the fight: the two tanks highest on her list the first time she is airborne at <= 42 %, a dead one
+// replaced by the next. Both StageForLanding and WhelpPostFor read it (SuiTactic::TanksStageForLanding gates the
+// staging; SuiTactic::WhelpPostsAtSpawns the posts - both checked by the callers before this is asked).
+// Onyxia's head direction from her landing spot, chosen once a fight (OnyxiaHeadSpot); cleared with her landing pair.
+static std::mutex gOnyHeadLock;
+static std::map<uint64, std::pair<float, float>> gOnyHead;
+
+static std::vector<uint64> OnyxiaLandingPair(Player* me, Creature* boss, Group* group, Map const* map)
+{
+    if (!SuiTactic::On(me, SuiTactic::TanksStageForLanding, boss) && !SuiTactic::On(me, SuiTactic::WhelpPostsAtSpawns, boss))
+        return {};
+    static std::mutex lock;
+    static std::map<uint64, std::vector<uint64>> pairs;
+    std::lock_guard<std::mutex> guard(lock);
+    std::vector<uint64>& p = pairs[boss->GetObjectGuid().GetRawValue()];
+    if (!boss->IsInCombat() || boss->GetHealthPercent() > 66.0f)
+    {
+        p.clear();
+        std::lock_guard<std::mutex> headGuard(gOnyHeadLock);
+        gOnyHead.erase(boss->GetObjectGuid().GetRawValue());
+        return p;
+    }
+    bool const air = boss->IsFlying() || boss->IsLevitating() || boss->IsHovering();
+    if (p.empty() && !(air && boss->GetHealthPercent() <= 42.0f))
+        return p;   // not chosen before the landing window opens
+    std::vector<std::pair<Player*, float>> tanks;
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || !m->IsAlive() || !m->IsInWorld() || m->GetMap() != map)
+            continue;
+        AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
+        if (!ai || ai->GetCombatActiveRole() != ROLE_TANK)
+            continue;
+        tanks.push_back({m, boss->GetThreatManager().getThreat(m)});
+    }
+    // drop the dead / gone, then fill up to two by threat
+    p.erase(std::remove_if(p.begin(), p.end(), [&](uint64 g)
+        { return std::none_of(tanks.begin(), tanks.end(), [g](auto const& t) { return t.first->GetObjectGuid().GetRawValue() == g; }); }),
+        p.end());
+    std::sort(tanks.begin(), tanks.end(), [](auto const& a, auto const& b)
+        { return a.second != b.second ? a.second > b.second : a.first->GetGUIDLow() < b.first->GetGUIDLow(); });
+    for (auto const& t : tanks)
+        if (p.size() < 2 && std::find(p.begin(), p.end(), t.first->GetObjectGuid().GetRawValue()) == p.end())
+        {
+            p.push_back(t.first->GetObjectGuid().GetRawValue());
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s is one of %s's two landing tanks (threat %.0f)",
+                t.first->GetName(), boss->GetName(), t.second);
+        }
+    return p;
+}
+
+// Onyxia's head spot: 7 yd off her landing spot (boss_onyxia.cpp, P3: MovePoint to (-8.860, -212.752)) toward the
+// direction with the fewest members in front of it (60 degrees, 50 yd; tanks not counted), the nearer wall when even,
+// chosen once a fight when first asked (her pair is chosen at <= 42 % in the air) - the nearest wall alone was a rock on
+// the raid's side (R4W0 drill 2 pull 1: her victim brought her there, one Flame Breath hit 26). The backup 4 yd
+// to the main tank's left. Used by StageForLanding and the LandingHeadSpot callers (each caller checks its own row).
+static void OnyxiaHeadSpot(Player* me, Creature* ony, bool backup, float& x, float& y, float& z)
+{
+    float const lx = -8.860f, ly = -212.752f, lz = -87.482f;
+    float fx = 0.0f, fy = 0.0f;
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> guard(gOnyHeadLock);
+        auto it = gOnyHead.find(ony->GetObjectGuid().GetRawValue());
+        if (it != gOnyHead.end())
+        {
+            fx = it->second.first;
+            fy = it->second.second;
+            have = true;
+        }
+    }
+    if (!have)
+    {
+        uint32 bestCrowd = 1000;
+        float bestWall = 1e9f, nearFx = 0.0f, nearFy = 0.0f, nearWall = 1e9f;
+        for (int k = 0; k < 24; ++k)
+        {
+            float const th = float(k) * float(M_PI) / 12.0f, dx = std::cos(th), dy = std::sin(th);
+            float wall = 60.0f;
+            for (float d = 4.0f; d <= 60.0f; d += 2.0f)
+                if (!me->GetMap()->isInLineOfSight(lx, ly, lz + 3.0f, lx + dx * d, ly + dy * d, lz + 3.0f))
+                {
+                    wall = d;
+                    break;
+                }
+            if (wall >= 10.0f && wall < nearWall)
+            {
+                nearWall = wall;
+                nearFx = dx;
+                nearFy = dy;
+            }
+            if (wall < 10.0f)
+                continue;   // no room for the tanks and her head
+            float sx = lx + dx * 7.0f, sy = ly + dy * 7.0f, sz = lz;
+            me->UpdateAllowedPositionZ(sx, sy, sz);
+            if (std::fabs(sz - lz) > 4.0f)
+                continue;
+            uint32 crowd = 0;
+            if (Group* g = me->GetGroup())
+                for (GroupReference* itr = g->GetFirstMember(); itr; itr = itr->next())
+                {
+                    Player* m = itr->getSource();
+                    if (!m || !m->IsAlive() || !m->IsInMap(me))
+                        continue;
+                    AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
+                    if (ai && ai->GetCombatActiveRole() == ROLE_TANK)
+                        continue;
+                    float const mx = m->GetPositionX() - lx, my = m->GetPositionY() - ly;
+                    float const md = std::sqrt(mx * mx + my * my);
+                    if (md < 1.0f || md > 50.0f)
+                        continue;
+                    if ((mx * dx + my * dy) / md > 0.5f)
+                        ++crowd;
+                }
+            if (crowd > bestCrowd || (crowd == bestCrowd && wall >= bestWall))
+                continue;
+            bestCrowd = crowd;
+            bestWall = wall;
+            fx = dx;
+            fy = dy;
+        }
+        if (bestCrowd == 1000)
+        {
+            fx = nearFx;
+            fy = nearFy;
+        }
+        {
+            std::lock_guard<std::mutex> guard(gOnyHeadLock);
+            gOnyHead[ony->GetObjectGuid().GetRawValue()] = { fx, fy };
+        }
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s's head spot: %.0f deg from her landing spot (%u members in front, wall %.0f yd)",
+            ony->GetName(), std::atan2(fy, fx) * 180.0f / float(M_PI), bestCrowd == 1000 ? 0u : bestCrowd, bestWall > 1e8f ? nearWall : bestWall);
+    }
+    x = lx + fx * 7.0f;
+    y = ly + fy * 7.0f;
+    z = lz;
+    if (backup)
+    {
+        x += -fy * 4.0f;
+        y += fx * 4.0f;
+    }
+    me->UpdateAllowedPositionZ(x, y, z);
+}
+
+// Onyxia landed (phase 3) with her landing pair chosen; inPair: I am one of the two; onPair: she is on one of them.
+// The callers check SuiTactic::LandingHeadSpot.
+static bool OnyxiaLandedWithPair(Player* me, Creature* ony, bool& inPair, bool& onPair)
+{
+    inPair = onPair = false;
+    if (!me->GetGroup() || ony->IsFlying() || ony->IsLevitating() || ony->IsHovering() || ony->GetHealthPercent() > 41.0f)
+        return false;
+    std::vector<uint64> const pair = OnyxiaLandingPair(me, ony, me->GetGroup(), me->GetMap());
+    if (pair.empty())
+        return false;
+    inPair = std::find(pair.begin(), pair.end(), me->GetObjectGuid().GetRawValue()) != pair.end();
+    Unit* v = ony->GetVictim();
+    onPair = v && std::find(pair.begin(), pair.end(), v->GetObjectGuid().GetRawValue()) != pair.end();
+    return true;
+}
+
+// [TACTICS] 2026-11-18 R4W0 Onyxia att. 1 (39 %): 30 of the 40 deaths took whelp melee. The script summons two whelps a
+// second from two fixed spots (afSpawnLocations, east (-30.1, -254.5), west (-30.8, -177.1)) - 16 at phase 2, then 5-7
+// every 30 s, one every 1-10 s in phase 3 - and sends each at a RANDOM member; the six tanks chased them one at a time
+// across the lair (36-40 focus switches each), Taunt refused for reach 132 times. The guide's answer: the off-tanks stand
+// at the spawn points and pick each whelp up as it appears. Scoped (SuiTactic::WhelpPostsAtSpawns): from phase 2 every
+// tank but the two staged for her landing (the TanksStageForLanding pair, remembered for the fight) holds a post 8 yd
+// inside a spawn point, three a side, 7 yd apart (one Fireball's Engulfing Flames burns friends within 5 yd), takes only
+// whelps within 16 yd of it and uses Demoralizing Shout / Challenging Shout there; her two tanks keep her in phase 3.
+bool AiBotAI::WhelpPostFor(float& x, float& y, float& z)
+{
+    uint32 const now = WorldTimer::getMSTime();
+    if (now < m_whelpPostCheckMs)
+    {
+        x = m_whelpPostX; y = m_whelpPostY; z = m_whelpPostZ;
+        return m_whelpPostOn;
+    }
+    m_whelpPostCheckMs = now + 1000;
+    m_whelpPostOn = false;
+    if (!me->IsAlive() || !me->IsInCombat() || GetCombatActiveRole() != ROLE_TANK || me->GetMapId() != SuiTactic::kOnyxia)
+        return false;
+    Group* group = me->GetGroup();
+    Creature* ony = me->FindNearestCreature(10184, 150.0f, true);
+    if (!group || !ony || !ony->IsInCombat() || !SuiTactic::On(me, SuiTactic::WhelpPostsAtSpawns, ony))
+        return false;
+    bool const air = ony->IsFlying() || ony->IsLevitating() || ony->IsHovering();
+    if (!air && ony->GetHealthPercent() > 41.0f)
+        return false;   // phase 1: no whelps yet, every tank on her
+    // her two tanks: the pair staged for the landing (top threat while airborne at <= 42 %), kept for the fight
+    std::vector<std::pair<Player*, float>> tanks;
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || !m->IsAlive() || !m->IsInMap(me))
+            continue;
+        AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
+        if (!ai || ai->GetCombatActiveRole() != ROLE_TANK)
+            continue;
+        tanks.push_back({m, ony->GetThreatManager().getThreat(m)});
+    }
+    std::set<uint64> hers;
+    for (uint64 g : OnyxiaLandingPair(me, ony, group, me->GetMap()))
+        hers.insert(g);
+    if (hers.empty() && !air)
+    {
+        // landed with no pair chosen (should not happen): her two highest tanks stay hers
+        std::vector<std::pair<Player*, float>> byT = tanks;
+        std::sort(byT.begin(), byT.end(), [](auto const& a, auto const& b) { return a.second > b.second; });
+        for (size_t i = 0; i < byT.size() && i < 2; ++i)
+            hers.insert(byT[i].first->GetObjectGuid().GetRawValue());
+    }
+    // [TACTICS] 2026-11-18 R4W0 Onyxia drill: her victim taken out of the post order re-numbered every post each time she
+    // turned. With SuiTactic::LandingHeadSpot her victim leaves its post (it brings her to the head spot) and keeps its
+    // place in the order.
+    bool const headSpot = SuiTactic::On(me, SuiTactic::LandingHeadSpot, ony);
+    if (!air && headSpot && ony->GetVictim() == me)
+        return false;
+    if (!air && !headSpot)
+        if (Unit* v = ony->GetVictim())
+            if (v->IsPlayer())
+                hers.insert(v->GetObjectGuid().GetRawValue());
+    if (hers.count(me->GetObjectGuid().GetRawValue()))
+        return false;
+    std::vector<Player*> posts;
+    for (auto const& t : tanks)
+        if (!hers.count(t.first->GetObjectGuid().GetRawValue()))
+            posts.push_back(t.first);
+    std::sort(posts.begin(), posts.end(), [](Player* a, Player* b) { return a->GetGUIDLow() < b->GetGUIDLow(); });
+    int idx = -1;
+    for (size_t i = 0; i < posts.size(); ++i)
+        if (posts[i] == me)
+            idx = int(i);
+    if (idx < 0)
+        return false;
+    int const side = idx % 2, slot = idx / 2;
+    int const n = int(posts.size()), nSide = side == 0 ? (n + 1) / 2 : n / 2;
+    float const sx = side == 0 ? -30.1f : -30.8f, sy = side == 0 ? -254.5f : -177.1f, sz = -89.4f;
+    float const cx = -21.0f, cy = -215.0f;
+    float dx = cx - sx, dy = cy - sy;
+    float const len = std::sqrt(dx * dx + dy * dy);
+    dx /= len; dy /= len;
+    float const lateral = (float(slot) - float(nSide - 1) * 0.5f) * 7.0f;
+    x = sx + dx * 8.0f - dy * lateral;
+    y = sy + dy * 8.0f + dx * lateral;
+    z = sz;
+    me->UpdateAllowedPositionZ(x, y, z);
+    m_whelpPostX = x; m_whelpPostY = y; m_whelpPostZ = z;
+    m_whelpPostOn = true;
+    return true;
+}
+
+// The whelp a post tank takes: one within 16 yd of its post, a loose one (not on a tank) first, then the nearest to the
+// post. Not a post tank (or no whelp there): postTank says which. Gated in WhelpPostFor (SuiTactic::WhelpPostsAtSpawns).
+static std::unordered_map<uint64, uint32> gWhelpSweepUntil;   // post tank -> sweeping until (SuiTactic::WhelpPostSweepsHealers)
+Unit* AiBotAI::WhelpPostTarget(bool& postTank)
+{
+    float px, py, pz;
+    postTank = WhelpPostFor(px, py, pz);
+    if (!postTank)
+        return nullptr;
+    std::list<Unit*> foes;
+    me->GetEnemyListInRadiusAround(me, 40.0f, foes);
+    Unit* best = nullptr;
+    float bestScore = 1e9f;
+    for (Unit* u : foes)
+    {
+        if (!u || !u->IsCreature() || !u->IsAlive() || u->GetEntry() != 11262 || u->GetDistance2d(px, py) > 16.0f)
+            continue;
+        Unit* v = u->GetVictim();
+        bool onTank = false;
+        if (v && v->IsPlayer())
+            if (AiBotAI* ai = dynamic_cast<AiBotAI*>(static_cast<Player*>(v)->AI()))
+                onTank = ai->GetCombatActiveRole() == ROLE_TANK;
+        float const score = u->GetDistance2d(px, py) + (onTank ? 30.0f : 0.0f);
+        if (score < bestScore)
+        {
+            bestScore = score;
+            best = u;
+        }
+    }
+    // [TACTICS] 2026-11-21 R4W7 att. 2-4, R4W8 att. 1: whelps past the posts killed the healers first in all four phase-3 losses
+    // (17-30 deaths by whelp melee) - nobody takes a whelp more than 16 yd from a post. A post tank with no whelp of its own
+    // goes for the nearest whelp on a non-tank within 25 yd of its post (taunts are melee range: it walks there), then returns.
+    // Gated by SuiTactic::WhelpPostSweepsHealers.
+    uint64 const myKey = me->GetObjectGuid().GetRawValue();
+    gWhelpSweepUntil.erase(myKey);
+    if (!best)
+    {
+        float bestD = 1e9f;
+        for (Unit* u : foes)
+        {
+            if (!u || !u->IsCreature() || !u->IsAlive() || u->GetEntry() != 11262 || u->GetDistance2d(px, py) > 25.0f ||
+                !SuiTactic::On(me, SuiTactic::WhelpPostSweepsHealers, u))
+                continue;
+            Unit* v = u->GetVictim();
+            if (!v || !v->IsPlayer() || v == me)
+                continue;
+            AiBotAI* vai = dynamic_cast<AiBotAI*>(static_cast<Player*>(v)->AI());
+            if (vai && vai->GetCombatActiveRole() == ROLE_TANK)
+                continue;
+            float const d = u->GetDistance2d(px, py);
+            if (d < bestD)
+            {
+                bestD = d;
+                best = u;
+            }
+        }
+        if (best)
+        {
+            gWhelpSweepUntil[myKey] = WorldTimer::getMSTime() + 3000;
+            static std::unordered_map<uint64, uint32> noted;
+            uint32 const nowMs = WorldTimer::getMSTime();
+            if (nowMs >= noted[myKey])
+            {
+                noted[myKey] = nowMs + 5000;
+                Unit* v = best->GetVictim();
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-WHELP] %s: no whelp at my post - taking the one on %s (%.0f yd from the post)",
+                    me->GetName(), v ? v->GetName() : "?", bestD);
+            }
+        }
+    }
+    return best;
+}
+
+// A post tank picking up a whelp on a healer may leave its post up to 30 yd (WhelpPostTarget, SuiTactic::WhelpPostSweepsHealers).
+static bool WhelpSweeping(Player* me, float px, float py)
+{
+    if (me->GetDistance2d(px, py) > 30.0f)
+        return false;
+    auto it = gWhelpSweepUntil.find(me->GetObjectGuid().GetRawValue());
+    if (it != gWhelpSweepUntil.end() && WorldTimer::getMSTime() < it->second)
+        return true;   // WhelpPostTarget chose a whelp on a healer within the last 3 s
+    Unit* v = me->GetVictim();
+    if (!v || !v->IsCreature() || v->GetEntry() != 11262 || !v->IsAlive())
+        return false;
+    Unit* vv = v->GetVictim();
+    if (!vv || vv == me || !vv->IsPlayer())
+        return false;
+    AiBotAI* vai = dynamic_cast<AiBotAI*>(static_cast<Player*>(vv)->AI());
+    return (!vai || vai->GetCombatActiveRole() != ROLE_TANK) && SuiTactic::On(me, SuiTactic::WhelpPostSweepsHealers, v);
+}
+
+// Walk to the post; there, shout the whelps onto me. Gated in WhelpPostFor (SuiTactic::WhelpPostsAtSpawns).
+bool AiBotAI::HoldWhelpPost()
+{
+    if (m_possessed || m_suiManual)
+        return false;
+    uint32 const now = WorldTimer::getMSTime();
+    if (now < m_whelpPostNextMs)
+        return false;
+    m_whelpPostNextMs = now + 400;
+    float x, y, z;
+    if (!WhelpPostFor(x, y, z))
+        return false;
+    if (me->GetDistance2d(x, y) > 6.0f && WhelpSweeping(me, x, y))
+        return false;   // picking up a whelp on a healer; the combat AI closes on it
+    if (me->GetDistance2d(x, y) > 6.0f)
+    {
+        if (!me->IsMoving() || me->GetMotionMaster()->GetCurrentMovementGeneratorType() != POINT_MOTION_TYPE)
+        {
+            if (now >= m_whelpPostLogMs)
+            {
+                m_whelpPostLogMs = now + 5000;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-WHELP] %s: to the whelp post (%.1f, %.1f), %.0f yd",
+                    me->GetName(), x, y, me->GetDistance2d(x, y));
+            }
+            me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+        }
+        return true;
+    }
+    if (me->GetClass() == CLASS_WARRIOR && !me->IsNonMeleeSpellCasted(false))
+    {
+        std::list<Unit*> foes;
+        me->GetEnemyListInRadiusAround(me, 10.0f, foes);
+        uint32 whelps = 0, loose = 0, bare = 0;
+        uint32 const demo = m_spells.warrior.pDemoralizingShout ? m_spells.warrior.pDemoralizingShout->Id : 0;
+        for (Unit* u : foes)
+        {
+            if (!u || !u->IsCreature() || !u->IsAlive() || u->GetEntry() != 11262)
+                continue;
+            ++whelps;
+            if (u->GetVictim() != me)
+                ++loose;
+            if (demo && !u->HasAura(demo))
+                ++bare;
+        }
+        if (loose >= 4 && TrySpecSpell(me, 1161u))   // Challenging Shout
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-WHELP] %s: Challenging Shout on %u loose whelps at the post", me->GetName(), loose);
+        else if (bare >= 2 && m_spells.warrior.pDemoralizingShout && TrySpecSpell(me, m_spells.warrior.pDemoralizingShout))
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-WHELP] %s: Demoralizing Shout on %u whelps at the post", me->GetName(), bare);
+    }
+    return false;   // fight from here (the focus keeps me on the post's whelps)
+}
+
+bool AiBotAI::StageForLanding()
+{
+    if (!me->IsAlive() || !me->IsInCombat() || m_possessed || m_suiManual || GetCombatActiveRole() != ROLE_TANK)
+        return false;
+    Group* group = me->GetGroup();
+    if (!group || !me->GetMap()->IsRaid())
+        return false;
+    uint32 const now = WorldTimer::getMSTime();
+    if (now < m_stageNextMs)
+        return m_stageMeeting;
+    m_stageNextMs = now + 500;
+    m_stageMeeting = false;
+    Creature* boss = nullptr;
+    std::list<Unit*> foes;
+    me->GetEnemyListInRadiusAround(me, 150.0f, foes);
+    for (Unit* u : foes)
+        if (u && u->IsCreature() && u->IsAlive() && u->IsInCombat() && static_cast<Creature*>(u)->IsWorldBoss() &&
+            SuiTactic::On(me, SuiTactic::TanksStageForLanding, u))
+        {
+            boss = static_cast<Creature*>(u);
+            break;
+        }
+    // [TACTICS] 2026-11-16 R3W5 Onyxia 34 %: staged from 45 % the tanks stood on the landing spot through 60 s of phase 2 and
+    // a Deep Breath there killed two of them and five healers beside them; 42 % leaves ~25 s, enough for a 50 yd walk.
+    // Gated by SuiTactic::TanksStageForLanding (the boss search above).
+    if (!boss || boss->GetHealthPercent() > 42.0f)
+        return false;
+    // [TACTICS] 2026-11-18 R4W0 Onyxia drill: landed, she stayed 4-38 s on a ranged member from the air and her two staged
+    // tanks left the head spot (out of her front, not her victim); until one of them holds her they keep it, and the
+    // member she is on brings her there (SuiTactic::LandingHeadSpot; AvoidFrontalCone).
+    // [TACTICS] 2026-11-19 R4W0 Onyxia drill 2 pulls 7/9/10: turning to land west of x -40 she touches down at her south
+    // point and fights 25-40 yd west of her landing spot; her pair waited at the head spot while she stayed on casters.
+    // Landed more than 12 yd from her landing spot: the main pair tank goes to her and takes her, then walks her to the
+    // head spot (she follows him). Gated by SuiTactic::PairMeetsHer.
+    bool meet = false, bringHome = false, far = false;
+    if (!(boss->IsFlying() || boss->IsLevitating() || boss->IsHovering()))
+    {
+        bool inPair = false, onPair = false;
+        if (!SuiTactic::On(me, SuiTactic::LandingHeadSpot, boss) || !OnyxiaLandedWithPair(me, boss, inPair, onPair) || !inPair)
+            return false;
+        far = boss->GetDistance2d(-8.860f, -212.752f) > 12.0f && SuiTactic::On(me, SuiTactic::PairMeetsHer, boss);
+        if (onPair)
+        {
+            // (drill 3 pull 1: feared off his spot, her main tank took her back wherever the fear left him and her
+            // breath went where he stood - also back to the spot when he is more than 4 yd off it, checked below)
+            if (boss->GetVictim() != me || !SuiTactic::On(me, SuiTactic::PairMeetsHer, boss))
+                return false;
+            bringHome = true;
+        }
+        else
+            meet = far;
+    }
+    // the two living tanks highest on her list
+    Player* top[2] = { nullptr, nullptr };
+    float topT[2] = { -1.0f, -1.0f };
+    for (GroupReference* itr = group->GetFirstMember(); itr; itr = itr->next())
+    {
+        Player* m = itr->getSource();
+        if (!m || !m->IsAlive() || !m->IsInMap(me))
+            continue;
+        AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
+        if (!ai || ai->GetCombatActiveRole() != ROLE_TANK)
+            continue;
+        float const t = boss->GetThreatManager().getThreat(m);
+        if (t > topT[0]) { top[1] = top[0]; topT[1] = topT[0]; top[0] = m; topT[0] = t; }
+        else if (t > topT[1]) { top[1] = m; topT[1] = t; }
+    }
+    // the pair is chosen once for the fight (OnyxiaLandingPair, R4W0 att. 3); the one of the two now higher
+    // on her list is the main tank
+    {
+        std::vector<uint64> const pair = OnyxiaLandingPair(me, boss, group, me->GetMap());
+        uint64 const mine = me->GetObjectGuid().GetRawValue();
+        if (std::find(pair.begin(), pair.end(), mine) == pair.end())
+            return false;
+        Player* other = nullptr;
+        for (uint64 g : pair)
+            if (g != mine)
+                other = ObjectAccessor::FindPlayer(ObjectGuid(g));
+        float const tMe = boss->GetThreatManager().getThreat(me), tOther = other ? boss->GetThreatManager().getThreat(other) : -1.0f;
+        bool const backup = other && (tOther > tMe || (tOther == tMe && other->GetGUIDLow() < me->GetGUIDLow()));
+        top[0] = backup ? other : me;
+        top[1] = backup ? me : other;
+    }
+    // (PairMeetsHer, above) the main tank goes to her where she landed and takes her; the backup keeps the head spot
+    if (meet && me == top[0])
+    {
+        if (me->GetVictim() != boss)
+            me->Attack(boss, true);
+        if (me->CanReachWithMeleeAutoAttack(boss))
+            return false;   // in reach: the rotation takes her (re-aimed at her every tick of mine)
+        if (now >= m_stageLogMs)
+        {
+            m_stageLogMs = now + 5000;
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: %s landed %.0f yd from her landing spot - to her, %.0f yd",
+                me->GetName(), boss->GetName(), boss->GetDistance2d(-8.860f, -212.752f), me->GetDistance2d(boss));
+        }
+        me->GetMotionMaster()->MoveChase(boss);
+        m_stageMeeting = true;
+        return true;
+    }
+    // the head spot (OnyxiaHeadSpot): the main tank 7 yd off her landing spot toward the nearest wall, the backup beside
+    // (bringHome: she is on me, away from her landing spot - my spot is the main one whatever the threat order says)
+    float x, y, z;
+    OnyxiaHeadSpot(me, boss, !bringHome && me == top[1], x, y, z);
+    if (bringHome && !far && me->GetDistance2d(x, y) <= 4.0f)
+        return false;   // she is on me at my spot: hold her there
+    if (me->GetDistance2d(x, y) <= 2.0f)
+    {
+        me->SetFacingTo(std::atan2(-212.752f - y, -8.860f - x));
+        return false;   // in place: whelps that reach me are still fought
+    }
+    if (now >= m_stageLogMs)
+    {
+        m_stageLogMs = now + 5000;
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-TANK] %s: to %s's landing spot (%.1f, %.1f), %.0f yd (she is at %.0f %%)%s",
+            me->GetName(), boss->GetName(), x, y, me->GetDistance2d(x, y), boss->GetHealthPercent(),
+            bringHome ? " - walking her home" : "");
+    }
+    m_stageMeeting = bringHome;
+    m_stageNextMs = now + 1200;
+    me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+    return true;
+}
+
 bool AiBotAI::AvoidFrontalCone()
 {
     if (!me->IsAlive() || !me->GetGroup() || m_possessed || m_suiManual || !(me->IsInCombat() || HealerOnDuty()))
@@ -4446,16 +5537,37 @@ bool AiBotAI::AvoidFrontalCone()
         {
             if (!u || !u->IsCreature() || !u->IsAlive())
                 continue;
-            Spell* cs = u->GetCurrentSpell(CURRENT_GENERIC_SPELL);
-            if (!cs || !cs->m_spellInfo || cs->GetCastTime() < 1000)
-                continue;
             bool cone = false;
-            for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
-                if (cs->m_spellInfo->EffectImplicitTargetA[i] == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24 ||
-                    cs->m_spellInfo->EffectImplicitTargetA[i] == TARGET_ENUM_UNITS_ENEMY_IN_CONE_54)
-                    cone = true;
+            Spell* cs = u->GetCurrentSpell(CURRENT_GENERIC_SPELL);
+            if (cs && cs->m_spellInfo && cs->GetCastTime() >= 1000)
+                for (uint8 i = 0; i < MAX_EFFECT_INDEX; ++i)
+                    if (cs->m_spellInfo->EffectImplicitTargetA[i] == TARGET_ENUM_UNITS_ENEMY_IN_CONE_24 ||
+                        cs->m_spellInfo->EffectImplicitTargetA[i] == TARGET_ENUM_UNITS_ENEMY_IN_CONE_54)
+                        cone = true;
+            // ...and an airborne world boss that holds still with no target: Onyxia's Deep Breath is cast triggered (no
+            // cast time) as a chain of line hits, and for its 5 s she clears her target and faces where she will fly
+            // (boss_onyxia DoMovement). The cast test never saw it (2026-11-14, Onyxia dev attempt 19: ten dead to one
+            // Deep Breath at +202 s, not one "off the line" step before it).
+            bool airborneBreath = false;
+            if (!cone && static_cast<Creature*>(u)->IsWorldBoss() && (u->IsFlying() || u->IsLevitating() || u->IsHovering()) &&
+                u->GetTargetGuid().IsEmpty() && !u->IsMoving())
+                cone = airborneBreath = true;
             if (!cone)
                 continue;
+            // [TACTICS] 2026-11-18 R4W0 Onyxia att. 1: her Deep Breath is escaped from its forecast impacts
+            // (EscapeBreathForecast); this facing-based line re-aimed bots onto the room's centre line every 0.5 s
+            // and five died on it (SuiTactic::DeepBreathEscape). Her cast Flame Breath stays here.
+            if (airborneBreath && SuiTactic::On(me, SuiTactic::DeepBreathEscape, u))
+                continue;
+            // [TACTICS] 2026-11-19 R4W0 Onyxia drill 3 pull 1: her backup tank stepped 28 yd "off the line" of her cast
+            // breath; a Bellowing Roar feared her main tank, she turned to the backup there and her breath hit 18 on
+            // the flank. Landed, her pair keeps the head spot through her breath (SuiTactic::LandingHeadSpot).
+            if (!airborneBreath && u->GetEntry() == 10184 && SuiTactic::On(me, SuiTactic::LandingHeadSpot, u))
+            {
+                bool inPair = false, onPair = false;
+                if (OnyxiaLandedWithPair(me, static_cast<Creature*>(u), inPair, onPair) && inPair)
+                    continue;
+            }
             float const o = u->GetOrientation(), fx = std::cos(o), fy = std::sin(o);
             float const dx = me->GetPositionX() - u->GetPositionX(), dy = me->GetPositionY() - u->GetPositionY();
             float const along = dx * fx + dy * fy;
@@ -4493,7 +5605,116 @@ bool AiBotAI::AvoidFrontalCone()
     {
         if (!u || !u->IsCreature() || !u->IsAlive() || !u->IsInCombat())
             continue;
-        if (role == ROLE_TANK && u->GetVictim() == me)
+        // [TACTICS] 2026-11-18 R4W0 Onyxia drill (SuiTactic::LandingHeadSpot): landed, her two tanks keep her head spot
+        // whether she is on them or not, and anyone else she turns on walks her there instead of out of her front (her
+        // landing target stepped out of it 4-5 times, she followed and her Flame Breath swept 10-25 members at once)
+        if (u->GetEntry() == 10184 && SuiTactic::On(me, SuiTactic::LandingHeadSpot, u))
+        {
+            bool inPair = false, onPair = false;
+            if (OnyxiaLandedWithPair(me, static_cast<Creature*>(u), inPair, onPair))
+            {
+                if (inPair)
+                    continue;
+                if (u->GetVictim() == me)
+                {
+                    float hx, hy, hz;
+                    OnyxiaHeadSpot(me, static_cast<Creature*>(u), false, hx, hy, hz);
+                    if (me->GetDistance2d(hx, hy) <= 3.0f)
+                        continue;   // there: her head is to the wall
+                    if (me->IsNonMeleeSpellCasted(false))
+                        me->InterruptNonMeleeSpells(false);
+                    m_coneNextMs = now + 1000;
+                    m_repositionUntilMs = now + 1500;
+                    SuiRaidTelemetry::OnReposition(me, "head spot");
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: %s is on me - to her head spot (%.1f, %.1f), %.0f yd",
+                        me->GetName(), u->GetName(), hx, hy, me->GetDistance2d(hx, hy));
+                    me->GetMotionMaster()->MovePoint(0, hx, hy, hz, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                    return true;
+                }
+                // [TACTICS] 2026-11-19 R4W0 Onyxia drill 2 pull 3: her Knock Away moves her tank, she turns 20-40 degrees with
+                // him, and every member re-picked a flank spot from her new facing in the same second and walked through her
+                // front (21 hit by one breath). Landed, the flanks are measured from her head direction (fixed for the
+                // fight): her front is within 75 degrees of it, her tail within 70 of its back; only a member in one of them
+                // moves, to 85-100 degrees on its own side, so nobody crosses her front (SuiTactic::FlanksOffHeadDirection).
+                float hfx = 0.0f, hfy = 0.0f;
+                bool haveHead = false;
+                {
+                    std::lock_guard<std::mutex> guard(gOnyHeadLock);
+                    auto it = gOnyHead.find(u->GetObjectGuid().GetRawValue());
+                    if (it != gOnyHead.end())
+                    {
+                        hfx = it->second.first;
+                        hfy = it->second.second;
+                        haveHead = true;
+                    }
+                }
+                // (a tank outside her pair is not moved here - it holds its whelp post; at her flank in melee reach it built
+                // threat and took her from her pair, R4W0 drill 2 pull 5)
+                if (haveHead && role == ROLE_TANK && SuiTactic::On(me, SuiTactic::FlanksOffHeadDirection, u))
+                    continue;
+                if (haveHead && SuiTactic::On(me, SuiTactic::FlanksOffHeadDirection, u))
+                {
+                    // (drill 3 pull 2: her melee reach is ~26 yd - landed away from her landing spot she hits her tank at
+                    // the head spot from where she stands and faces him, not the head direction; 4 breaths hit 4-11 at
+                    // 55-60 deg. Her head points from her to the main head spot; the fixed direction only once there.)
+                    float ho = std::atan2(hfy, hfx);
+                    {
+                        float hsx, hsy, hsz;
+                        OnyxiaHeadSpot(me, static_cast<Creature*>(u), false, hsx, hsy, hsz);
+                        if (u->GetDistance2d(hsx, hsy) > 3.0f)
+                            ho = std::atan2(hsy - u->GetPositionY(), hsx - u->GetPositionX());
+                    }
+                    float const dx = me->GetPositionX() - u->GetPositionX(), dy = me->GetPositionY() - u->GetPositionY();
+                    float const d = std::sqrt(dx * dx + dy * dy);
+                    float rel = std::atan2(dy, dx) - ho;
+                    while (rel > float(M_PI)) rel -= 2.0f * float(M_PI);
+                    while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
+                    float const absRel = std::fabs(rel);
+                    float const reachO = SuiRaidTelemetry::EntryConeRadius(u->GetEntry()) + u->GetObjectBoundingRadius() + 3.0f;
+                    bool const front = absRel < float(M_PI) * 75.0f / 180.0f;
+                    bool const tail = absRel > float(M_PI) * 110.0f / 180.0f;
+                    if (d > reachO || !(front || tail))
+                        continue;   // on a flank (or out of her reach): stay
+                    bool const melee = role == ROLE_MELEE_DPS || role == ROLE_TANK;
+                    float const keepO = melee ? u->GetObjectBoundingRadius() + me->GetObjectBoundingRadius() +
+                        std::min(u->GetCombatReach() * 0.5f, 10.0f) : std::min(std::max(d, 12.0f), 30.0f);
+                    float const side = rel >= 0.0f ? 1.0f : -1.0f;
+                    bool moved = false;
+                    for (float sgn : { side, -side })
+                    {
+                        for (float off : { 1.57f, 1.66f, 1.48f, 1.75f })
+                        {
+                            float const ang = ho + sgn * off;
+                            float x = u->GetPositionX() + keepO * std::cos(ang), y = u->GetPositionY() + keepO * std::sin(ang);
+                            float z = u->GetPositionZ();
+                            me->UpdateAllowedPositionZ(x, y, z);
+                            if (std::fabs(z - u->GetPositionZ()) > 6.0f || Molten(me, x, y, z) || !SeesFrom(me, x, y, z, u) ||
+                                !Walkable(me, x, y, z))
+                                continue;
+                            if (me->IsNonMeleeSpellCasted(false))
+                                me->InterruptNonMeleeSpells(false);
+                            m_coneNextMs = now + 1500;
+                            m_repositionUntilMs = now + 2500;
+                            SuiRaidTelemetry::OnReposition(me, "flank");
+                            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HAZARD] %s: to %s's %s flank off her head direction -> (%.1f, %.1f) (was %.0f deg)",
+                                me->GetName(), u->GetName(), sgn > 0.0f ? "left" : "right", x, y, rel * 180.0f / float(M_PI));
+                            me->GetMotionMaster()->MovePoint(0, x, y, z, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                            moved = true;
+                            break;
+                        }
+                        if (moved || front)
+                            break;   // from her front only my own side: the other one is across her breath
+                    }
+                    if (moved)
+                        return true;
+                    continue;
+                }
+            }
+        }
+        // (and nobody steps out of the front of the one hitting them: it turns with them - 2026-11-15, R3W1 MC, the
+        // Firewalker/Flameguard/Lava Elemental pack by Geddon: healers it had turned on stepped "out of the front" every
+        // 1-2 s, cast almost nothing, and the tanks chasing it never got into Taunt's melee reach; 38 dead at 100 %)
+        if (u->GetVictim() == me && (role == ROLE_TANK || SuiTactic::On(me, SuiTactic::NoDodgeOwnAttacker, u)))
             continue;
         float const cone = SuiRaidTelemetry::EntryConeRadius(u->GetEntry());
         if (cone <= 0.0f)
@@ -4532,6 +5753,10 @@ bool AiBotAI::AvoidFrontalCone()
         CollectGroundHazards(me, hazards);
         std::vector<GroundHazard> idle;
         CollectIdleHostiles(me, 60.0f, idle);
+        // ...and an idle boss's whole roam (35 yd + his wander) like the fire step-out: a mage's cone step to 40 yd from
+        // Shazzrah's home (28 + 10 credited) woke him at +13 s of his trash pack's fight, all 40 dead (2026-11-15, R3W1 MC)
+        if (SuiTactic::On(me, SuiTactic::ConeAvoidsIdleBossRoam))
+            CollectIdleBosses(me, idle);
         float bestX = 0, bestY = 0, bestZ = 0, bestScore = 1e9f;
         // its flanks - behind the shoulder, clear of both its front and its tail; at my own distance first, then nearer
         // and farther (2026-11-14, Onyxia dev attempt 11: a warlock 19 yd out at 22 degrees found no flank spot at 19 yd
@@ -5231,6 +6456,17 @@ bool AiBotAI::MaintainRangedSpacing()
             tank = FindEscortBoss();
         if (role != ROLE_HEALER || !tank || tank == me || !tank->IsAlive())
             return false;
+        // [TACTICS] 2026-11-22 R4W12 Onyxia att. 1 (57 %): Gankreaper stepped out of her next Deep Breath lane at 13:00:51, then
+        // "closing on Stormdoom (40 yd)" at 13:00:53 walked it back in; it and Shiftftw died to the breath at 13:01:06 and the
+        // healer-less raid fell to the whelps. A healer holding its lane spot or a forecast-breath escape does not close on a
+        // tank. (m_hLaneUntilMs / m_breathEscUntilMs are only set under SuiTactic::HealerLaneClear / DeepBreathEscape.)
+        {
+            uint32 const holdNow = WorldTimer::getMSTime();
+            if (holdNow < m_hLaneUntilMs || holdNow < m_breathEscUntilMs)
+                if (Creature* ony = me->FindNearestCreature(10184, 150.0f, true))
+                    if (SuiTactic::On(me, SuiTactic::HealerLaneClear, ony))
+                        return false;
+        }
         // The tank's enemy pulses fire around itself: heal from outside that circle (heal range is
         // 40 yd), rather than walking back into it between bursts.
         float pulseKeepOut = 0.0f;
@@ -5269,6 +6505,32 @@ bool AiBotAI::MaintainRangedSpacing()
         CollectGroundHazards(me, burning);
         struct Cand { float x, y, z, score; };
         std::vector<Cand> cands;
+        // In front of or behind a kind that breathes a cone and sweeps its tail (its flanks are 70-110 degrees off).
+        auto inArc = [&](float x, float y)
+        {
+            for (Unit* a : tank->GetAttackers())
+                if (a && a->IsAlive() && a->IsCreature())
+                    if (float const cone = SuiRaidTelemetry::EntryConeRadius(a->GetEntry()))
+                        if (a->GetDistance2d(x, y) < cone + a->GetObjectBoundingRadius() + 3.0f)
+                        {
+                            float rel = a->GetAngle(x, y) - a->GetOrientation();
+                            while (rel > float(M_PI)) rel -= 2.0f * float(M_PI);
+                            while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
+                            float const off = std::fabs(rel);
+                            if (off < float(M_PI) * 7.0f / 18.0f)
+                                return 1;   // its front
+                            // [TACTICS] 2026-11-19 R4W0 Onyxia drill 4 pull 11: her tail was given her breath's reach (45 yd +
+                            // her size); with her head to the east wall the tail covered the whole way in from the tunnel,
+                            // every healer logged "cannot reach Boomwarrior (8 spots)" with no sight and her tank died at +33 s.
+                            // Her Tail Sweep never hit beyond 28 yd (CONEHIT, all of 11-19): that is the tail arc here.
+                            // Gated by SuiTactic::HealWalkAvoidsArcs.
+                            if (off > float(M_PI) * 11.0f / 18.0f &&
+                                (!SuiTactic::On(me, SuiTactic::HealWalkAvoidsArcs, a) || a->GetDistance2d(x, y) < 31.0f))
+                                return 2;   // its tail
+                        }
+            return 0;
+        };
+        int const startArc = inArc(me->GetPositionX(), me->GetPositionY());
         float const rings[3] = { pulseKeepOut > 0.0f ? 30.0f : 20.0f, pulseKeepOut > 0.0f ? 34.0f : 26.0f, pulseKeepOut > 0.0f ? 26.0f : 14.0f };
         for (float r : rings)
             for (int i = 0; i < 24; ++i)
@@ -5294,7 +6556,9 @@ bool AiBotAI::MaintainRangedSpacing()
                                 while (rel > float(M_PI)) rel -= 2.0f * float(M_PI);
                                 while (rel < -float(M_PI)) rel += 2.0f * float(M_PI);
                                 float const off = std::fabs(rel);
-                                if (off < float(M_PI) * 7.0f / 18.0f || off > float(M_PI) * 11.0f / 18.0f)
+                                // (her tail is 28 yd, not her breath's reach - see inArc below; SuiTactic::HealWalkAvoidsArcs)
+                                if (off < float(M_PI) * 7.0f / 18.0f || (off > float(M_PI) * 11.0f / 18.0f &&
+                                    (!SuiTactic::On(me, SuiTactic::HealWalkAvoidsArcs, a) || a->GetDistance2d(x, y) < 31.0f)))
                                     arc = true;
                             }
                 if (arc)
@@ -5355,6 +6619,24 @@ bool AiBotAI::MaintainRangedSpacing()
                 }
             }
             if (through)
+                continue;
+            // ...and not across a breather's front or tail on the way: healers walking from Onyxia's tail round to a
+            // flank spot crossed her front together and one Flame Breath killed eight of them at 21-40 yd (2026-11-15,
+            // R3W2 Onyxia attempt 3, phase 3). The arc I start in is the way out of it; the other is not crossed.
+            bool crosses = false;
+            bool const arcWalkOn = SuiTactic::OnAnyAttacker(tank, SuiTactic::HealWalkAvoidsArcs);
+            for (size_t k = 1; k < pts.size() && !crosses && arcWalkOn; ++k)
+            {
+                Vector3 const d = pts[k] - pts[k - 1];
+                int const n = std::max(1, int(d.length() / 2.0f));
+                for (int j = 1; j <= n && !crosses; ++j)
+                {
+                    Vector3 const p = pts[k - 1] + d * (float(j) / n);
+                    int const arcHere = inArc(p.x, p.y);
+                    crosses = arcHere != 0 && arcHere != startArc;
+                }
+            }
+            if (crosses)
                 continue;
             sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AIBOT-HEAL] %s: closing on %s (%.0f yd%s) -> %.0f yd from it",
                 me->GetName(), tank->GetName(), me->GetDistance(tank), me->IsWithinLOSInMap(tank) ? "" : ", no sight",

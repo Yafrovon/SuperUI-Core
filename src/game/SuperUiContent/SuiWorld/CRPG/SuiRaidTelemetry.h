@@ -45,6 +45,8 @@ namespace SuiRaidTelemetry
     void OnCreatureCast(Unit* caster, SpellEntry const* spell);
     // Forecast impact circles (x, y, radius) on this map instance still to come.
     void ForecastHazards(Unit const* around, float range, std::vector<std::tuple<float, float, float>>& out);
+    // The impact circles (x, y, radius) a chain spell would land on this map (spell_target_position), without a cast.
+    void ChainImpacts(uint32 spellId, uint32 mapId, std::vector<std::tuple<float, float, float>>& out);
     void OnHeal(Unit* healer, Unit* target, uint32 amount, SpellEntry const* spell);
     void OnKill(Unit* killer, Unit* victim);
     // Once a second while the autopilot's group fights: member activity, hostiles' health and victims.

@@ -102,6 +102,7 @@ namespace
         ObjectGuid crowder;                                        // the pack closest to the camp
         uint32 crowdHops = 0;
         uint32 crowdWaitMs = 0;
+        uint32 corridorRefusedMs = 0, corridorWaitMs = 0;   // a patrol's corridor plan refused (CorridorClearOfPacks)
         uint32 planHoldMs = 0;
         bool planFresh = false;   // a new plan: the walk still under way heads for the target itself
         // Ambush of a patrolling target: the point on its walk where it is pulled.
@@ -116,6 +117,15 @@ namespace
         uint32 safeCheckMs = 0;
         bool retreating = false;   // the whole raid falls back with the leader (early aggro)
         std::map<ObjectGuid, uint32> skip;       // unreachable / stuck targets -> retry after (ms clock)
+        std::map<ObjectGuid, uint32> corridorSkip;   // patrols skipped by CorridorClearOfPacks -> until (CorridorSkipHolds)
+        std::map<ObjectGuid, uint32> bossPassSkip;   // room trash whose walk passes a boss -> until (BossPassSkipHolds)
+        uint32 noPlanMs = 0, noPlanWaitMs = 0;      // PlanPull found no plan (NoPlanNoWalkIn)
+        ObjectGuid noPlanTarget;
+        std::map<ObjectGuid, uint32> noPlanSkipped; // targets already skipped once for having no plan
+        std::map<ObjectGuid, uint32> ambushSkipped; // patrols skipped for having no ambush (AmbushSkipHolds)
+        uint32 comeNearMs = 0;                      // backing off from the timed walker (TimedWalkerGoesFirst)
+        ObjectGuid comeNearTarget;
+        bool hopBlocked = false;                     // InTheWay met a corridor-skipped patrol: the pick waits with it
         uint32 prepNextMs = 0;
         bool offMesh = false;
         uint32 offMeshTries = 0;
@@ -134,6 +144,7 @@ namespace
         bool leaderDied = false;   // the leader fell in this fight: the record still runs to its end
         bool review = true;        // pause after a boss fight or a wipe (owner 2026-11-03: review per boss)
         ObjectGuid noAmbush;       // a patrol whose ambush timed out: pulled where it walks
+        ObjectGuid roomTrash;      // the last pack RoomTrash chose: a boss waits for it
         std::map<uint32, uint32> gateNotedMs;   // boss entry -> last "waits for" note
         ObjectGuid timedBy;        // a patrolling boss the next pull is timed around (pulled while it is away)
         ObjectGuid passedFrom;     // the target a "stands beside the walk" hop left (never hopped back to)
@@ -155,6 +166,25 @@ namespace
     // restart does not forget what the raid already killed.
     std::set<std::tuple<uint32, uint32, uint32>> gCleared;   // map, instance, spawn
     bool gClearedLoaded = false;
+
+    // [TACTICS-SCOPE-EXEMPT: QA tool, not a tactic] DRILL (owner 2026-11-15: "rerun this stuck area until we have cleared it 8/10 times ... any 8 clears within a
+    // rolling 10 fight window"): the autopilot pulls only inside a circle, and when the circle is empty it respawns the
+    // real spawns there (not bosses) and goes again. Pack fights are scored in a file beside mangosd.conf (a restart keeps
+    // the window): clear = the leader lived and at most 5 members died. Drill kills verify a build; they are not progression.
+    struct Drill
+    {
+        bool on = false, passed = false;
+        uint32 map = 0, instance = 0;
+        float x = 0.0f, y = 0.0f, z = 0.0f, r = 0.0f;
+        uint32 waitMs = 0;
+    };
+    Drill gDrill;
+
+    bool OutsideDrill(Creature const* c)
+    {
+        return gDrill.on && c->GetMapId() == gDrill.map && c->GetInstanceId() == gDrill.instance &&
+            c->GetDistance2d(gDrill.x, gDrill.y) > gDrill.r;
+    }
 
     std::string ClearedPath()
     {
@@ -185,6 +215,103 @@ namespace
         LoadCleared();
         uint32 const guid = c->HasStaticDBSpawnData() ? c->GetDBTableGUIDLow() : 0;
         return guid && gCleared.count(std::make_tuple(c->GetMapId(), c->GetInstanceId(), guid));
+    }
+
+    struct DrillRespawnDo
+    {
+        float x, y, r;
+        std::vector<uint32>* spawns;
+        void operator()(Creature* c) const
+        {
+            if (c->IsAlive() || c->IsWorldBoss() || !c->HasStaticDBSpawnData() || c->GetDistance2d(x, y) > r)
+                return;
+            spawns->push_back(c->GetDBTableGUIDLow());
+            c->Respawn();
+        }
+        void operator()(GameObject*) const {}
+        void operator()(WorldObject*) const {}
+        void operator()(Corpse*) const {}
+    };
+
+    // Respawns the dead non-boss spawns of the drill circle and forgets them as cleared (else they are executed on sight).
+    uint32 DrillRespawn(Player* me)
+    {
+        std::lock_guard<std::recursive_mutex> guard(gLock);
+        LoadCleared();
+        // [TACTICS-SCOPE-EXEMPT: QA tool, not a tactic] A cleared spawn whose respawn timer is still pending after a
+        // server restart is not loaded at all, so the circle stayed empty (2026-11-21 R4W5 Core Hound drill: "respawned
+        // 0" for 30 min). Its timer is cleared and the spawn loaded, then respawned below like the rest.
+        // (also 04:34: the pack was alive and loaded but still on the cleared list - never pullable, never respawned.)
+        // Every cleared spawn inside the circle is forgotten.
+        Map* map = me->GetMap();
+        std::vector<uint32> inCircle;
+        // every DB spawn of this map inside the circle (05:12: the cleared list alone missed spawns already taken off it)
+        for (auto const& pair : sObjectMgr.GetCreatureDataMap())
+        {
+            uint32 const guid = pair.first;
+            CreatureData const* data = &pair.second;
+            if (data->position.mapId != me->GetMapId())
+                continue;
+            float const dx = data->position.x - gDrill.x, dy = data->position.y - gDrill.y;
+            if (dx * dx + dy * dy > gDrill.r * gDrill.r)
+                continue;
+            if (CreatureInfo const* info = sObjectMgr.GetCreatureTemplate(data->creature_id[0]))
+                if (info->rank == CREATURE_ELITE_WORLDBOSS)
+                    continue;
+            inCircle.push_back(guid);
+            if (Creature* cr = map->GetCreature(data->GetObjectGuid(guid)))
+            {
+                // 05:12: loaded but never seen by the grid sweep - say what it is, and bring a dead one back directly
+                static std::map<uint32, uint32> noted;
+                uint32 const nowMs = WorldTimer::getMSTime();
+                if (nowMs >= noted[guid])
+                {
+                    noted[guid] = nowMs + 60000;
+                    sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] drill: spawn %u loaded: alive %d inworld %d death %u at (%.0f, %.0f, %.0f) %.0f yd from the circle",
+                        guid, int(cr->IsAlive()), int(cr->IsInWorld()), uint32(cr->GetDeathState()), cr->GetPositionX(), cr->GetPositionY(),
+                        cr->GetPositionZ(), cr->GetDistance2d(gDrill.x, gDrill.y));
+                }
+                if (!cr->IsAlive())
+                    cr->Respawn();
+                continue;
+            }
+            if (map->GetPersistentState())
+                map->GetPersistentState()->SaveCreatureRespawnTime(guid, 0);
+            map->LoadCreatureSpawn(guid);
+        }
+        std::vector<uint32> spawns;
+        DrillRespawnDo work{ gDrill.x, gDrill.y, gDrill.r, &spawns };
+        MaNGOS::WorldObjectWorker<DrillRespawnDo> worker(work);
+        Cell::VisitGridObjects(me, worker, me->GetDistance2d(gDrill.x, gDrill.y) + gDrill.r + 10.0f);
+        for (uint32 guid : spawns)
+            gCleared.erase(std::make_tuple(me->GetMapId(), me->GetInstanceId(), guid));
+        uint32 forgotten = 0;
+        for (uint32 guid : inCircle)
+            forgotten += uint32(gCleared.erase(std::make_tuple(me->GetMapId(), me->GetInstanceId(), guid)));
+        if (forgotten)
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] drill: %u living spawn(s) in the circle taken off the cleared list", forgotten);
+        std::ofstream out(ClearedPath(), std::ios::trunc);
+        for (auto const& t : gCleared)
+            out << std::get<0>(t) << ' ' << std::get<1>(t) << ' ' << std::get<2>(t) << '\n';
+        return uint32(spawns.size());
+    }
+
+    std::string DrillPath()
+    {
+        std::string const cleared = ClearedPath();
+        return cleared.substr(0, cleared.find_last_of('/') + 1) + "sui-autopilot-drill.txt";
+    }
+
+    // the scored fights so far, oldest first (1 = clear)
+    std::vector<int> DrillWindow()
+    {
+        std::vector<int> all;
+        std::ifstream in(DrillPath());
+        long long when = 0;
+        int clear = 0, dead = 0, secs = 0, entry = 0;
+        while (in >> when >> clear >> dead >> secs >> entry)
+            all.push_back(clear);
+        return all;
     }
 
     // A creature that really walks somewhere: a waypoint route reaching 35 yd or more from its
@@ -263,6 +390,14 @@ namespace
             if (c->IsAlive() && c->IsHostileTo(leader) && !c->IsTotem() && c->GetCreatureType() != CREATURE_TYPE_CRITTER &&
                 (c->IsInCombat() || c->IsInEvadeMode()) && !(c->GetVictim() && group->IsMember(c->GetVictim()->GetObjectGuid())))
                 ++r.unsettled;
+        // [TACTICS] 2026-11-16 R3W8/R3W9 MC: a Core Hound pack's fight was closed while hounds lay down (they rise unless
+        // the whole pack is down within 10 s); they rose on the raid walking off - Lucifron joined them (W9, 38/40). A pack
+        // member lying down alive keeps the fight open. Gated by SuiTactic::RiserKeepsFightOpen.
+        for (Creature* c : around)
+            if (c->IsAlive() && c->IsHostileTo(leader) &&
+                (c->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_DEAD) || c->GetStandState() == UNIT_STAND_STATE_DEAD) &&
+                SuiTactic::On(leader, SuiTactic::RiserKeepsFightOpen, c))
+                r.inCombat = true;
         return r;
     }
 
@@ -292,7 +427,7 @@ namespace
             c->GetUInt32Value(UNIT_NPC_FLAGS) == 0 && !c->IsGuard() &&   // never a flight master, vendor or guard
             !c->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_NOT_SELECTABLE | UNIT_FLAG_NON_ATTACKABLE_2 | UNIT_FLAG_IMMUNE_TO_PLAYER) &&
             !(!ignoreSkip && pilot.skip.count(c->GetObjectGuid()) && WorldTimer::getMSTime() < pilot.skip.at(c->GetObjectGuid())) &&
-            !IsCleared(c) &&
+            !IsCleared(c) && !OutsideDrill(c) &&
             !(pilot.deferEntry.count(c->GetEntry()) && WorldTimer::getMSTime() < pilot.deferEntry.at(c->GetEntry())) &&
             std::none_of(pilot.deferZones.begin(), pilot.deferZones.end(), [c](Pilot::Zone const& z)
             {
@@ -318,6 +453,7 @@ namespace
         if (c->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_IMMUNE_TO_PLAYER)) return "immune to players";
         if (pilot.skip.count(c->GetObjectGuid()) && nowMs < pilot.skip.at(c->GetObjectGuid())) return "skipped (no path)";
         if (IsCleared(c)) return "cleared spawn";
+        if (OutsideDrill(c)) return "outside the drill circle";
         if (pilot.deferEntry.count(c->GetEntry()) && nowMs < pilot.deferEntry.at(c->GetEntry())) return "entry deferred";
         for (Pilot::Zone const& z : pilot.deferZones)
             if (nowMs < z.until && std::fabs(c->GetPositionZ() - z.z) < 25.0f && c->GetDistance2d(z.x, z.y) < z.r)
@@ -649,6 +785,14 @@ namespace
         Cell::VisitGridObjects(boss, searcher, 90.0f);
         Creature* best = nullptr;
         float bestD = 1e9f;
+        // [TACTICS] 2026-11-22 R4W13 22:20-22:48, Golemagg's room: Firewalker 56797 was put off because the walk to it passed
+        // Golemagg, and this search un-skipped it the next second - 500+ picks, no pull, the night ended at 6/10. Room trash put
+        // off that way is passed over while another member of its pack (the Lava Reaver R4W12 pulled from the east) or another
+        // room pack is pullable; only when nothing else is left does the old behaviour (nearest, skip erased) apply.
+        // Gated by SuiTactic::BossPassSkipHolds.
+        Creature* held = nullptr;
+        float heldD = 1e9f;
+        uint32 const nowMs = WorldTimer::getMSTime();
         for (Creature* c : near)
         {
             // A pack only put off for a while (an abandoned ambush) still stands in the room: the boss
@@ -660,12 +804,30 @@ namespace
             if (std::fabs(c->GetPositionZ() - boss->GetPositionZ()) > 20.0f)
                 continue;
             float const d = me->GetDistance(c);
+            auto bp = pilot.bossPassSkip.find(c->GetObjectGuid());
+            bool const passHeld = bp != pilot.bossPassSkip.end() && nowMs < bp->second &&
+                SuiTactic::On(me, SuiTactic::BossPassSkipHolds, c);
+            if (passHeld)
+            {
+                if (d < heldD)
+                {
+                    heldD = d;
+                    held = c;
+                }
+                continue;
+            }
             if (d < bestD && PathLength(me, c->GetPositionX(), c->GetPositionY(), c->GetPositionZ()) >= 0.0f)
             {
                 bestD = d;
                 best = c;
             }
         }
+        if (!best && held && PathLength(me, held->GetPositionX(), held->GetPositionY(), held->GetPositionZ()) >= 0.0f)
+            best = held;   // nothing else left in the room: the old behaviour
+        else if (best && held)
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s (spawn %u) waits - its walk passes %s; %s (entry %u, spawn %u) is tried first",
+                me->GetName(), held->GetName(), held->GetDBTableGUIDLow(), boss->GetName(), best->GetName(), best->GetEntry(),
+                best->GetDBTableGUIDLow());
         if (best)
             pilot.skip.erase(best->GetObjectGuid());   // it is the next pull again
         return best;
@@ -725,6 +887,36 @@ namespace
                 if (blocker && PathLength(me, blocker->GetPositionX(), blocker->GetPositionY(),
                     blocker->GetPositionZ()) >= 0.0f)
                 {
+                    // [TACTICS] 2026-11-22 R4W11 10:38-10:59: a Lava Surger skipped for having no corridor plan clear of packs
+                    // was un-skipped the next second as standing in the way of the other Surger - eleven rounds, Majordomo
+                    // never pulled. A corridor-skipped patrol stays skipped; what it stands in front of waits with it.
+                    // Gated by SuiTactic::CorridorSkipHolds.
+                    auto cs = pilot.corridorSkip.find(blocker->GetObjectGuid());
+                    if (cs != pilot.corridorSkip.end() && WorldTimer::getMSTime() < cs->second &&
+                        SuiTactic::On(me, SuiTactic::CorridorSkipHolds, blocker))
+                    {
+                        pilot.skip[target->GetObjectGuid()] = cs->second;
+                        pilot.hopBlocked = true;
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s (entry %u) stands behind the corridor-skipped %s (spawn %u) - it waits with it",
+                            me->GetName(), target->GetName(), target->GetEntry(), blocker->GetName(), blocker->GetDBTableGUIDLow());
+                        return nullptr;
+                    }
+                    // [TACTICS] 2026-11-23 R4W17 MC 14:32, P56721: Firelord 91283 was held 60 s for having no pull plan and
+                    // skipped for 10 min, and the next second it stood in the way of the Molten Giant 16 yd off and was the
+                    // target again - pulled unplanned 35 s later, 39/40 (Firelord 79 %, Annihilator 7 %, the raid on Lava
+                    // Spawns). A Firelord skipped for having no plan stays skipped like a corridor-skipped patrol; what it
+                    // stands in front of waits with it. Gated by SuiTactic::NoPlanSkipHolds.
+                    auto ns = pilot.skip.find(blocker->GetObjectGuid());
+                    if (ns != pilot.skip.end() && WorldTimer::getMSTime() < ns->second &&
+                        pilot.noPlanSkipped.count(blocker->GetObjectGuid()) &&
+                        SuiTactic::On(me, SuiTactic::NoPlanSkipHolds, blocker))
+                    {
+                        pilot.skip[target->GetObjectGuid()] = ns->second;
+                        pilot.hopBlocked = true;
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s (entry %u) stands behind %s (spawn %u), skipped for having no plan - it waits with it",
+                            me->GetName(), target->GetName(), target->GetEntry(), blocker->GetName(), blocker->GetDBTableGUIDLow());
+                        return nullptr;
+                    }
                     pilot.skip.erase(blocker->GetObjectGuid());   // it is the next pull again
                     return blocker;
                 }
@@ -846,6 +1038,7 @@ namespace
     {
         pilot.offMesh = false;
         pilot.timedBy.Clear();
+        pilot.hopBlocked = false;
         for (float radius : kSearchRings)
             if (pilot.offMesh)
                 return nullptr;
@@ -879,7 +1072,7 @@ namespace
                                     me->GetName(), first->GetName(), first->GetEntry(), found->GetName());
                                 found = first;
                             }
-                            return found;
+                            return pilot.hopBlocked ? nullptr : found;
                         }
                 if (Creature* boss = BossOf(found))
                     if (LuresFirst(me, boss))
@@ -893,6 +1086,7 @@ namespace
                         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s (entry %u) is cleared before %s",
                             me->GetName(), trash->GetName(), trash->GetEntry(), boss->GetName());
                         found = trash;
+                        pilot.roomTrash = trash->GetObjectGuid();
                         if (Patrols(boss))
                             pilot.timedBy = boss->GetObjectGuid();   // his room's packs are pulled while he walks away
                     }
@@ -904,6 +1098,80 @@ namespace
                     sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s (entry %u) stands in the way of %s - it goes first",
                         me->GetName(), first->GetName(), first->GetEntry(), found->GetName());
                     found = first;
+                }
+                if (pilot.hopBlocked)
+                    return nullptr;   // CorridorSkipHolds: it waits with the skipped patrol in front of it
+                // [TACTICS] 2026-11-21 P56750 (Firewalker + Flameguard + 2x Lava Elemental): pulled by its Firewalker twice, 40/40
+                // twice; the R4W8 drill cleared it 9 of 9 times when a Lava Elemental was the one pulled (the one fail: its
+                // Flameguard). A Firewalker/Flameguard target is swapped for a pullable Lava Elemental of its own pack.
+                // Gated by SuiTactic::LavaPackPullByElemental.
+                if (found && (found->GetEntry() == 11666 || found->GetEntry() == 11667) &&
+                    SuiTactic::On(me, SuiTactic::LavaPackPullByElemental, found))
+                    if (CreatureGroup* g = found->GetCreatureGroup())
+                    {
+                        Creature* elemental = nullptr;
+                        std::list<Creature*> near;
+                        found->GetCreatureListWithEntryInGrid(near, 12076, 40.0f);
+                        for (Creature* c : near)
+                            if (c->GetCreatureGroup() == g && Pullable(me, c, pilot) &&
+                                (!elemental || me->GetDistance(c) < me->GetDistance(elemental)))
+                                elemental = c;
+                        if (elemental)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s's pack is pulled by its Lava Elemental (guid %u)",
+                                me->GetName(), found->GetName(), elemental->GetGUIDLow());
+                            found = elemental;
+                        }
+                    }
+                // [TACTICS] 2026-11-16 R3W6 MC: a Lava Surger skipped for having no ambush walked into the Lava Elemental
+                // pack pulled next (+16 s, an Ancient Core Hound at +46 s, 40/40). A skipped patroller within 60 yd of the
+                // next pack times that pull like a walking boss: it goes while he is 75 yd off and walking away.
+                // Gated by SuiTactic::SkipUnambushablePatrol.
+                if (pilot.timedBy.IsEmpty())
+                {
+                    uint32 const nowMs = WorldTimer::getMSTime();
+                    for (auto const& sk : pilot.skip)
+                    {
+                        if (nowMs >= sk.second)
+                            continue;
+                        Creature* walker = me->GetMap()->GetCreature(sk.first);
+                        if (!walker || walker == found || !walker->IsAlive() || walker->IsInCombat() || !Patrols(walker) ||
+                            walker->GetDistance(found) > 60.0f || !SuiTactic::On(me, SuiTactic::SkipUnambushablePatrol, walker))
+                            continue;
+                        pilot.timedBy = walker->GetObjectGuid();
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s (entry %u) is pulled while the skipped %s walks away (%.0f yd from it)",
+                            me->GetName(), found->GetName(), found->GetEntry(), walker->GetName(), walker->GetDistance(found));
+                        break;
+                    }
+                }
+                // [TACTICS] 2026-11-21 R4W5 03:00/03:21, R4W6 09:07 (P56729 + Lava Surger R56849, three wipes): a patrol found
+                // with no clear ambush only minutes ago (notFirstUntil, not yet skipped) whose walk passes within 30 yd of the
+                // next pack times that pull the same way. Gated by SuiTactic::CrowdedPatrolTimesPull.
+                // (R4W10 02:25: never for a target that walks itself - "Ancient Core Hound is pulled while Ancient Core Hound walks
+                // away" sent the leader between two crossing hounds, 40/40)
+                if (pilot.timedBy.IsEmpty() && !Patrols(found))
+                {
+                    uint32 const nowMs = WorldTimer::getMSTime();
+                    for (auto const& nf : pilot.notFirstUntil)
+                    {
+                        if (nowMs >= nf.second)
+                            continue;
+                        Creature* walker = me->GetMap()->GetCreature(nf.first);
+                        if (!walker || walker == found || !walker->IsAlive() || walker->IsInCombat() || !Patrols(walker) ||
+                            walker->IsWorldBoss() || !SuiTactic::On(me, SuiTactic::CrowdedPatrolTimesPull, walker))
+                            continue;
+                        float nearest = 1e9f;
+                        ForEachRoutePoint(walker, [&](float x, float y, float z)
+                        {
+                            nearest = std::min(nearest, found->GetDistance(x, y, z));
+                        });
+                        if (nearest > 30.0f && walker->GetDistance(found) > 60.0f)
+                            continue;
+                        pilot.timedBy = walker->GetObjectGuid();
+                        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s (entry %u) is pulled while %s walks away - no clear ambush for it, its walk passes %.0f yd from the pack",
+                            me->GetName(), found->GetName(), found->GetEntry(), walker->GetName(), nearest);
+                        break;
+                    }
                 }
                 return found;
             }
@@ -1717,6 +1985,31 @@ namespace
         std::vector<Spot> near;
         ForeignIdle(me, boss, boss->GetDistance(lx, ly, lz) + 80.0f, near);
         float best = 1e9f;
+        // [TACTICS] 2026-11-20 R4W3 MC Lucifron 100 %: the lure ran with pack A alive (RAID_MAP: its lure is 22 yd from
+        // P56634, inside its idle reach) - the hounds were not "idle" at that moment, so this clearance passed, and all
+        // five joined at +0 s. Every LIVING Core Hound within 40 yd of his lure counts here, idle, evading or lying down.
+        // Gated by SuiTactic::LureNeedsPackDead.
+        if (SuiTactic::On(me, SuiTactic::LureNeedsPackDead, boss))
+        {
+            std::list<Creature*> hounds;
+            me->GetCreatureListWithEntryInGrid(hounds, 11671, me->GetDistance2d(lx, ly) + 45.0f);
+            for (Creature* h : hounds)
+            {
+                if (!h->IsAlive())
+                    continue;
+                float const d = h->GetDistance2d(lx, ly);
+                if (d < 40.0f && d < best)
+                {
+                    best = d;
+                    if (nearestOut)
+                        *nearestOut = h;
+                    if (nxOut)
+                        *nxOut = h->GetPositionX();
+                    if (nyOut)
+                        *nyOut = h->GetPositionY();
+                }
+            }
+        }
         for (Spot const& sp : near)
             if (sp.who && !(sp.who->GetDefaultMovementType() == WAYPOINT_MOTION_TYPE &&
                             sp.x != sp.who->GetPositionX()))   // the creatures, not other walkers' routes
@@ -2086,8 +2379,27 @@ namespace
                 }
             }
         }
+        // [TACTICS] 2026-11-19 R4W1 MC 16:50: the corridor plan for a Lava Surger walking through the imp room took a pull
+        // spot 1 yd and a camp 13 yd from idle packs - at the pull spot the Surger and two imp packs engaged together,
+        // 40/40 in 78 s. A corridor plan needs both spots 20 yd clear of idle packs; otherwise there is no plan and the
+        // patrol is skipped like any unambushable one (SuiTactic::CorridorClearOfPacks).
+        if (corridor && (bestDp < 20.0f || bestDc < 20.0f) && SuiTactic::On(me, SuiTactic::CorridorClearOfPacks, target))
+        {
+            Note(pilot, me, "corridor plan for %s refused: pull spot %.0f yd and camp %.0f yd from idle packs (20 needed)",
+                target->GetName(), std::min(bestDp, 999.0f), std::min(bestDc, 999.0f));
+            pilot.corridorRefusedMs = WorldTimer::getMSTime();
+            pilot.noPlanMs = pilot.corridorRefusedMs;
+            corridor = false;
+            bestScore = 1e9f;
+        }
         if (bestScore > 1e8f)
         {
+            // (R4W3 MC 10:36: no ring plan and no corridor for a Lava Surger crossing the imp room - the leader walked on
+            // toward it and the imps woke, 40/40. Any failed plan for a patrol waits at the clear spot like a refused
+            // corridor - SuiTactic::CorridorClearOfPacks, the wait below "crowdedButClear")
+            if (Patrols(target) && SuiTactic::On(me, SuiTactic::CorridorClearOfPacks, target))
+                pilot.corridorRefusedMs = WorldTimer::getMSTime();
+            pilot.noPlanMs = WorldTimer::getMSTime();
             Note(pilot, me, "no plan for %s: refused ground/lava %u, pack reach %u, no sight %u, camp level/sight %u, no path to camp %u, pull-to-camp %u, pack-to-camp %u, run back long %u, walk past it %u, camp on %s's walk %u",
                 target->GetName(), refused[0], refused[1], refused[2], refused[3], refused[4], refused[5], refused[6], refused[7], refused[8],
                 walker ? walker->GetName() : "a boss", refused[9]);
@@ -2178,6 +2490,33 @@ namespace
             return false;
         std::vector<Spot> foreign;
         ForeignIdle(me, target, 320.0f, foreign);
+        // [TACTICS] 2026-11-20 R4W4 MC 17:43-19:01: Garr's two Ancient Core Hounds R56855 and R56857 walk lines that cross
+        // (R56855 point 8 is 6 yd from R56857 point 4). Each one's whole walk counted as an idle pack in the other's ambush,
+        // so neither ambush ever reached patrol-ambush-clear's 35 yd (20 / 25 yd); both were skipped, RoomTrash took them
+        // back for Garr, and the raid re-chose them ~4400 times in 78 min (R4W3: a similar ACH loop, 30 min). Another LONE trash patrol counts
+        // where it stands now, not along its walk; real packs and bosses still count as before. Gated by
+        // SuiTactic::PatrolWalksOverlap.
+        float withWalks = -1.0f;
+        bool const overlapRule = !target->IsWorldBoss() && SuiTactic::On(me, SuiTactic::PatrolWalksOverlap, target);
+        if (overlapRule)
+        {
+            ForEachRoutePoint(target, [&](float x, float y, float z) { withWalks = std::max(withWalks, Nearest(foreign, x, y, z)); });
+            auto loneWalker = [target](Creature const* c)
+            {
+                return c && c != target && !c->IsWorldBoss() && !c->GetCreatureGroup() && Patrols(c);
+            };
+            std::vector<Creature*> walkers;
+            foreign.erase(std::remove_if(foreign.begin(), foreign.end(), [&](Spot const& s)
+            {
+                if (!loneWalker(s.who))
+                    return false;
+                if (std::find(walkers.begin(), walkers.end(), s.who) == walkers.end())
+                    walkers.push_back(s.who);
+                return true;
+            }), foreign.end());
+            for (Creature* w : walkers)
+                foreign.push_back({ w->GetPositionX(), w->GetPositionY(), w->GetPositionZ(), w });
+        }
         float best = -1.0f;
         ForEachRoutePoint(target, [&](float x, float y, float z)
         {
@@ -2191,6 +2530,18 @@ namespace
             }
         });
         clearance = best;
+        if (overlapRule && best > withWalks + 0.5f)
+        {
+            static std::unordered_map<uint32, uint32> lastNote;   // spawn guid -> ms
+            uint32 const nowMs = WorldTimer::getMSTime();
+            uint32& last = lastNote[target->GetDBTableGUIDLow()];
+            if (!last || nowMs - last > 60 * 1000)
+            {
+                last = nowMs;
+                sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s: %s (spawn %u) ambush counts other lone patrols where they stand: clearance %.0f yd (with their walks %.0f yd) at (%.0f, %.0f)",
+                    me->GetName(), target->GetName(), target->GetDBTableGUIDLow(), best, withWalks, qx, qy);
+            }
+        }
         return best >= 0.0f;
     }
 
@@ -2389,6 +2740,21 @@ namespace
                     me->UpdateAllowedPositionZ(lx, ly, lz);
                     std::vector<Spot> foreign;
                     ForeignIdle(me, target, 140.0f, foreign);
+                    // The stretches of his walk that pass within 20 yd of an idle pack: noticed there, he brings
+                    // it (creatures call for help 10 yd around them, 1.5 s later). The camp and the raid's spot
+                    // stay beyond his aggro reach of them (2026-11-15, R3W0 MC: Baron Geddon noticed the raid
+                    // 38 yd off as he ran past the Firewalker pack - it joined 2 s later, 40 dead at 98 %, x3).
+                    std::vector<Spot> hot, packs;
+                    for (Spot const& sp : foreign)
+                        if (sp.who && !(sp.who->GetDefaultMovementType() == WAYPOINT_MOTION_TYPE && sp.x != sp.who->GetPositionX()))
+                            packs.push_back(sp);
+                    if (SuiTactic::On(me, SuiTactic::HotWalkCamp, target))
+                    ForEachRoutePoint(target, [&](float x, float y, float z)
+                    {
+                        if (Nearest(packs, x, y, z) < 20.0f)
+                            hot.push_back({x, y, z, nullptr});
+                    });
+                    float const hotReach = AggroReach(me, target) + 6.0f;
                     // The camp: on the lure's level, in its sight, and a walk the boss can make (2026-11-04: a
                     // camp picked by hand stood on a rock 4 yd up - the healers had no sight of the tanks
                     // below and Geddon, unable to reach the one he wanted, evaded after 24 s). Clear of
@@ -2396,7 +2762,8 @@ namespace
                     auto campOk = [&](float x, float y, float& z)
                     {
                         if (!Ground(me, x, y, z) || std::fabs(z - lz) > 3.0f || Molten(me, x, y, z) ||
-                            !me->GetMap()->isInLineOfSight(x, y, z + 2.0f, lx, ly, lz + 2.0f))
+                            !me->GetMap()->isInLineOfSight(x, y, z + 2.0f, lx, ly, lz + 2.0f) ||
+                            Nearest(hot, x, y, z) < hotReach)
                             return false;
                         PathInfo mine(me);
                         mine.calculate(x, y, z, false);
@@ -2418,7 +2785,7 @@ namespace
                     if (!campFound)
                     {
                         float bestScore = -1e9f;
-                        for (float r : {18.0f, 22.0f, 26.0f})
+                        for (float r : {18.0f, 22.0f, 26.0f, 32.0f, 38.0f})
                             for (int i = 0; i < 24; ++i)
                             {
                                 float const a = i * float(M_PI) / 12.0f;
@@ -2485,6 +2852,8 @@ namespace
                         if (pilot.hasRear)
                             Note(pilot, me, "the raid waits at (%.0f, %.0f), %.0f yd from the nearest idle pack; the tanks at the camp",
                                 pilot.rearX, pilot.rearY, bestClear);
+                        Note(pilot, me, "%s: %u walk point(s) within 20 yd of a pack; camp %.0f yd, lure %.0f yd from them (his reach %.0f)",
+                            target->GetName(), uint32(hot.size()), Nearest(hot, cx, cy, cz), Nearest(hot, lx, ly, lz), hotReach);
                     }
                     Note(pilot, me, "%s: playbook lure at (%.0f, %.0f), %.0f yd off its walk - the raid camps at (%.0f, %.0f)",
                         target->GetName(), lx, ly, std::sqrt(best), cx, cy);
@@ -2505,8 +2874,14 @@ namespace
                         // Geddon ambushed with a pack 41 yd from the camp - it joined at +31 s, a second
                         // one at +34 s, wipe with Geddon at 63 %).
                         bool const bossFight = target->IsWorldBoss();
+                        // [TACTICS] 2026-11-20 R4W2 MC 01:16: a trash patrol's ambush point had no clearance test - the
+                        // Ancient Core Hound R56855 was ambushed 28 yd from Garr's centre (his reach ring is 42 yd) and
+                        // Garr's pack joined at +7 s, 40/40. A patrol of these kinds is ambushed only 35 yd from idle packs;
+                        // closer, it is "no clear ambush" (the packs on its walk first, skipped after three, the next pull
+                        // timed around it). Gated by SuiTactic::PatrolAmbushClear.
                         bool const crowded = pilot.planRoute < 15.0f || pilot.planDc < (bossFight ? 40.0f : 20.0f) ||
-                            (bossFight && clear < 28.0f);
+                            (bossFight && clear < 28.0f) ||
+                            (!bossFight && clear < 35.0f && SuiTactic::On(me, SuiTactic::PatrolAmbushClear, target));
                         // A crowded ambush (the walk or the camp beside another pack) clears that pack
                         // first (2026-11-03: Geddon's ambush route passed 1 yd from three packs, camp 6 yd
                         // from one - the raid walked through them and Geddon came on top).
@@ -2541,11 +2916,72 @@ namespace
                         // Still crowded and nothing to clear first: no ambush through other packs - the packs
                         // along his walk go first, timed (2026-11-04: Geddon's route at 0 yd from a pack,
                         // walked into it, Geddon on top - three wipes).
+                        // [TACTICS] 2026-11-21 R4W5 MC 01:19-01:40: Garr waits for his last Ancient Core Hound (RoomTrash
+                        // ignores skips on purpose) and the hound waits for a 35 yd ambush that his room never gives (best
+                        // 26 yd): 414 re-choices. A patrol a boss waits for is tagged where it walks once nothing idle stands
+                        // within 22 yd of it (the far end of its walk) and fought at the planned camp (48 yd clear); until
+                        // then the raid waits safe, no skip. Gated by SuiTactic::RoomPatrolTagToCamp.
+                        if (crowded && pilot.roomTrash == pilot.target && !bossFight &&
+                            SuiTactic::On(me, SuiTactic::RoomPatrolTagToCamp, target))
+                        {
+                            // (R4W6 07:29-07:47: "nothing idle within 22 yd" never came - 18 min of waiting. The hound is
+                            // tagged at the clearest point of its own walk instead: its clearance from idle packs is watched
+                            // for 90 s, then it is tagged once it is back within 2 yd of the best seen.)
+                            static std::unordered_map<uint64, uint32> waitNoteMs;
+                            static std::unordered_map<uint64, std::pair<float, uint32>> walkBest;   // best clearance, watched since
+                            uint32 const nowMs = WorldTimer::getMSTime();
+                            std::vector<Spot> others;
+                            ForeignIdle(me, target, 320.0f, others);
+                            others.erase(std::remove_if(others.begin(), others.end(), [target](Spot const& sp) { return sp.who == target; }), others.end());
+                            float const here = Nearest(others, target->GetPositionX(), target->GetPositionY(), target->GetPositionZ());
+                            auto& wb = walkBest[target->GetObjectGuid().GetRawValue()];
+                            if (wb.second == 0 || nowMs - wb.second > 15 * 60 * 1000)
+                                wb = { here, nowMs };
+                            wb.first = std::max(wb.first, here);
+                            if (nowMs - wb.second >= 90000 && here >= wb.first - 2.0f)
+                            {
+                                Note(pilot, me, "%s: a boss waits for it and no ambush is clear (ambush point %.0f yd) - tagged at the clearest point of its walk (%.0f yd from idle packs, best %.0f), fought at the camp",
+                                    target->GetName(), std::min(clear, 999.0f), here, wb.first);
+                                wb = { 0.0f, 0 };
+                                pilot.noAmbush = pilot.target;
+                                pilot.planned = false;
+                                pilot.phase = Phase::Approach;
+                                pilot.stuckMs = 0;
+                                pilot.bestDist = me->GetDistance(target);
+                                return true;
+                            }
+                            uint32& next = waitNoteMs[target->GetObjectGuid().GetRawValue()];
+                            if (nowMs >= next)
+                            {
+                                next = nowMs + 30000;
+                                Note(pilot, me, "%s: a boss waits for it and no ambush is clear (ambush point %.0f yd) - watching its walk: %.0f yd from idle packs now, best %.0f in %u s",
+                                    target->GetName(), std::min(clear, 999.0f), here, wb.first, (nowMs - wb.second) / 1000);
+                            }
+                            pilot.planned = false;
+                            me->StopMoving();
+                            MoveToSafe(me, pilot);
+                            return false;
+                        }
                         if (crowded)
                         {
                             Note(pilot, me, "%s: no clear way to an ambush (route %.0f yd, camp %.0f yd, ambush point %.0f yd) - the packs on his walk go first",
                                 target->GetName(), pilot.planRoute, pilot.planDc, std::min(clear, 999.0f));
                             pilot.notFirstUntil[pilot.target] = WorldTimer::getMSTime() + 10 * 60 * 1000;
+                            // [TACTICS] 2026-11-16 R3W5 MC: with nothing else pullable the same Lava Surger came back
+                            // as "next" 1786 times in 35 min and the raid never reached Golemagg; the third time running
+                            // it is skipped for 15 min. Gated by SuiTactic::SkipUnambushablePatrol.
+                            if (SuiTactic::On(me, SuiTactic::SkipUnambushablePatrol, target))
+                            {
+                                static std::unordered_map<uint64, uint32> noAmbush;
+                                uint32& times = noAmbush[target->GetObjectGuid().GetRawValue()];
+                                if (++times >= 3)
+                                {
+                                    times = 0;
+                                    pilot.skip[pilot.target] = WorldTimer::getMSTime() + 15 * 60 * 1000;
+                                    pilot.ambushSkipped[pilot.target] = 1;
+                                    Note(pilot, me, "%s: no ambush three times running - skipped for 15 min", target->GetName());
+                                }
+                            }
                             pilot.phase = Phase::Idle;
                             pilot.target.Clear();
                             pilot.planned = false;
@@ -2588,8 +3024,45 @@ namespace
                     pilot.bestDist = me->GetDistance(walker);
                     return true;
                 }
+            // [TACTICS] 2026-11-22 R4W11 08:35 + R4W12 14:54 (Gehennas' room, 40/40 both weeks): a Firelord pulled 16-18 yd from the
+            // idle Molten Giant + Destroyer pack P56708 woke it (+4 s / +55 s); three elites and the Firelord's Lava Spawn splits
+            // outlasted the raid. P56708 as the pulled target is 23-0: an idle Giant/Destroyer within 20 yd of a Firelord/Annihilator
+            // pull goes first. Gated by SuiTactic::GiantPackBeforeFirelord.
+            if (!pilot.planned && pilot.planHoldMs == 0 && dist <= 180.0f && pilot.crowdHops < 3 &&
+                (target->GetEntry() == 11668 || target->GetEntry() == 11665))
+            {
+                Creature* giant = target->FindNearestCreature(11658, 20.0f, true);
+                if (!giant || giant->IsInCombat())
+                    giant = target->FindNearestCreature(11659, 20.0f, true);
+                if (giant && !giant->IsInCombat() && !Patrols(giant) &&
+                    SuiTactic::On(me, SuiTactic::GiantPackBeforeFirelord, giant) && Pullable(me, giant, pilot) &&
+                    PathLength(me, giant->GetPositionX(), giant->GetPositionY(), giant->GetPositionZ()) >= 0.0f)
+                {
+                    ++pilot.crowdHops;
+                    Note(pilot, me, "%s (entry %u, spawn %u) stands %.0f yd from %s - the giant pack goes first", giant->GetName(),
+                        giant->GetEntry(), giant->GetDBTableGUIDLow(), giant->GetDistance(target), target->GetName());
+                    pilot.target = giant->GetObjectGuid();
+                    pilot.targetEntry = giant->GetEntry();
+                    pilot.planned = false;
+                    pilot.crowdWaitMs = 0;
+                    pilot.stuckMs = 0;
+                    pilot.bestDist = me->GetDistance(giant);
+                    return true;
+                }
+            }
+            // [TACTICS] 2026-11-22 R4W9 23:39 + R4W10 05:13: a camp 34 / 46 yd from an idle Lava pack - it woke as the raid spread
+            // (21 dead, 40/40). A sleeping Lava elite reaches 34 yd and the raid spreads ~20 yd round its camp: closer than 55 yd to
+            // one, the pull is crowded and that pack goes first. Gated by SuiTactic::LavaPackCampClear.
+            auto lavaCrowded = [&]() -> bool
+            {
+                if (pilot.planDc >= 55.0f || pilot.crowder.IsEmpty())
+                    return false;
+                Creature* cr = me->GetMap()->GetCreature(pilot.crowder);
+                return cr && cr != target && cr->IsAlive() && !cr->IsInCombat() && !Patrols(cr) &&
+                    SuiTactic::On(me, SuiTactic::LavaPackCampClear, cr);
+            };
             if (!pilot.planned && pilot.planHoldMs == 0 && dist <= 180.0f && PlanPull(me, target, pilot) &&
-                (pilot.planDc < 35.0f || pilot.planDp < 22.0f || pilot.planRoute < 15.0f))
+                (pilot.planDc < 35.0f || pilot.planDp < 22.0f || pilot.planRoute < 15.0f || lavaCrowded()))
             {
                 // Crowded: no side of this pack keeps the raid clear of the next one. A patrol
                 // walks on - wait for it to be somewhere better. A pack that stands still has its
@@ -2672,6 +3145,66 @@ namespace
                 }
             }
         crowdedButClear:
+            // [TACTICS] 2026-11-19 R4W1 MC 17:21: the corridor plan for a Lava Surger in the imp room was refused four times
+            // (pull spot 1-5 yd from idle packs) and the leader walked on toward it anyway, to (995, -886) beside imp pack
+            // P56594 - the Surgers and the imps engaged together, 40/40. A patrol whose corridor plan was just refused is
+            // waited for at the clear spot; after 120 s of that it is skipped for 10 min (SuiTactic::CorridorClearOfPacks).
+            if (!pilot.planned && pilot.corridorRefusedMs && WorldTimer::getMSTime() - pilot.corridorRefusedMs < 5000 &&
+                Patrols(target) && SuiTactic::On(me, SuiTactic::CorridorClearOfPacks, target))
+            {
+                pilot.corridorWaitMs += step;
+                if (pilot.corridorWaitMs >= 120000)
+                {
+                    Note(pilot, me, "%s: no corridor plan clear of packs for 120 s - skipped for 10 min", target->GetName());
+                    pilot.skip[pilot.target] = WorldTimer::getMSTime() + 10 * 60 * 1000;
+                    pilot.corridorSkip[pilot.target] = pilot.skip[pilot.target];
+                    pilot.corridorWaitMs = 0;
+                    pilot.corridorRefusedMs = 0;
+                    pilot.phase = Phase::Idle;
+                    pilot.target.Clear();
+                    pilot.planned = false;
+                    return false;
+                }
+                if (!MoveToSafe(me, pilot) && me->IsMoving())
+                    me->StopMoving();
+                return true;
+            }
+            // [TACTICS] 2026-11-23 R4W14 23:35-23:38, corridor pack P56786: the corridor plan for Firelord 56796 was refused 13
+            // times in a row while the leader kept walking at it, from (1130,-525) to (1176,-595); it aggroed at 25 yd with no
+            // plan, the camp was his own spot 12 yd off Lava Surger R56839's walk - Surger at +14 s, Ancient Core Hound R56854 at
+            // +34 s, 40/40. R4W6 05:57 was the same pack and the same walk-in. A Firelord/Annihilator that has no plan is not
+            // walked at: the raid holds at the clear spot; after 60 s it is skipped once for 10 min (the packs crowding it go
+            // first); the second time round the old behaviour applies. Gated by SuiTactic::NoPlanNoWalkIn.
+            if (!pilot.planned && pilot.noPlanMs && WorldTimer::getMSTime() - pilot.noPlanMs < 5000 && !Patrols(target) &&
+                pilot.noPlanSkipped.find(pilot.target) == pilot.noPlanSkipped.end() &&
+                SuiTactic::On(me, SuiTactic::NoPlanNoWalkIn, target))
+            {
+                if (pilot.noPlanTarget != pilot.target)
+                {
+                    pilot.noPlanTarget = pilot.target;
+                    pilot.noPlanWaitMs = 0;
+                    Note(pilot, me, "%s (spawn %u) has no pull plan - the raid holds at the clear spot instead of walking in",
+                        target->GetName(), target->GetDBTableGUIDLow());
+                }
+                pilot.noPlanWaitMs += step;
+                if (pilot.noPlanWaitMs >= 60000)
+                {
+                    Note(pilot, me, "%s (spawn %u): no pull plan for 60 s - skipped for 10 min, the packs around it go first",
+                        target->GetName(), target->GetDBTableGUIDLow());
+                    pilot.skip[pilot.target] = WorldTimer::getMSTime() + 10 * 60 * 1000;
+                    pilot.noPlanSkipped[pilot.target] = 1;
+                    pilot.noPlanWaitMs = 0;
+                    pilot.noPlanMs = 0;
+                    pilot.noPlanTarget.Clear();
+                    pilot.phase = Phase::Idle;
+                    pilot.target.Clear();
+                    pilot.planned = false;
+                    return false;
+                }
+                if (!MoveToSafe(me, pilot) && me->IsMoving())
+                    me->StopMoving();
+                return true;
+            }
             if (!pilot.planned && pilot.planHoldMs > 0 && pilot.crowdWaitMs > 0 && pilot.crowdWaitMs < 120000)
             {
                 MoveToSafe(me, pilot);   // still waiting out the patrol
@@ -2739,6 +3272,7 @@ namespace
                     Note(pilot, me, "the walk to %s passes %s (%.0f yd) - it waits", target->GetName(), bossNear->GetName(),
                         me->GetDistance(bossNear));
                     pilot.skip[pilot.target] = WorldTimer::getMSTime() + 3 * 60 * 1000;
+                    pilot.bossPassSkip[pilot.target] = pilot.skip[pilot.target];
                     pilot.phase = Phase::Idle;
                     pilot.target.Clear();
                     pilot.planned = false;
@@ -2747,14 +3281,105 @@ namespace
                     return false;
                 }
                 // The boss the pull is timed around comes near while the raid walks in: back to the clear spot.
-                if (timed && timed->IsAlive() && !timed->IsInCombat() && me->GetDistance(timed) < 60.0f)
+                // [TACTICS] 2026-11-16 R3W4 MC Geddon: the back-off began at the leader's 51 yd while a rogue walking ahead
+                // was 9 yd from him; he woke and brought his Firewalker pack. Gated by SuiTactic::PatrolBackoffWholeRaid.
+                bool memberNear = false;
+                if (timed && SuiTactic::On(me, SuiTactic::PatrolBackoffWholeRaid, timed) && me->GetGroup())
+                    for (GroupReference* itr = me->GetGroup()->GetFirstMember(); itr && !memberNear; itr = itr->next())
+                        if (Player* m = itr->getSource())
+                            if (m->IsAlive() && m->IsInMap(me) && m->GetDistance(timed) < 50.0f)
+                                memberNear = true;
+                // (never from the pull target itself: R3W15 a skipped Lava Surger timed its own pull and the leader backed off
+                // from it 15 min - "Lava Surger comes near on the walk to Lava Surger" - 2026-11-17, same gate)
+                if (timed && timed != target && timed->IsAlive() && !timed->IsInCombat() && (me->GetDistance(timed) < 60.0f || memberNear))
                 {
                     if (pilot.lastEvent.find("comes near") == std::string::npos)
                         Note(pilot, me, "%s comes near (%.0f yd) on the walk to %s - backing off", timed->GetName(),
                             me->GetDistance(timed), target->GetName());
+                    // [TACTICS] 2026-11-23 R4W15 04:50-05:00, imp room: a skipped Lava Surger loitered 42-57 yd from the walk to a
+                    // Flame Imp pack and the leader backed off from it every second for 10 min (594 notes, no pull); the loop
+                    // ended when the Surger was taken first (05:06, 27 s, 0 dead). After 120 s of backing off from the same
+                    // walker for the same pull, the walker is the next pull. Gated by SuiTactic::TimedWalkerGoesFirst.
+                    if (pilot.comeNearTarget != pilot.target)
+                    {
+                        pilot.comeNearTarget = pilot.target;
+                        pilot.comeNearMs = 0;
+                    }
+                    pilot.comeNearMs += step;
+                    auto cs = pilot.corridorSkip.find(timed->GetObjectGuid());
+                    bool const corridorHeld = cs != pilot.corridorSkip.end() && WorldTimer::getMSTime() < cs->second;
+                    if (pilot.comeNearMs >= 120000 && !corridorHeld && SuiTactic::On(me, SuiTactic::TimedWalkerGoesFirst, timed) &&
+                        Pullable(me, timed, pilot, true) &&
+                        PathLength(me, timed->GetPositionX(), timed->GetPositionY(), timed->GetPositionZ()) >= 0.0f)
+                    {
+                        Note(pilot, me, "%s (spawn %u) has come near the walk to %s for 120 s - it goes first", timed->GetName(),
+                            timed->GetDBTableGUIDLow(), target->GetName());
+                        pilot.skip.erase(timed->GetObjectGuid());
+                        pilot.comeNearMs = 0;
+                        pilot.comeNearTarget.Clear();
+                        pilot.target = timed->GetObjectGuid();
+                        pilot.targetEntry = timed->GetEntry();
+                        pilot.timedBy.Clear();
+                        pilot.planned = false;
+                        pilot.stuckMs = 0;
+                        pilot.bestDist = me->GetDistance(timed);
+                        return true;
+                    }
+                    // [TACTICS] 2026-11-16 R3W5 MC Lucifron: MoveToSafe gives no order while the leader is walking, so
+                    // "backing off" went on walking to the Core Hounds - 56 -> 26 yd from Lucifron in 4 s, he and five
+                    // hounds woke on the leader (40/40). Here the back-off replaces the walk: to the clear spot when it lies
+                    // further from him, else 20 yd straight away from him. Gated by SuiTactic::BackoffAwayFromWalker.
+                    if (SuiTactic::On(me, SuiTactic::BackoffAwayFromWalker, timed))
+                    {
+                        static std::unordered_map<uint32, uint32> nextOrder;
+                        uint32 const nowMs = WorldTimer::getMSTime();
+                        uint32& next = nextOrder[me->GetGUIDLow()];
+                        if (nowMs >= next)
+                        {
+                            next = nowMs + 1500;
+                            float const dMe = me->GetDistance2d(timed);
+                            float tx, ty, tz;
+                            if (pilot.hasSafe && timed->GetDistance2d(pilot.safeX, pilot.safeY) > dMe + 10.0f)
+                            {
+                                tx = pilot.safeX; ty = pilot.safeY; tz = pilot.safeZ;
+                            }
+                            else
+                            {
+                                float dx = me->GetPositionX() - timed->GetPositionX(), dy = me->GetPositionY() - timed->GetPositionY();
+                                float const len = std::max(1.0f, std::sqrt(dx * dx + dy * dy));
+                                tx = me->GetPositionX() + dx / len * 20.0f;
+                                ty = me->GetPositionY() + dy / len * 20.0f;
+                                tz = me->GetPositionZ();
+                                me->UpdateAllowedPositionZ(tx, ty, tz);
+                            }
+                            me->GetMotionMaster()->MovePoint(0, tx, ty, tz, MOVE_PATHFINDING | MOVE_RUN_MODE);
+                        }
+                        return true;
+                    }
                     if (!MoveToSafe(me, pilot) && me->IsMoving())
                         me->StopMoving();
                     return true;
+                }
+                // [TACTICS] 2026-11-23 R4W18 MC 18:04-18:07, corridor: the Lava Surger skipped 15 min for having no ambush was
+                // un-skipped 52 s later as standing 28 yd from the walk to a Molten Destroyer; it woke on the way in and five
+                // Firelords/Annihilators plus an Ancient Core Hound joined, 40/40 in 106 s. A patrol skipped for having no ambush
+                // stays skipped; the pull whose walk passes it waits with it. Gated by SuiTactic::AmbushSkipHolds.
+                if (passing && pilot.ambushSkipped.count(passing->GetObjectGuid()))
+                {
+                    auto as = pilot.skip.find(passing->GetObjectGuid());
+                    if (as != pilot.skip.end() && WorldTimer::getMSTime() < as->second &&
+                        SuiTactic::On(me, SuiTactic::AmbushSkipHolds, passing))
+                    {
+                        Note(pilot, me, "%s (spawn %u) is skipped for having no ambush and stands %.0f yd from the walk to %s - it waits with it",
+                            passing->GetName(), passing->GetDBTableGUIDLow(), best, target->GetName());
+                        pilot.skip[pilot.target] = as->second;
+                        pilot.phase = Phase::Idle;
+                        pilot.target.Clear();
+                        pilot.planned = false;
+                        if (!MoveToSafe(me, pilot) && me->IsMoving())
+                            me->StopMoving();
+                        return false;
+                    }
                 }
                 if (passing)
                 {
@@ -3137,6 +3762,12 @@ namespace
             }
             // Timed around a patrolling boss: pulled only while he is well away from the pack, the camp
             // and the leader (75 yd: his walk back takes longer than the fight).
+            // [TACTICS] 2026-11-23 R4W15 05:00-05:06, imp room: the Lava Surger the imp pull was timed around became the target
+            // itself, and the raid waited "for Lava Surger to walk away from Lava Surger (pack 0 ...)" until the 300 s cap. A pull
+            // is never timed around its own target. Gated by SuiTactic::TimedWaitNotSelf.
+            if (!pilot.timedBy.IsEmpty() && pilot.timedBy == pilot.target &&
+                SuiTactic::On(me, SuiTactic::TimedWaitNotSelf, target))
+                pilot.timedBy.Clear();
             if (!pilot.timedBy.IsEmpty() && pilot.timedWaitMs < 300000)
                 if (Creature* walker = me->GetMap()->GetCreature(pilot.timedBy))
                     if (walker->IsAlive() && !walker->IsInCombat())
@@ -3184,6 +3815,26 @@ namespace
                             if (!toCamp)
                                 me->GetMotionMaster()->MovePoint(0, pilot.campX, pilot.campY, pilot.campZ,
                                     MOVE_PATHFINDING | MOVE_RUN_MODE);
+                            return true;
+                        }
+                        // [TACTICS] 2026-11-16 R3W8 MC Lucifron: the raid waited at a camp on his walk while he came at it
+                        // ("waiting for Lucifron to walk away": camp 91 -> 67 -> 43 yd) and he joined with five Core Hounds,
+                        // twice (38/40, 40/40). While he closes on the camp inside 60 yd the leader leaves it, 30 yd straight
+                        // away from him, and the pull is planned again once he walks off. Gated by SuiTactic::BackoffAwayFromWalker.
+                        if (!out && closing && dC < 60.0f && SuiTactic::On(me, SuiTactic::BackoffAwayFromWalker, walker))
+                        {
+                            float dx = me->GetPositionX() - walker->GetPositionX(), dy = me->GetPositionY() - walker->GetPositionY();
+                            float const len = std::max(1.0f, std::sqrt(dx * dx + dy * dy));
+                            float tx = me->GetPositionX() + dx / len * 30.0f, ty = me->GetPositionY() + dy / len * 30.0f;
+                            float tz = me->GetPositionZ();
+                            me->UpdateAllowedPositionZ(tx, ty, tz);
+                            Note(pilot, me, "%s walks at the camp (%.0f yd) - the raid leaves it, 30 yd away from him",
+                                walker->GetName(), dC);
+                            pilot.planned = false;
+                            pilot.planHoldMs = 6000;   // R3W13: without the hold the next tick planned the same camp and the leader never left it
+                            pilot.timedClearTicks = 0;
+                            pilot.timedWaitMs += step;
+                            me->GetMotionMaster()->MovePoint(0, tx, ty, tz, MOVE_PATHFINDING | MOVE_RUN_MODE);
                             return true;
                         }
                         if (!out && pilot.timedClearTicks < 2)
@@ -3390,7 +4041,12 @@ bool SuiAutopilot::HoldForPull(Player const* member)
             // ...except a pull timed around a patrolling boss: the pull spot is beside his walk and the
             // pack must come to the camp off it (2026-11-04: two tanks met a pack at the pull spot 13 yd
             // from Baron Geddon's walk and held it there; he walked by at +14 s and joined).
-            if (tank && pair.second.timedBy.IsEmpty() && !pair.second.lured)
+            // [TACTICS] 2026-11-16 R3W5 MC Garr: the paladin tank walked out with the puller and six Firesworn killed
+            // him in 0.1 s at the pull (40/40 twice); for Garr's pack the tanks wait at the camp with the raid.
+            // Gated by SuiTactic::GarrTanksAtCamp.
+            Creature const* pullTarget = pair.second.target.IsEmpty() ? nullptr : leader->GetMap()->GetCreature(pair.second.target);
+            bool const garrPack = pullTarget && SuiTactic::On(member, SuiTactic::GarrTanksAtCamp, pullTarget);
+            if (tank && pair.second.timedBy.IsEmpty() && !pair.second.lured && !garrPack)
                 return false;
             // ...nor while the pack is already on the leader near the camp (see CampHold)
             if (tank && !leader->GetAttackers().empty() &&
@@ -3425,7 +4081,12 @@ bool SuiAutopilot::CampHold(Player const* member, float& x, float& y, float& z)
         // A tank never holds while the pack is on the leader near the camp: a rooted leader does not
         // reach it (2026-11-05: Fire Blossom held him 13 yd short with three elites on him; the other
         // tanks waited at the camp for the Return to end and he died at 12 s - all but two dead).
-        if (tank && !leader->GetAttackers().empty() && leader->GetDistance(p.campX, p.campY, p.campZ) < 25.0f)
+        // ...but only a tank whose own target is at the camp too: with one hound on the leader at the camp the
+        // other tanks ran 45 yd out to the four on the paladin, held them at their spot 10 yd off Lucifron's walk
+        // and he walked into it at +76 s (2026-11-15, R3W0 MC: 38 dead).
+        if (tank && !leader->GetAttackers().empty() && leader->GetDistance(p.campX, p.campY, p.campZ) < 25.0f &&
+            (!SuiTactic::On(member, SuiTactic::CampHoldTankTarget) || !member->GetVictim() ||
+             member->GetVictim()->GetDistance(p.campX, p.campY, p.campZ) <= 15.0f))
             return false;
         // ...and the first 20 s of the fight while the member's target has not come to the camp yet: a
         // Firewalker stands rooted casting its blossoms 30 yd out, beside the walk (2026-11-04: the tanks
@@ -3541,6 +4202,65 @@ int SuiAutopilot::StackOnLeader(Player const* member, float& x, float& y, float&
 
 namespace
 {
+    // DRILL: the circle is empty - walk to it, wait for the raid, respawn it.
+    bool DrillIdle(Player* me, Pilot& pilot)
+    {
+        if (!gDrill.on || me->GetMapId() != gDrill.map || me->GetInstanceId() != gDrill.instance)
+            return false;
+        if (gDrill.passed)
+        {
+            pilot.paused = true;
+            return true;
+        }
+        float const d = me->GetDistance2d(gDrill.x, gDrill.y);
+        if (d > gDrill.r * 0.5f)
+        {
+            if (!me->IsMoving())
+                me->GetMotionMaster()->MovePoint(0, gDrill.x, gDrill.y, gDrill.z, MOVE_PATHFINDING);
+            if (pilot.lastEvent.compare(0, 14, "drill: walking") != 0)
+                Note(pilot, me, "drill: walking to the drill area (%.0f yd)", d);
+            return true;
+        }
+        Readiness const r = Assess(me);
+        if ((r.dead || r.low) && (gDrill.waitMs += 1500) < 90000)
+            return true;   // the rest phase revives and drinks first
+        gDrill.waitMs = 0;
+        uint32 const n = DrillRespawn(me);
+        Note(pilot, me, "drill: respawned %u creature(s) within %.0f yd of (%.0f, %.0f)", n, gDrill.r, gDrill.x, gDrill.y);
+        return true;
+    }
+
+    // DRILL: score a pack fight; 8 clears in the last 10 pass the drill and stop it.
+    void DrillScore(Player* me, Pilot& pilot, Readiness const& ready)
+    {
+        if (!gDrill.on || me->GetMapId() != gDrill.map || me->GetInstanceId() != gDrill.instance)
+            return;
+        // [TACTICS-SCOPE-EXEMPT: QA tool, not a tactic] Every fight pulled inside the circle is scored (2026-11-20: the list of the Lava pack drill's four kinds left the
+        // Firelord pair drill and a Core Hound pack drill unscored - "not a pack fight").
+        bool const scored = pilot.targetEntry != 0;
+        bool const clear = !pilot.leaderDied && ready.dead <= 5;
+        if (scored)
+        {
+            std::ofstream out(DrillPath(), std::ios::app);
+            out << (long long)time(nullptr) << ' ' << (clear ? 1 : 0) << ' ' << ready.dead << ' ' << pilot.fightMs / 1000
+                << ' ' << pilot.targetEntry << '\n';
+        }
+        std::vector<int> const all = DrillWindow();
+        size_t const n = std::min<size_t>(10, all.size());
+        uint32 k = 0;
+        for (size_t i = all.size() - n; i < all.size(); ++i)
+            k += all[i];
+        sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[DRILL] fight %u (entry %u, %u s, %u dead%s): %s - last %u scored: %u clear (%u scored in all)",
+            pilot.fights, pilot.targetEntry, pilot.fightMs / 1000, ready.dead, pilot.leaderDied ? ", leader died" : "",
+            !scored ? "not a pack fight" : clear ? "CLEAR" : "FAIL", uint32(n), k, uint32(all.size()));
+        if (scored && n >= 10 && k >= 8)
+        {
+            gDrill.passed = true;
+            pilot.paused = true;
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[DRILL] PASSED: %u of the last 10 pack fights clear - autopilot paused", k);
+        }
+    }
+
     // The fight is over: its record is written, and a boss fight or a wipe stops the autopilot for
     // review before the next pull (owner 2026-11-03: be involved, review per boss attempt).
     void EndFight(Player* me, Pilot& pilot, Readiness const& ready)
@@ -3549,6 +4269,7 @@ namespace
             pilot.leaderDied);
         Note(pilot, me, "fight %u over after %u s (members %u, dead %u)%s", pilot.fights,
             pilot.fightMs / 1000, ready.members, ready.dead, pilot.leaderDied ? " - leader died" : "");
+        DrillScore(me, pilot, ready);
         pilot.phase = Phase::Rest;
         pilot.restMs = 0;
         pilot.target.Clear();
@@ -3786,6 +4507,11 @@ bool SuiAutopilot::TickLeader(AiBotAI* ai)
         uint32 exploreEntry = 0, exploreGuid = 0;
         if (next)
             pilot.exploreStallMs = 0;
+        if (!next && DrillIdle(me, pilot))
+        {
+            pilot.searchBackoffMs = 1500;
+            return false;
+        }
         if (!next && UseSummonGossip(me, pilot))
         {
             pilot.searchBackoffMs = 1500;
@@ -4220,10 +4946,14 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
             return extra.count(p->ItemId) != 0 || (p->Quality >= ITEM_QUALITY_EPIC && p->ItemLevel >= 66);
         };
         // what wearing it would gain this member: its score over the slot's present piece (the weaker of a pair)
-        auto gainFor = [&](Player* m, ItemPrototype const* p, float& rel) -> bool
+        auto gainFor = [&](Player* m, ItemPrototype const* p, float& rel, uint8& wearSlot) -> bool
         {
             AiBotAI* ai = dynamic_cast<AiBotAI*>(m->AI());
             if (!ai || m->CanUseItem(p) != EQUIP_ERR_OK)
+                return false;
+            // a tank keeps its shield: Earthshaker went to a tank at every council from Magmadar on, scored +10^7 % and
+            // stayed in his bags (2026-11-15, R3W0/R3W1) - his own equip logic never trades the shield for it
+            if (ai->GetCombatActiveRole() == ROLE_TANK && p->InventoryType == INVTYPE_2HWEAPON && SuiTactic::On(m, SuiTactic::CouncilNo2HForTank))
                 return false;
             uint8 slot = m->FindEquipSlot(p, NULL_SLOT, true);
             if (slot == NULL_SLOT)
@@ -4234,11 +4964,28 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
                 return w ? ai->ScoreItem(w->GetProto(), s) : 0.0f;
             };
             float old = wornScore(slot);
-            if (slot == EQUIPMENT_SLOT_FINGER1 || slot == EQUIPMENT_SLOT_TRINKET1)
-                old = std::min(old, wornScore(slot + 1));
+            wearSlot = slot;
+            if ((slot == EQUIPMENT_SLOT_FINGER1 || slot == EQUIPMENT_SLOT_TRINKET1) && wornScore(slot + 1) < old)
+            {
+                old = wornScore(slot + 1);
+                wearSlot = slot + 1;
+            }
             if (p->InventoryType == INVTYPE_2HWEAPON)
                 old += wornScore(EQUIPMENT_SLOT_OFFHAND);
             float const now = ai->ScoreItem(p, slot);
+            // [TACTICS] 2026-11-16 R3W5: an Arms warrior's scoring rejects every weapon but a 2H axe at -100000; with a
+            // sword and shield worn (-200000) Staff of Dominance and Earthshaker read as +10^7 % upgrades at every council
+            // and his own equip scan never put them on. A piece the member's scoring rejects is no upgrade.
+            // Gated by SuiTactic::CouncilWearsChoice.
+            if (now <= -10000.0f && SuiTactic::On(m, SuiTactic::CouncilWearsChoice))
+                return false;
+            // [TACTICS] 2026-11-16 R3W6 Onyxia: three Ancient Cornerstone Grimoires went to a warlock with a staff
+            // in both hands - an off-hand cannot go on beside a two-hander, so it is no upgrade for him.
+            // Gated by SuiTactic::CouncilWearsChoice.
+            if (slot == EQUIPMENT_SLOT_OFFHAND && SuiTactic::On(m, SuiTactic::CouncilWearsChoice))
+                if (Item* mh = m->GetItemByPos(INVENTORY_SLOT_BAG_0, EQUIPMENT_SLOT_MAINHAND))
+                    if (mh->GetProto() && mh->GetProto()->InventoryType == INVTYPE_2HWEAPON)
+                        return false;
             if (now <= old)
                 return false;
             // against the members own average worn piece, not this slots: a cloak scored ~0 for a priest made any
@@ -4275,15 +5022,18 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
                 ItemPrototype const* p = sObjectMgr.GetItemPrototype(id);
                 Player* best = nullptr;
                 float bestRel = 0.0f;
+                uint8 bestSlot = NULL_SLOT;
                 for (Player* m : members)
                 {
                     float rel = 0.0f;
+                    uint8 wearSlot = NULL_SLOT;
                     if (m->HasItemCount(id, 1, true) && m != holder && p->MaxCount == 1)
                         continue;   // a unique piece it already has
-                    if (gainFor(m, p, rel) && rel > bestRel)
+                    if (gainFor(m, p, rel, wearSlot) && rel > bestRel)
                     {
                         bestRel = rel;
                         best = m;
+                        bestSlot = wearSlot;
                     }
                 }
                 if (!best)
@@ -4292,18 +5042,103 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
                     report << " " << p->Name1 << ": no upgrade (" << holder->GetName() << " keeps it);";
                     continue;
                 }
+                // [TACTICS] 2026-11-16 R3W5: the council's choice was left to the member's own equip scan, which skips
+                // a member in combat or dead and judges a 2H against the main hand alone - "in bags" at every council;
+                // and a member with full bags lost Helm of Wrath, Belt/Sabatons of Might and Eskhandar's Collar. The
+                // chosen piece is now put on in the chosen slot; with full bags the member's old piece goes to the
+                // holder, whose bag slot the piece just left. Gated by SuiTactic::CouncilWearsChoice.
+                bool const wearIt = bestSlot != NULL_SLOT && SuiTactic::On(best, SuiTactic::CouncilWearsChoice);
                 if (best != holder)
                 {
                     ItemPosCountVec dest;
-                    if (best->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, id, 1) != EQUIP_ERR_OK || !holder->HasItemCount(id, 1, false))
+                    // [TACTICS] 2026-11-16 R3W6 Onyxia: Helm of Wrath, Belt + Sabatons of Might and Eskhandar's Collar
+                    // were lost to "Sylwhisper has no bag room" again - his bags hold 80 pieces of vendor trash. One grey
+                    // (poor) item is thrown away to make room for the chosen piece. Gated by SuiTactic::CouncilWearsChoice.
+                    if (wearIt && best->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, id, 1) != EQUIP_ERR_OK)
+                    {
+                        Item* junk = nullptr;
+                        for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END && !junk; ++i)
+                            if (Item* c = best->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                                if (c->GetProto() && c->GetProto()->Quality == ITEM_QUALITY_POOR)
+                                    junk = c;
+                        for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !junk; ++b)
+                            if (Bag* bag = dynamic_cast<Bag*>(best->GetItemByPos(INVENTORY_SLOT_BAG_0, b)))
+                                for (uint32 j = 0; j < bag->GetBagSize() && !junk; ++j)
+                                    if (Item* c = bag->GetItemByPos(uint8(j)))
+                                        if (c->GetProto() && c->GetProto()->Quality == ITEM_QUALITY_POOR)
+                                            junk = c;
+                        if (junk)
+                        {
+                            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] LOOT %s: throws away %s for %s", best->GetName(),
+                                junk->GetProto()->Name1, p->Name1);
+                            best->DestroyItem(junk->GetBagSlot(), junk->GetSlot(), true);
+                        }
+                        dest.clear();
+                    }
+                    bool const room = best->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, id, 1) == EQUIP_ERR_OK;
+                    uint16 edest = 0;
+                    bool const direct = !room && wearIt && p->InventoryType != INVTYPE_2HWEAPON &&
+                        best->CanEquipNewItem(bestSlot, edest, id, true) == EQUIP_ERR_OK;
+                    if ((!room && !direct) || !holder->HasItemCount(id, 1, false))
                     {
                         ++kept;
                         report << " " << p->Name1 << ": " << best->GetName() << " has no bag room;";
                         continue;
                     }
                     holder->DestroyItemCount(id, 1, true);
-                    if (Item* item = best->StoreNewItem(dest, id, true))
-                        best->SendNewItem(item, 1, true, false);
+                    if (room)
+                    {
+                        if (Item* item = best->StoreNewItem(dest, id, true))
+                            best->SendNewItem(item, 1, true, false);
+                    }
+                    else
+                    {
+                        bool moved = true;
+                        if (Item* old = best->GetItemByPos(INVENTORY_SLOT_BAG_0, bestSlot))
+                        {
+                            ItemPosCountVec hd;
+                            if (holder->CanStoreItem(NULL_BAG, NULL_SLOT, hd, old, false) == EQUIP_ERR_OK)
+                            {
+                                best->MoveItemFromInventory(INVENTORY_SLOT_BAG_0, bestSlot, true);
+                                old->DeleteFromInventoryDB();
+                                holder->MoveItemToInventory(hd, old, true, true);
+                            }
+                            else
+                                moved = false;
+                        }
+                        if (moved && best->CanEquipNewItem(bestSlot, edest, id, false) == EQUIP_ERR_OK)
+                        {
+                            if (Item* item = best->EquipNewItem(edest, id, true))
+                                best->SendNewItem(item, 1, true, false);
+                        }
+                        else
+                        {
+                            // nothing changed hands: the piece goes back to the holder's freed slot
+                            ItemPosCountVec rd;
+                            if (holder->CanStoreNewItem(NULL_BAG, NULL_SLOT, rd, id, 1) == EQUIP_ERR_OK)
+                                holder->StoreNewItem(rd, id, true);
+                            ++kept;
+                            report << " " << p->Name1 << ": " << best->GetName() << " has no bag room;";
+                            continue;
+                        }
+                    }
+                }
+                if (wearIt && !best->HasItemWithIdEquipped(id, 1))
+                {
+                    Item* it = nullptr;
+                    for (uint8 i = INVENTORY_SLOT_ITEM_START; i < INVENTORY_SLOT_ITEM_END && !it; ++i)
+                        if (Item* c = best->GetItemByPos(INVENTORY_SLOT_BAG_0, i))
+                            if (c->GetEntry() == id)
+                                it = c;
+                    for (uint8 b = INVENTORY_SLOT_BAG_START; b < INVENTORY_SLOT_BAG_END && !it; ++b)
+                        if (Bag* bag = dynamic_cast<Bag*>(best->GetItemByPos(INVENTORY_SLOT_BAG_0, b)))
+                            for (uint32 j = 0; j < bag->GetBagSize() && !it; ++j)
+                                if (Item* c = bag->GetItemByPos(uint8(j)))
+                                    if (c->GetEntry() == id)
+                                        it = c;
+                    uint16 edest = 0;
+                    if (it && best->CanEquipItem(bestSlot, edest, it, true) == EQUIP_ERR_OK)
+                        best->SwapItem(it->GetPos(), edest);
                 }
                 if (AiBotAI* ai = dynamic_cast<AiBotAI*>(best->AI()))
                     ai->TryAutoEquip();
@@ -4460,6 +5295,46 @@ bool ChatHandler::HandleAutopilotCommand(char* args)
         }
         sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[AUTOPILOT] %s joins %s's group (setup)", member->GetName(), leader->GetName());
         PSendSysMessage("%s joined %s's group", member->GetName(), leader->GetName());
+        return true;
+    }
+    // [TACTICS-SCOPE-EXEMPT: QA tool, not a tactic] QA drill (owner 2026-11-15): .autopilot drill <leader> on <x> <y> <z> <radius> | off | reset | status
+    if (action == "drill")
+    {
+        char* modeArg = ExtractLiteralArg(&args);
+        std::string const mode = modeArg ? modeArg : "status";
+        std::lock_guard<std::recursive_mutex> guard(gLock);
+        if (mode == "on")
+        {
+            float x = 0.0f, y = 0.0f, z = 0.0f, r = 0.0f;
+            if (!ExtractFloat(&args, x) || !ExtractFloat(&args, y) || !ExtractFloat(&args, z) || !ExtractFloat(&args, r) || r < 10.0f)
+            {
+                SendSysMessage("usage: .autopilot drill <leader> on <x> <y> <z> <radius>");
+                SetSentErrorMessage(true);
+                return false;
+            }
+            gDrill = Drill();
+            gDrill.on = true;
+            gDrill.map = leader->GetMapId();
+            gDrill.instance = leader->GetInstanceId();
+            gDrill.x = x; gDrill.y = y; gDrill.z = z; gDrill.r = r;
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[DRILL] on: map %u instance %u, %.0f yd around (%.1f, %.1f, %.1f) (QA, not progression)",
+                gDrill.map, gDrill.instance, r, x, y, z);
+        }
+        else if (mode == "off")
+            gDrill.on = false;
+        else if (mode == "reset")
+        {
+            std::ofstream out(DrillPath(), std::ios::trunc);
+            gDrill.passed = false;
+            sLog.Out(LOG_BASIC, LOG_LVL_MINIMAL, "[DRILL] window reset");
+        }
+        std::vector<int> const all = DrillWindow();
+        size_t const n = std::min<size_t>(10, all.size());
+        uint32 k = 0;
+        for (size_t i = all.size() - n; i < all.size(); ++i)
+            k += all[i];
+        PSendSysMessage("drill %s%s: last %u scored %u clear, %u scored in all", gDrill.on ? "on" : "off",
+            gDrill.passed ? " PASSED" : "", uint32(n), k, uint32(all.size()));
         return true;
     }
     if (action == "review")
